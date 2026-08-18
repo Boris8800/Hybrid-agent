@@ -1,0 +1,1 @@
+"""Router package: archetype classification, confidence scoring, threshold control."""

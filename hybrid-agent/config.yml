@@ -1,0 +1,47 @@
+# Hybrid coding agent configuration (fallback: embedded defaults in agent.py)
+router:
+  local_threshold: 0.85
+  threshold_min: 0.60
+  threshold_max: 0.85
+  target_local_rate: 0.93
+  alpha: 0.01
+  weights:
+    clarity: 0.30
+    specificity: 0.25
+    size_penalty: 0.15
+    history_bonus: 0.20
+    novelty: 0.10
+
+backends:
+  local:
+    base_url: "http://localhost:1234/v1"   # LM Studio OpenAI-compatible endpoint
+    model: "google/gemma-4-12b-qat"
+    # gemma4 runs in thinking mode (LM Studio ignores thinking-disable API params),
+    # so legit calls can take 1-2 min. A 60s timeout was killing slow-but-working
+    # calls and re-running them, doubling wall time. Raised to 180s.
+    timeout_s: 180
+    max_retries: 3
+    backoff_s: [0.5, 1.0, 2.0]
+    cold_start_wait_s: 30
+  deepseek:
+    api_key_env: "DEEPSEEK_API_KEY"
+    model: "deepseek-chat"
+    timeout_s: 30
+    max_retries: 4
+    backoff_s: [1.0, 2.0, 4.0]
+
+review:
+  max_local_retries: 2
+  max_depth_tokens: 600
+  max_failure_summary_words: 150
+  daily_token_budget: 200000
+
+circuit_breaker:
+  window_size: 20
+  local_error_ceiling: 0.40
+  deepseek_error_ceiling: 0.30
+  cooldown_s: 60
+
+memory:
+  root: "./memory"
+  max_project_summary_words: 200
