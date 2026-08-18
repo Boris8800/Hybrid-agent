@@ -34,6 +34,7 @@ from backends.base import Backend, ModelRequest, ModelResponse
 @dataclass
 class Verdict:
     decision: str  # "APPROVED" | "FIX_REQUIRED" | "REJECTED"
+    quality_score: float = 0.0  # 0-10 quality score (80/20 strategy)
     assessment: str = ""
     issues: list[dict] = field(default_factory=list)
     approval_conditions: str = ""
@@ -83,7 +84,14 @@ def _decision_from(raw: str) -> str:
 
 def parse_verdict(raw: str) -> Verdict:
     decision = _decision_from(raw)
-    verdict = Verdict(decision=decision, raw=raw)
+    quality_score = 0.0
+    m = re.search(r"QUALITY[ _]?SCORE.{0,60}?([0-9]*\.?[0-9]+)", raw, re.I | re.S)
+    if m:
+        try:
+            quality_score = float(m.group(1))
+        except ValueError:
+            quality_score = 0.0
+    verdict = Verdict(decision=decision, quality_score=quality_score, raw=raw)
 
     def _section(label: str) -> str:
         m = re.search(rf"===\s*{label}\s*===\s*(.*?)(?:\n\s*===|\Z)", raw, re.S | re.I)
@@ -153,6 +161,8 @@ def _supervisor_request(pkg: ReviewPackage, verbose: bool = True) -> ModelReques
         "Return a verdict following this exact format:\n\n"
         "=== REVIEW DECISION ===\n"
         "[APPROVED | FIX_REQUIRED | REJECTED]\n\n"
+        "=== QUALITY SCORE ===\n"
+        "[0.0-10.0] — a single number. 8.0-10.0 APPROVED, 5.0-7.9 FIX_REQUIRED, <5.0 REJECTED.\n\n"
         "=== OVERALL ASSESSMENT ===\n"
         "[2-3 sentences]\n\n"
         "=== ISSUES FOUND ===\n"
@@ -248,13 +258,15 @@ def supervise(
         result.verdicts.append(verdict)
 
         if verdict.approved:
-            status(f"[supervise] iter {iteration}: APPROVED")
+            status(f"[supervise] iter {iteration}: APPROVED (score {verdict.quality_score:.1f}/10)")
             result.final_text = code
             return result
         if verdict.rejected:
-            status(f"[supervise] iter {iteration}: REJECTED")
-            result.final_text = code
-            result.reason = "supervisor_rejected"
+            status(f"[supervise] iter {iteration}: REJECTED (score {verdict.quality_score:.1f}/10) — falling back to DeepSeek")
+            plan = cloud.generate(_cloud_generate_request(task))
+            result.final_text = plan.text
+            result.escalated = True
+            result.reason = "deepseek_fallback_rejected"
             return result
 
         # FIX_REQUIRED: feed fixes back to Gemma.
@@ -262,8 +274,12 @@ def supervise(
         status(f"[supervise] iter {iteration}: FIX_REQUIRED — {len(verdict.issues)} issue(s), looping")
         current = task
 
-    result.final_text = code  # last Gemma output after exhausting iterations
-    result.reason = f"max_iterations_{max_iterations}"
+    # Retries exhausted with FIX_REQUIRED: fall back to DeepSeek (80/20 fallback).
+    status(f"[supervise] max iterations ({max_iterations}) reached; falling back to DeepSeek")
+    plan = cloud.generate(_cloud_generate_request(task))
+    result.final_text = plan.text
+    result.escalated = True
+    result.reason = f"deepseek_fallback_max_iterations_{max_iterations}"
     return result
 
 
@@ -280,5 +296,19 @@ def _cloud_plan_request(task: str) -> ModelRequest:
         system="You are the senior architect for a hybrid coding agent. Produce a step-by-step plan with file-level breakdown (max 400 words).",
         user=f"OBJECTIVE: {task}\n",
         max_tokens=1200,
+        temperature=0.1,
+    )
+
+
+def _cloud_generate_request(task: str) -> ModelRequest:
+    """Request DeepSeek to generate the full implementation (80/20 fallback path)."""
+    return ModelRequest(
+        system=(
+            "You are a senior engineer. Given the task, produce the COMPLETE "
+            "implementation — all files, in fenced code blocks labeled with paths. "
+            "No preamble."
+        ),
+        user=f"TASK:\n{task}\n",
+        max_tokens=2048,
         temperature=0.1,
     )

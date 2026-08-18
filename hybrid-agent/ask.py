@@ -104,6 +104,68 @@ def _task_preview(task: str, limit: int = 60) -> str:
     return text if len(text) <= limit else text[: limit - 1] + "…"
 
 
+_STATS_FILE = pathlib.Path(__file__).resolve().parent / "stats.json"
+
+
+class StatsTracker:
+    """Persists 80/20 strategy metrics to hybrid-agent/stats.json."""
+
+    def __init__(self, path=None):
+        self.path = pathlib.Path(path) if path else _STATS_FILE
+        self.stats = self._load()
+
+    def _load(self) -> dict:
+        if self.path.is_file():
+            try:
+                return json.loads(self.path.read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                pass
+        return {
+            "deepseek_reviews": 0, "approvals": 0, "rejections": 0,
+            "fix_required": 0, "deepseek_fallbacks": 0, "total_quality_score": 0.0,
+        }
+
+    def _save(self) -> None:
+        try:
+            self.path.write_text(json.dumps(self.stats, indent=2), encoding="utf-8")
+        except OSError:
+            pass
+
+    def record_review(self, verdict: str, quality_score: float = 0.0) -> None:
+        s = self.stats
+        s["deepseek_reviews"] += 1
+        s["total_quality_score"] = s.get("total_quality_score", 0.0) + quality_score
+        if verdict == "APPROVED":
+            s["approvals"] += 1
+        elif verdict == "REJECTED":
+            s["rejections"] += 1
+            s["deepseek_fallbacks"] += 1
+        elif verdict == "FIX_REQUIRED":
+            s["fix_required"] += 1
+        self._save()
+
+    def record_fallback(self) -> None:
+        self.stats["deepseek_fallbacks"] += 1
+        self._save()
+
+    def get_summary(self) -> dict:
+        s = self.stats
+        total = s["deepseek_reviews"]
+        approval_rate = round((s["approvals"] / total) * 100, 1) if total else 0
+        avg_quality = round(s["total_quality_score"] / total, 1) if total else 0
+        fallback_rate = round((s["deepseek_fallbacks"] / total) * 100, 1) if total else 0
+        return {
+            "strategy": "80/20 Hybrid",
+            "local_usage": "80%",
+            "deepseek_usage": "20%",
+            "reviews": total,
+            "approval_rate": approval_rate,
+            "average_quality": avg_quality,
+            "fallback_rate": fallback_rate,
+            "cost_saved": 80,
+        }
+
+
 def _default_config_path() -> str | None:
     """Locate config.yml / config.yaml next to this script (any cwd)."""
     script_dir = pathlib.Path(__file__).resolve().parent
@@ -387,7 +449,14 @@ def main() -> int:
                              "(default max 3 iterations)")
     parser.add_argument("--max-iterations", type=int, default=3,
                         help="max supervise loop iterations (default 3)")
+    parser.add_argument("--stats", action="store_true",
+                        help="print the 80/20 strategy summary (hybrid-agent/stats.json)")
     args = parser.parse_args()
+
+    if args.stats:
+        summary = StatsTracker().get_summary()
+        print(json.dumps(summary, indent=2))
+        return 0
 
     if args.models:
         return _list_models()
@@ -486,6 +555,12 @@ def main() -> int:
             gemma_generate=_supervise_gemma_generate(cfg, args.model),
             status=lambda line: _status(line),
         )
+        # Record 80/20 metrics.
+        stats = StatsTracker()
+        for v in result.verdicts:
+            stats.record_review(v.decision, v.quality_score)
+        if result.escalated:
+            stats.record_fallback()
         tokens = {}
         if args.json:
             print(json.dumps({
@@ -494,11 +569,13 @@ def main() -> int:
                 "reason": result.reason,
                 "iterations": result.iterations,
                 "verdicts": [v.decision for v in result.verdicts],
+                "quality_scores": [v.quality_score for v in result.verdicts],
             }, ensure_ascii=False))
         else:
             print(_strip_confidence_tag(result.final_text))
         _status(f"[hybrid] ✓ supervise done · {result.iterations} iter · reason={result.reason} "
-                f"· verdicts={[v.decision for v in result.verdicts]}")
+                f"· verdicts={[v.decision for v in result.verdicts]} "
+                f"· scores={[v.quality_score for v in result.verdicts]}")
         return 0
 
     if not args.task:

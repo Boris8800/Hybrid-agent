@@ -22,6 +22,9 @@ hybrid-agent/logs/
 # Generated project context
 hybrid-agent/context.json
 
+# Generated 80/20 metrics
+hybrid-agent/stats.json
+
 # OS
 .DS_Store
 Thumbs.db

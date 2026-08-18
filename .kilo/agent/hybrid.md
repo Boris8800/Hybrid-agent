@@ -113,6 +113,33 @@ hybrid-agent/manage-context.sh . status   # show context info / freshness
 hybrid-agent/manage-context.sh . clear    # remove context.json
 ```
 
+## 80/20 Hybrid Strategy
+
+The default `--supervise` loop is the 80/20 strategy: the local model does ~80% of the work, DeepSeek confirms ~20% as a quality gate.
+
+| Model | Usage | Purpose |
+|-------|-------|---------|
+| Local (Gemma) | 80% | Generates the implementation (fast, free) |
+| DeepSeek | 20% | Reviews **every** output with a 0–10 score; fallback generator |
+
+### Quality scoring
+DeepSeek scores each review on a 0–10 scale, mapped to a verdict:
+| Score | Verdict | Action |
+|-------|---------|--------|
+| 8.0–10.0 | APPROVED | Apply (majority of cases) |
+| 5.0–7.9 | FIX_REQUIRED | Local fixes, re-review (up to `--max-iterations`) |
+| < 5.0 | REJECTED | DeepSeek generates a fresh implementation |
+
+### Fallback
+If the local output is REJECTED, or FIX_REQUIRED retries are exhausted, the loop falls back to **DeepSeek generating fresh** (the 20% path). Metadata carries the reason (`deepseek_fallback_rejected` / `deepseek_fallback_max_iterations_N`).
+
+### Metrics
+Every `--supervise` run records a verdict + quality score to `hybrid-agent/stats.json`. View the 80/20 summary:
+```bash
+hybrid-agent/.venv/bin/python hybrid-agent/ask.py --stats
+```
+`--json` on a supervise run also emits `quality_scores` per iteration.
+
 ## Operational Notes
 
 - Prefer the **local** model for the fast path; use DeepSeek only where quality demands it (cost/latency).
