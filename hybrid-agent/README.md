@@ -21,6 +21,29 @@ hybrid-agent/.venv/bin/python hybrid-agent/ask.py --supervise --task "<task>" --
 
 Key flags: `--local` / `--deepseek` / `--auto`, `--review` (DeepSeek supervisor review), `--supervise` (Gemma-primary / DeepSeek-supervisor loop), `--models`, `--stream`, `--json`, `--route-only`.
 
+## Project Context Feature
+
+The hybrid agent can automatically build a project index (files, dependencies, structure, entry points, git info) and use it for smarter routing and suggestions.
+
+```bash
+# Initial scan (auto-runs on agent load if context.json is missing)
+hybrid-agent/.venv/bin/python hybrid-agent/scan.py --project-root .
+
+# See context
+hybrid-agent/manage-context.sh status
+
+# Get task suggestions
+hybrid-agent/.venv/bin/python hybrid-agent/scan.py --project-root . --suggest-tasks
+
+# Refresh after changes
+hybrid-agent/manage-context.sh update
+
+# Ask a context-aware question (context is auto-appended to every request)
+hybrid-agent/.venv/bin/python hybrid-agent/ask.py --route-only --task "Add tests for the main module"
+```
+
+Context is stored in `hybrid-agent/context.json` (git-ignored) and auto-appended to every model request by `ask.py`. The scanner skips `.venv`, `node_modules`, `.git`, and caches.
+
 ## Quick Setup for New Developers
 
 1. **Clone and enter the repo**

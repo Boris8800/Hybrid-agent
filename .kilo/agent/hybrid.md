@@ -73,7 +73,45 @@ Follow this exact sequence for a coding request:
 4. **If DEEPSEEK:** run e.g. `python3 hybrid-agent/ask.py --deepseek --task "<task>" --context "<relevant snippets>" --max-tokens 2048`. If it exits 2, tell the user that `DEEPSEEK_API_KEY` is missing.
 5. **Treat model output as a PROPOSAL.** Critically review it yourself — you are the senior engineer gate. For non-trivial **local** output, run the DeepSeek supervisor review first (see `## Supervisor Review`). Then apply it with your `edit`/`write` tools only after review passes. Never apply model output blindly.
 6. **Verify.** Run tests/lint if available, then summarize what changed and how the local/cloud split worked. If the local output was weak or wrong, re-route to DeepSeek (escalation).
-7. **Track multi-step work** with `todowrite`/`todoread`.
+ 7. **Track multi-step work** with `todowrite`/`todoread`.
+
+## Project Context Management
+
+The bridge includes a project scanner (`hybrid-agent/scan.py`) that builds a project index (files, dependencies, structure, entry points, git info) and stores it in `hybrid-agent/context.json`. Use it to route more accurately and to suggest work.
+
+### When to scan
+- On agent load: if `hybrid-agent/context.json` is missing, scan in the background.
+- On idle: if the context file is stale (older than ~1 hour), refresh it.
+- Manually / after changes: run `hybrid-agent/scan.py --project-root . --update`.
+
+### Scanning commands
+```bash
+hybrid-agent/.venv/bin/python hybrid-agent/scan.py --project-root .                # initial scan -> context.json
+hybrid-agent/.venv/bin/python hybrid-agent/scan.py --project-root . --suggest-tasks # scan + task suggestions
+hybrid-agent/.venv/bin/python hybrid-agent/scan.py --project-root . --update        # refresh after changes
+hybrid-agent/.venv/bin/python hybrid-agent/scan.py --project-root . --json          # machine-readable output
+```
+
+### Using context for routing
+`ask.py` automatically appends a `PROJECT CONTEXT` block to every request, tailored to the task (test-related tasks show the tests directory; "main"/"app" tasks show entry points; otherwise a general overview). The scanner ignores `.venv`, `node_modules`, `.git`, caches, and build dirs so the index stays clean.
+
+### Context-aware suggestions
+After scanning, proactively offer helpful work based on the index — e.g. "I see a Django project; want to add a model?", "Your tests directory is empty; should I create test templates?", "You have failing tests; want me to look at them?".
+
+### Auto-scan on agent load
+When the agent starts and the orchestrator initializes:
+1. **Check for context** — if `hybrid-agent/context.json` does not exist, run `scan.py` in the background; if it is older than ~1 hour, refresh it with `--update`.
+2. **Show a quick status line** — e.g. `Project context loaded: Python/Django · 42 source files · entry point manage.py · 3 suggestions (run --suggest-tasks)`.
+3. **Proceed** — all subsequent tasks use the loaded context via `ask.py`.
+
+### Context management script
+`hybrid-agent/manage-context.sh` wraps the common operations:
+```bash
+hybrid-agent/manage-context.sh . scan     # scan + suggestions
+hybrid-agent/manage-context.sh . update   # refresh existing context
+hybrid-agent/manage-context.sh . status   # show context info / freshness
+hybrid-agent/manage-context.sh . clear    # remove context.json
+```
 
 ## Operational Notes
 

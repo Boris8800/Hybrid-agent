@@ -19,6 +19,9 @@ venv/
 hybrid-agent/logs/
 *.log
 
+# Generated project context
+hybrid-agent/context.json
+
 # OS
 .DS_Store
 Thumbs.db

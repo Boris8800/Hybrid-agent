@@ -44,6 +44,33 @@ def _strip_confidence_tag(text: str) -> str:
     return _re.sub(r"\s*<CONFIDENCE>\s*[0-9.]+</CONFIDENCE>\s*$", "", text).rstrip()
 
 
+_CONTEXT_FILE = pathlib.Path(__file__).resolve().parent / "context.json"
+
+
+def get_project_context(task: str) -> str:
+    """Return relevant project context from context.json (produced by scan.py).
+
+    If no context file exists, returns a short notice. Otherwise tailors the
+    snippet to the task (tests / entry points / general overview).
+    """
+    if not _CONTEXT_FILE.is_file():
+        return "No project context available. Run hybrid-agent/scan.py first."
+    try:
+        context = json.loads(_CONTEXT_FILE.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return "Project context is stale/unreadable. Re-run hybrid-agent/scan.py."
+
+    if "test" in task.lower():
+        tests = context.get("structure", {}).get("tests", "not found")
+        return f"Tests directory: {tests}"
+    if any(w in task.lower() for w in ("main", "app", "entry")):
+        return f"Entry points: {context.get('entry_points', [])}"
+    return (
+        f"Project type: {context.get('structure', {}).get('framework', 'Unknown')}\n"
+        f"Dependencies: {list(context.get('dependencies', {}).keys())}"
+    )
+
+
 def _load_supervisor_prompt() -> str:
     """Return the DeepSeek supervisor-review system prompt (review/supervisor.md)."""
     if REVIEW_PROMPT_FILE.is_file():
@@ -292,6 +319,9 @@ def _build_request(agent: HybridAgent, args: argparse.Namespace,
     user = f"TASK: {args.task}"
     if context:
         user += f"\n\nCONTEXT:\n{context}"
+    project_context = get_project_context(args.task)
+    if project_context and "No project context" not in project_context:
+        user += f"\n\nPROJECT CONTEXT:\n{project_context}"
     timeout_s = (
         agent.cfg["backends"]["local"]["timeout_s"]
         if route == "local"
