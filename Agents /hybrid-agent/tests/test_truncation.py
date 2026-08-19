@@ -395,5 +395,143 @@ class EnhanceTaskClarificationTests(unittest.TestCase):
         self.assertEqual(task_for_gemma, "Enhanced")
 
 
+class SelfEvaluationTests(unittest.TestCase):
+    """Self-evaluation: per-session metrics and the weekly comparison report."""
+
+    def test_record_session_tracks_aggregates_and_period(self):
+        import json
+        import tempfile
+
+        import ask
+        with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as f:
+            f.write("{}")
+            path = f.name
+        st = ask.StatsTracker(path)
+        st.record_session(files_generated=3, iterations=2, truncation=True, quality=9.0)
+        st.record_session(files_generated=5, iterations=1, truncation=False, quality=8.0)
+        s = st.stats
+        self.assertEqual(s["tasks_completed"], 2)
+        self.assertEqual(s["files_generated"], 8)
+        self.assertEqual(s["total_iterations"], 3)
+        self.assertEqual(s["truncation_events"], 1)
+        p = s["periods"][ask._iso_week()]
+        self.assertEqual(p["files_generated"], 8)
+        self.assertEqual(p["tasks_completed"], 2)
+        self.assertEqual(p["truncation_events"], 1)
+
+    def test_evaluate_reports_metrics_and_week_comparison(self):
+        import json
+        import tempfile
+        from datetime import date, timedelta
+
+        import ask
+        iso = date.today().isocalendar()
+        cur = f"{iso[0]}-W{iso[1]:02d}"
+        lw = (date.today() - timedelta(days=7)).isocalendar()
+        last = f"{lw[0]}-W{lw[1]:02d}"
+        stats = {
+            "tasks_completed": 5, "files_generated": 12, "total_iterations": 3,
+            "truncation_events": 1, "selfeval_quality_sum": 46.0,
+            "selfeval_quality_count": 5,
+            "periods": {
+                cur: {"files_generated": 12, "iterations": 3, "truncation_events": 1,
+                      "tasks_completed": 5, "quality_sum": 46.0, "quality_count": 5},
+                last: {"files_generated": 10, "iterations": 4, "truncation_events": 2,
+                       "tasks_completed": 4, "quality_sum": 34.8, "quality_count": 4},
+            },
+        }
+        with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as f:
+            json.dump(stats, f)
+            path = f.name
+        r = ask.StatsTracker(path).evaluate()
+        self.assertEqual(r["files_generated"], 12)
+        self.assertEqual(r["iterations"], 3)
+        self.assertEqual(r["tasks_completed"], 5)
+        self.assertEqual(r["average_quality"], 9.2)
+        self.assertEqual(r["truncation_rate"], 20.0)
+        self.assertEqual(r["truncation_events"], 1)
+        self.assertEqual(r["previous_average"], 8.7)
+        self.assertIn("better than last week", r["comparison"])
+
+    def test_evaluate_no_prior_period(self):
+        import json
+        import tempfile
+
+        import ask
+        with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as f:
+            f.write("{}")
+            path = f.name
+        r = ask.StatsTracker(path).evaluate()
+        self.assertIsNone(r["previous_average"])
+        self.assertEqual(r["comparison"], "No prior period to compare against")
+        self.assertEqual(r["average_quality"], 0.0)
+
+
+class ProjectContextTests(unittest.TestCase):
+    """Project Context Awareness: scan/deps/architecture/relevant-files."""
+
+    def _fixture(self):
+        import tempfile
+        import json
+        from pathlib import Path
+        d = Path(tempfile.mkdtemp())
+        (d / 'backend').mkdir()
+        (d / 'models').mkdir()
+        (d / 'tests').mkdir()
+        (d / 'backend' / 'package.json').write_text(json.dumps({
+            'dependencies': {'express': '^4', 'prisma': '^5', 'pg': '^8'}}))
+        (d / 'backend' / 'app.py').write_text(
+            'from fastapi import FastAPI\napp = FastAPI()\n'
+            '@app.get("/health")\nasync def health() -> dict:\n'
+            '    """Return health."""\n    return {"status": "ok"}\n')
+        (d / 'models' / 'user.py').write_text(
+            'from pydantic import BaseModel\nclass User(BaseModel):\n'
+            '    id: int\n    name: str\n')
+        (d / 'tests' / 'test_app.py').write_text(
+            'def test_health():\n    assert True\n')
+        return d
+
+    def test_scan_detects_deps_and_architecture(self):
+        from context import ProjectContext
+        c = ProjectContext(str(self._fixture()))
+        ctx = c.scan()
+        self.assertIn('node', ctx['dependencies'])
+        self.assertIn('express', ctx['dependencies']['node'])
+        arch = ctx['architecture']
+        self.assertIn(arch['backend_framework'], ('Express', 'FastAPI'))
+        self.assertGreater(ctx['estimate_tokens'], 0)
+
+    def test_find_relevant_files(self):
+        from context import ProjectContext
+        c = ProjectContext(str(self._fixture()))
+        c.scan()
+        relevant = c.find_relevant_files('add a user model', limit=3)
+        self.assertTrue(any('user' in f for f in relevant))
+
+    def test_recommend_libraries_for_auth(self):
+        from context import ProjectContext
+        c = ProjectContext(str(self._fixture()))
+        c.scan()
+        recs = c.recommend_libraries('add jwt auth')
+        self.assertTrue(any('jwt' in r for r in recs))
+
+    def test_to_prompt_contains_sections(self):
+        from context import ProjectContext
+        c = ProjectContext(str(self._fixture()))
+        c.scan()
+        prompt = c.to_prompt()
+        for section in ('## Project Context', '### Structure',
+                        '### Dependencies', '### Architecture'):
+            self.assertIn(section, prompt)
+
+    def test_scan_never_crashes_on_empty_dir(self):
+        import tempfile
+        from pathlib import Path
+        from context import ProjectContext
+        c = ProjectContext(str(Path(tempfile.mkdtemp())))
+        ctx = c.scan()
+        self.assertEqual(ctx['architecture'].get('type'), 'unknown')
+
+
 if __name__ == "__main__":
     unittest.main()

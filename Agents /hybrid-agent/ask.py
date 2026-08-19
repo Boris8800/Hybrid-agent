@@ -26,6 +26,7 @@ import subprocess
 import sys
 import time
 import urllib.request
+from datetime import date, timedelta
 
 from backends.base import ModelRequest, ModelResponse
 from backends.local_gemma import GemmaBackend
@@ -34,6 +35,7 @@ from router.confidence import MemoryView
 from agent import HybridAgent, _load_config, apply_env_overrides
 from backends.deepseek import _resolve_api_key
 from supervise import GEMMA_MAX_TOKENS, ReviewPackage, _enhance_request, parse_enhancement, supervise
+from context import ProjectContext
 
 # --- Self-heal: loading config.yml requires PyYAML + openai, which exist only
 # in the project venv (hybrid-agent/.venv). When invoked with a system python3
@@ -138,23 +140,37 @@ def _task_preview(task: str, limit: int = 60) -> str:
 _STATS_FILE = pathlib.Path(__file__).resolve().parent / "stats.json"
 
 
+def _iso_week() -> str:
+    """Return the current ISO week as 'YYYY-Www' (e.g. '2026-W34')."""
+    iso = date.today().isocalendar()
+    return f"{iso[0]}-W{iso[1]:02d}"
+
+
 class StatsTracker:
-    """Persists 80/20 strategy metrics to hybrid-agent/stats.json."""
+    """Persists 80/20 strategy + self-evaluation metrics to hybrid-agent/stats.json."""
 
     def __init__(self, path=None):
         self.path = pathlib.Path(path) if path else _STATS_FILE
         self.stats = self._load()
 
     def _load(self) -> dict:
+        data = {}
         if self.path.is_file():
             try:
-                return json.loads(self.path.read_text(encoding="utf-8"))
+                data = json.loads(self.path.read_text(encoding="utf-8"))
             except (OSError, ValueError):
-                pass
-        return {
+                data = {}
+        # setdefault so OLD stats.json files (missing the new keys) still work.
+        defaults = {
             "deepseek_reviews": 0, "approvals": 0, "rejections": 0,
             "fix_required": 0, "deepseek_fallbacks": 0, "total_quality_score": 0.0,
+            "tasks_completed": 0, "files_generated": 0, "total_iterations": 0,
+            "truncation_events": 0, "selfeval_quality_sum": 0.0,
+            "selfeval_quality_count": 0, "periods": {},
         }
+        for key, value in defaults.items():
+            data.setdefault(key, value)
+        return data
 
     def _save(self) -> None:
         try:
@@ -178,6 +194,72 @@ class StatsTracker:
     def record_fallback(self) -> None:
         self.stats["deepseek_fallbacks"] += 1
         self._save()
+
+    def record_session(self, files_generated: int = 0, iterations: int = 0,
+                       truncation: bool = False, quality: float = 0.0) -> None:
+        """Record one completed task/session, plus a per-ISO-week snapshot."""
+        s = self.stats
+        s["tasks_completed"] += 1
+        s["files_generated"] += files_generated
+        s["total_iterations"] += iterations
+        if truncation:
+            s["truncation_events"] += 1
+        if quality:
+            s["selfeval_quality_sum"] += quality
+            s["selfeval_quality_count"] += 1
+
+        week = _iso_week()
+        p = s.setdefault("periods", {}).setdefault(week, {
+            "files_generated": 0, "iterations": 0, "truncation_events": 0,
+            "tasks_completed": 0, "quality_sum": 0.0, "quality_count": 0,
+        })
+        p["files_generated"] += files_generated
+        p["iterations"] += iterations
+        if truncation:
+            p["truncation_events"] += 1
+        p["tasks_completed"] += 1
+        if quality:
+            p["quality_sum"] += quality
+            p["quality_count"] += 1
+        self._save()
+
+    def evaluate(self) -> dict:
+        """Self-evaluation report for the current week vs the previous week."""
+        s = self.stats
+        current_week = _iso_week()
+        iso = (date.today() - timedelta(days=7)).isocalendar()
+        last_week = f"{iso[0]}-W{iso[1]:02d}"
+        p = s.get("periods", {}).get(current_week, {})
+        prev = s.get("periods", {}).get(last_week, {})
+
+        files = p.get("files_generated", 0)
+        iterations = p.get("iterations", 0)
+        tasks = p.get("tasks_completed", 0)
+        avg = round(p["quality_sum"] / p["quality_count"], 1) if p.get("quality_count") else 0.0
+        trunc = p.get("truncation_events", 0)
+        rate = round(trunc / tasks * 100, 1) if tasks else 0.0
+        prev_avg = round(prev["quality_sum"] / prev["quality_count"], 1) if prev.get("quality_count") else None
+
+        if prev_avg is None:
+            comparison = "No prior period to compare against"
+        elif avg > prev_avg:
+            comparison = f"This is better than last week ({prev_avg}/10 average)"
+        elif avg < prev_avg:
+            comparison = f"This is worse than last week ({prev_avg}/10 average)"
+        else:
+            comparison = f"This matches last week ({prev_avg}/10 average)"
+
+        return {
+            "period": current_week,
+            "files_generated": files,
+            "iterations": iterations,
+            "tasks_completed": tasks,
+            "average_quality": avg,
+            "truncation_rate": rate,
+            "truncation_events": trunc,
+            "comparison": comparison,
+            "previous_average": prev_avg,
+        }
 
     def get_summary(self) -> dict:
         s = self.stats
@@ -583,6 +665,38 @@ def _enhance_task(agent: HybridAgent, cfg: dict, args: argparse.Namespace,
     return (task_for_gemma, enhancement, False)
 
 
+def _scan_project_context(root: str, task: str = "") -> str:
+    """Scan the project and return a rendered context prompt (or '' on failure).
+
+    Emits status lines showing what was detected (architecture, file count, and
+    a token estimate) so the user sees the scan happening.
+    """
+    try:
+        _status("[hybrid] 🧠 Scanning project context...")
+        ctx = ProjectContext(root or ".")
+        ctx.scan()
+        if task:
+            ctx.find_relevant_files(task)
+        prompt = ctx.to_prompt()
+        arch = ctx.context.get("architecture", {})
+        files = ctx.context.get("structure", {}).get("files", [])
+        _status("[hybrid] 📂 Detected: type={} backend={} frontend={} "
+                "orm={} db={}".format(
+                    arch.get("type", "unknown"),
+                    arch.get("backend_framework", "-"),
+                    arch.get("frontend_framework", "-"),
+                    arch.get("orm", "-"),
+                    arch.get("database", "-"),
+                ))
+        _status(f"[hybrid] 📝 {len(files)} source files, "
+                f"deps={sum(len(v) for v in ctx.context.get('dependencies', {}).values())}")
+        _status(f"[hybrid] ✅ Context collected ({ctx.context.get('estimate_tokens', 0)} tokens)")
+        return prompt
+    except Exception as exc:  # noqa: BLE001 - never block the run on a scan failure
+        _status(f"[hybrid] ⚠ context scan failed: {exc}")
+        return ""
+
+
 def _select_backend(agent: HybridAgent, cfg: dict, route: str,
                     model_override: str | None):
     """Return the backend for `route`, applying the local model override.
@@ -716,7 +830,25 @@ def main() -> int:
                              "Default from $MODE, else hybrid")
     parser.add_argument("--stats", action="store_true",
                         help="print the 80/20 strategy summary (hybrid-agent/stats.json)")
+    parser.add_argument("--evaluate", action="store_true",
+                        help="print the self-evaluation report: files, iterations, "
+                             "quality, truncation rate, and comparison vs last week "
+                             "(hybrid-agent/stats.json)")
+    parser.add_argument("--context-scan", action="store_true",
+                        help="scan the project (structure, dependencies, architecture, "
+                             "coding standards, code examples) and inject the rendered "
+                             "context into the enhancement/supervise flow so DeepSeek "
+                             "and Gemma understand the codebase")
     args = parser.parse_args()
+
+    if args.evaluate:
+        r = StatsTracker().evaluate()
+        print("=== SELF-EVALUATION ===")
+        print(f"I generated {r['files_generated']} files in {r['iterations']} iterations")
+        print(f"Average quality score: {r['average_quality']}/10")
+        print(f"Truncation rate: {r['truncation_rate']}% ({r['truncation_events']}/{r['tasks_completed']} tasks)")
+        print(r['comparison'])
+        return 0
 
     if args.stats:
         summary = StatsTracker().get_summary()
@@ -816,6 +948,10 @@ def main() -> int:
 
         # Optional context (files/diff) goes into the review package via a builder.
         context = args.context or ""
+        if args.context_scan:
+            scanned = _scan_project_context(args.root, args.task)
+            if scanned:
+                context = (context + "\n\n" + scanned).strip() if context else scanned
 
         # --enhance: DeepSeek enhances the task and plans around Gemma's limits
         # BEFORE Gemma implements. The improved prompt + reasoning + plan are
@@ -888,6 +1024,17 @@ def main() -> int:
             if not applied and not skipped:
                 _status("[hybrid] ⚠ --apply: no path-labeled fenced blocks found in output")
 
+        # Record the session for self-evaluation (files, iterations, truncation,
+        # and the final quality score).
+        trunc_reasons = {"local_truncation_escalation", "cloud_fallback_truncated"}
+        final_quality = result.verdicts[-1].quality_score if result.verdicts else 0.0
+        stats.record_session(
+            files_generated=len(applied),
+            iterations=result.iterations,
+            truncation=result.reason in trunc_reasons,
+            quality=final_quality,
+        )
+
         tokens = {}
         if args.json:
             payload = {
@@ -942,6 +1089,10 @@ def main() -> int:
     cfg = _load_config_quiet(args.config or _default_config_path())
     agent = HybridAgent(cfg)
     context = args.context or ""
+    if args.context_scan:
+        scanned = _scan_project_context(args.root, args.task)
+        if scanned:
+            context = (context + "\n\n" + scanned).strip() if context else scanned
     mode = _resolve_mode(args)
     m = MODES[mode]
 
