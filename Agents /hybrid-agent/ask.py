@@ -766,6 +766,107 @@ def _looks_like_error(output: str) -> bool:
     return any(m in lowered for m in markers)
 
 
+# --- verification safety/cost/performance helpers -----------------------
+
+# Cap on the error text sent to DeepSeek so huge build logs don't waste tokens.
+_VERIFY_ERROR_CHARS = 4000
+
+# Allowlisted verification command prefixes (run via shell). Anything else is
+# blocked so a mis-set verify: [ ... ] can't run destructive commands.
+_SAFE_VERIFY_PREFIXES = (
+    "npm run build", "npm run test", "npm run lint", "npm run typecheck",
+    "npm run", "npm test",
+    "npx tsc", "npx eslint", "npx prettier --check",
+    "yarn build", "yarn test", "yarn lint",
+    "pnpm run build", "pnpm run test", "pnpm run lint",
+    "python -m pytest", "pytest", "python -m unittest", "unittest",
+    "make test", "make lint", "make build",
+    "go test", "go vet", "go build",
+    "cargo test", "cargo build", "cargo clippy",
+    "echo", "test -f",
+)
+
+# Shell metacharacters / commands that must never appear in a verify command.
+_DANGEROUS_VERIFY_MARKERS = (
+    "rm ", "rm -rf", "sudo", ">", ">>", "|", "`", "$(", "&&", "||", ";",
+    "chmod", "chown", "mkfs", "dd ", "shutdown", "reboot",
+)
+
+
+def _is_safe_verify_cmd(cmd: str) -> bool:
+    """Only allowlist verification commands; block destructive/compound shell."""
+    c = (cmd or "").strip().lower()
+    if not c:
+        return False
+    if any(m in c for m in _DANGEROUS_VERIFY_MARKERS):
+        return False
+    return c.startswith(_SAFE_VERIFY_PREFIXES)
+
+
+def _truncate_error(text: str, limit: int = _VERIFY_ERROR_CHARS) -> str:
+    if len(text) <= limit:
+        return text
+    return text[:limit] + f"\n... [truncated; first {limit} chars shown]"
+
+
+def _git_snapshot(root: str) -> str | None:
+    """Commit the working tree as a snapshot so fixes can be rolled back."""
+    try:
+        check = subprocess.run(["git", "rev-parse", "--is-inside-work-tree"],
+                               cwd=root, capture_output=True, text=True)
+        if check.returncode != 0:
+            return None
+        subprocess.run(["git", "add", "-A"], cwd=root, capture_output=True)
+        subprocess.run(["git", "commit", "-m", "hybrid-verify: snapshot before fixes",
+                        "--allow-empty"], cwd=root, capture_output=True)
+        sha = subprocess.run(["git", "rev-parse", "HEAD"], cwd=root,
+                             capture_output=True, text=True).stdout.strip()
+        return sha or None
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _git_restore(root: str, snapshot_sha: str, files: list[str]) -> None:
+    """Restore only the files DeepSeek fixed to their pre-fix snapshot state.
+
+    checkout restores tracked files to the snapshot; clean removes any fix
+    files that were untracked (newly created by the fix) and not in the
+    snapshot. Scoped strictly to the fix file paths.
+    """
+    if not files:
+        return
+    try:
+        subprocess.run(["git", "checkout", snapshot_sha, "--"] + files,
+                       cwd=root, capture_output=True)
+        subprocess.run(["git", "clean", "-fd", "--"] + files,
+                       cwd=root, capture_output=True)
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def _write_diff_log(root: str, files: list[str]) -> str:
+    """Write a unified diff of the fixed files; return log path ('' on failure)."""
+    if not files:
+        return ""
+    try:
+        proc = subprocess.run(["git", "diff", "--"] + files, cwd=root,
+                              capture_output=True, text=True)
+    except Exception:  # noqa: BLE001
+        return ""
+    diff = proc.stdout or ""
+    if not diff:
+        return ""
+    try:
+        log_dir = pathlib.Path(root) / "hybrid-verify"
+        log_dir.mkdir(exist_ok=True)
+        log_path = log_dir / "fixes.diff"
+        log_path.write_text(f"# hybrid-agent verification fixes\n\n{diff}",
+                            encoding="utf-8")
+        return str(log_path)
+    except OSError:
+        return ""
+
+
 def _deepseek_fix(cloud, task: str, error_text: str):
     """Ask DeepSeek to fix the errors and return the fixed files."""
     system = (
@@ -776,7 +877,7 @@ def _deepseek_fix(cloud, task: str, error_text: str):
     )
     user = (
         f"TASK:\n{task}\n\n"
-        f"VERIFICATION ERRORS:\n{error_text}\n\n"
+        f"VERIFICATION ERRORS:\n{_truncate_error(error_text)}\n\n"
         "Fix every error. Output corrected files as path-labeled fenced blocks."
     )
     return cloud.generate(ModelRequest(
@@ -785,49 +886,84 @@ def _deepseek_fix(cloud, task: str, error_text: str):
 
 
 def _run_final_verify(cloud, root: str, task: str, cmds, status,
-                      max_iter: int = 2) -> tuple[bool, str]:
+                      max_iter: int = 2, timeout_s: int = 600) -> tuple[bool, str]:
     """Final error-check stage: run verification commands and, on errors, have
     DeepSeek fix them (applied to disk) until clean or max_iter exhausted.
 
+    Safety: commands are allowlisted; the working tree is snapshotted before
+    fixes so a failed run rolls back the AI's changes; every fix is diff-logged.
     Returns (verified, report). verified True when all commands pass.
     """
     if not cmds:
         return True, "no verification commands configured"
+
+    unsafe = [c for c in cmds if not _is_safe_verify_cmd(c)]
+    if unsafe:
+        blocked = "; ".join(unsafe[:3])
+        status(f"[hybrid] ⛔ BLOCKED unsafe verify command(s): {blocked}")
+        return False, f"blocked unsafe verification commands: {blocked}"
+    safe_cmds = [c for c in cmds if _is_safe_verify_cmd(c)]
+
+    fixed_files: list[str] = []
+    snapshot: str | None = None
     for iteration in range(max_iter + 1):
         errors: list[str] = []
-        for cmd in cmds:
+        for cmd in safe_cmds:
             status(f"[hybrid] 🔍 verify: {cmd}")
             try:
                 proc = subprocess.run(cmd, shell=True, cwd=root,
-                                      capture_output=True, text=True, timeout=600)
+                                      capture_output=True, text=True,
+                                      timeout=timeout_s)
             except subprocess.TimeoutExpired:
-                errors.append(f"$ {cmd}\n[timed out]")
+                errors.append(f"$ {cmd}\n[timed out after {timeout_s}s]")
                 continue
             output = (proc.stdout or "") + "\n" + (proc.stderr or "")
             if proc.returncode != 0 or _looks_like_error(output):
                 errors.append(f"$ {cmd} (exit {proc.returncode})\n{output}")
+
         if not errors:
             status("[hybrid] ✅ verification passed")
+            if fixed_files:
+                log = _write_diff_log(root, fixed_files)
+                if log:
+                    status(f"[hybrid] 📄 fix diff: {log}")
             return True, "verification passed"
+
         error_text = "\n\n".join(errors)
-        status(f"[hybrid] ⚠ verification found {len(errors)} error(s) — "
-               f"DeepSeek fixing (attempt {iteration + 1}/{max_iter + 1})")
+        status(f"[hybrid] ⚠ {len(errors)} error(s) — DeepSeek fixing "
+               f"(attempt {iteration + 1}/{max_iter + 1})")
+        if snapshot is None:
+            snapshot = _git_snapshot(root)
         try:
             fix_text = _deepseek_fix(cloud, task, error_text)
         except Exception as exc:  # noqa: BLE001
             status(f"[hybrid] ⚠ DeepSeek fix failed: {exc}")
+            if snapshot:
+                _git_restore(root, snapshot, fixed_files)
             return False, error_text
+
         applied, skipped = _apply_fenced_files(fix_text, root)
         for rel, nbytes in applied:
             status(f"[hybrid] ✓ FIXED {rel} ({nbytes} B)")
+            fixed_files.append(rel)
         if skipped:
             status(f"[hybrid] ⚠ skipped {len(skipped)} fix block(s): "
                    f"{', '.join(skipped[:3])}")
         if not applied:
             status("[hybrid] ⚠ DeepSeek returned no fixable files")
+            if snapshot:
+                _git_restore(root, snapshot, fixed_files)
             return False, error_text
         if iteration >= max_iter:
             break
+
+    # Verification still failing after retries: roll back the AI's fixes.
+    if snapshot:
+        _git_restore(root, snapshot, fixed_files)
+        status(f"[hybrid] ↩ rolled back {len(fixed_files)} fix file(s) to snapshot")
+    log = _write_diff_log(root, fixed_files)
+    if log:
+        status(f"[hybrid] 📄 fix diff: {log}")
     status("[hybrid] ⛔ verification still failing after max attempts")
     return False, error_text
 
@@ -994,6 +1130,9 @@ def main() -> int:
                              "implies --verify")
     parser.add_argument("--verify-max", type=int, default=2,
                         help="max verify-fix iterations before giving up (default 2)")
+    parser.add_argument("--verify-timeout", type=int, default=0,
+                        help="per-command timeout in seconds for verification "
+                             "(default from review.verify_timeout, else 600)")
     args = parser.parse_args()
 
     if args.evaluate:
@@ -1209,9 +1348,11 @@ def main() -> int:
         if args.verify and not verify_cmds:
             verify_cmds = list(cfg.get("review", {}).get("verify", []) or [])
         if verify_cmds:
+            verify_timeout = (args.verify_timeout
+                              or cfg.get("review", {}).get("verify_timeout", 600))
             verified, verify_report = _run_final_verify(
                 cloud, args.root, args.task, verify_cmds, _status,
-                max_iter=args.verify_max)
+                max_iter=args.verify_max, timeout_s=verify_timeout)
         if not verified:
             _status("[hybrid] ⛔ FINAL CHECK FAILED: the task is NOT fully verified. "
                     "Fix DEEPSEEK_API_KEY/network, the verify command, or the code.")

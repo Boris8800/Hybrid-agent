@@ -42,6 +42,8 @@ review:
   # and re-verified (loop until clean). Empty = final check disabled.
   # Example: ["npm run build", "npx tsc --noEmit", "npm run lint"]
   verify: []
+  # Per-command timeout (seconds) for verification commands (default 600).
+  verify_timeout: 600
 
 circuit_breaker:
   window_size: 20

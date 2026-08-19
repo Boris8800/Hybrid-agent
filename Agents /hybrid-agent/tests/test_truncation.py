@@ -653,6 +653,60 @@ class FinalVerifyTests(unittest.TestCase):
                                              lambda l: None)
         self.assertTrue(verified)
 
+    def test_is_safe_verify_cmd(self):
+        from ask import _is_safe_verify_cmd
+        self.assertTrue(_is_safe_verify_cmd("npm run build"))
+        self.assertTrue(_is_safe_verify_cmd("npx tsc --noEmit"))
+        self.assertFalse(_is_safe_verify_cmd("rm -rf /"))
+        self.assertFalse(_is_safe_verify_cmd("sudo npm test"))
+        self.assertFalse(_is_safe_verify_cmd("echo hi; rm -rf /"))
+
+    def test_truncate_error(self):
+        from ask import _truncate_error
+        short = "x" * 100
+        self.assertEqual(_truncate_error(short, limit=200), short)
+        long = "x" * 500
+        out = _truncate_error(long, limit=200)
+        self.assertLess(len(out), len(long))
+        self.assertIn("truncated", out)
+
+    def test_run_final_verify_blocks_unsafe_command(self):
+        from ask import _run_final_verify
+        verified, report = _run_final_verify(None, ".", "task", ["rm -rf /"],
+                                             lambda l: None)
+        self.assertFalse(verified)
+        self.assertIn("blocked", report)
+
+    def test_run_final_verify_rolls_back_fixes_in_git(self):
+        import subprocess
+        import tempfile
+        from pathlib import Path
+        from backends.base import ModelResponse
+        from ask import _run_final_verify
+
+        root = Path(tempfile.mkdtemp())
+        for cmd, args in [
+            (["git", "init"], {}),
+            (["git", "config", "user.email", "t@t"], {}),
+            (["git", "config", "user.name", "t"], {}),
+            (["git", "add", "-A"], {}),
+            (["git", "commit", "-m", "init", "--allow-empty"], {}),
+        ]:
+            subprocess.run(cmd, cwd=root, capture_output=True, text=True, **args)
+
+        class FakeCloud:
+            def generate(self, req):
+                return ModelResponse(text="```ok.txt\ncreated\n```\n")
+
+        # 'test -f never.txt' always fails, so after retries the fix (ok.txt)
+        # must be rolled back to the pre-fix snapshot.
+        verified, report = _run_final_verify(
+            FakeCloud(), str(root), "task", ["test -f never.txt"],
+            lambda l: None, max_iter=1)
+        self.assertFalse(verified)
+        self.assertFalse((root / "ok.txt").exists(),
+                         "failed verification must roll back the AI's fixes")
+
 
 if __name__ == "__main__":
     unittest.main()
