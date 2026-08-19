@@ -520,6 +520,69 @@ def _build_request(agent: HybridAgent, args: argparse.Namespace,
     )
 
 
+MAX_CLARIFY_ROUNDS = 3
+
+
+def _enhance_task(agent: HybridAgent, cfg: dict, args: argparse.Namespace,
+                  task: str, context: str):
+    """Run DeepSeek prompt-enhancement with an interactive clarification loop.
+
+    DeepSeek ENHANCES the prompt and plans around the local model's limits. If
+    it finds the task ambiguous it emits clarifying questions: interactively we
+    ask the user to adjust the prompt (re-enhancing up to MAX_CLARIFY_ROUNDS),
+    otherwise we stop and report that clarification is needed.
+
+    Returns (task_for_gemma, enhancement, clar_needed). Raises on generation
+    failure so the caller handles it.
+    """
+    current = task
+    enhancement = None
+    for round_num in range(MAX_CLARIFY_ROUNDS):
+        enh_label = "deepseek (prompt enhancer)"
+        _status(f"[hybrid] ▶ {enh_label} working on \"{_task_preview(current)}\" ...")
+        enh_resp = _generate_with_retry(
+            agent, cfg, args, "deepseek", _enhance_request(current, context)
+        )
+        enhancement = parse_enhancement(enh_resp.text)
+        _status(f"[hybrid] ✓ {enh_label} done · {int(enh_resp.latency_ms)} ms · "
+                f"tokens={_format_tokens(enh_resp)}")
+
+        if not args.json:
+            print("=== ENHANCED PROMPT ===\n" + enhancement.enhanced_prompt)
+            if enhancement.reasoning:
+                print("\n=== REASONING ===\n" + enhancement.reasoning)
+            if enhancement.plan:
+                print("\n=== PLAN ===\n" + enhancement.plan)
+            if enhancement.clarifying_questions:
+                print("\n=== CLARIFYING QUESTIONS ===\n" + enhancement.clarifying_questions)
+
+        if not enhancement.clarifying_questions:
+            break  # prompt is clear
+        if not sys.stdin.isatty():
+            # Non-interactive: surface the questions and let the caller stop so
+            # the user can adjust the prompt and re-run.
+            return (current, enhancement, True)
+        print("\nThe task has ambiguities. Make the prompt clear and concise "
+              "by answering DeepSeek's questions.")
+        try:
+            answer = input("Your clarification (press Enter to proceed as-is): ").strip()
+        except (EOFError, KeyboardInterrupt):
+            break
+        if not answer:
+            break
+        current = current + "\n\nUSER CLARIFICATION:\n" + answer
+        _status(f"[hybrid] ↻ clarification #{round_num + 1} received — re-enhancing")
+
+    task_for_gemma = (
+        enhancement.enhanced_prompt
+        if enhancement and enhancement.enhanced
+        else current
+    )
+    if not args.json:
+        print("\n--- sending enhanced prompt to local model ---\n")
+    return (task_for_gemma, enhancement, False)
+
+
 def _select_backend(agent: HybridAgent, cfg: dict, route: str,
                     model_override: str | None):
     """Return the backend for `route`, applying the local model override.
@@ -756,35 +819,26 @@ def main() -> int:
 
         # --enhance: DeepSeek enhances the task and plans around Gemma's limits
         # BEFORE Gemma implements. The improved prompt + reasoning + plan are
-        # shown, then the enhanced prompt is what Gemma implements.
+        # shown (and DeepSeek asks for clarification if the task is unclear),
+        # then the enhanced prompt is what Gemma implements.
         enhancement = None
         task_for_gemma = args.task
         if args.enhance:
-            enh_label = "deepseek (prompt enhancer)"
-            _status(f"[hybrid] ▶ {enh_label} working on \"{_task_preview(args.task)}\" ...")
             try:
-                enh_resp = _generate_with_retry(
-                    agent, cfg, args, "deepseek",
-                    _enhance_request(args.task, context),
-                )
+                task_for_gemma, enhancement, clar_needed = _enhance_task(
+                    agent, cfg, args, args.task, context)
             except KeyboardInterrupt:
                 return 130
             except Exception as exc:  # noqa: BLE001 - report cleanly
-                _status(f"[hybrid] ✗ {enh_label} failed")
+                _status("[hybrid] ✗ deepseek (prompt enhancer) failed")
                 print(f"error: {exc}", file=sys.stderr)
                 return 3
-            enhancement = parse_enhancement(enh_resp.text)
-            _status(f"[hybrid] ✓ {enh_label} done · {int(enh_resp.latency_ms)} ms · "
-                    f"tokens={_format_tokens(enh_resp)}")
-            if not args.json:
-                print("=== ENHANCED PROMPT ===\n" + enhancement.enhanced_prompt)
-                if enhancement.reasoning:
-                    print("\n=== REASONING ===\n" + enhancement.reasoning)
-                if enhancement.plan:
-                    print("\n=== PLAN ===\n" + enhancement.plan)
-                print("\n--- sending enhanced prompt to local model ---\n")
-            if enhancement.enhanced:
-                task_for_gemma = enhancement.enhanced_prompt
+            if clar_needed:
+                _status("[hybrid] ⛔ TASK UNCLEAR: clarify the prompt and re-run.")
+                print("CLARIFICATION_NEEDED: the task has ambiguities. Re-run with a "
+                      "clearer --task, or run interactively to answer DeepSeek's "
+                      "questions.", file=sys.stderr)
+                return 4
 
         def _pkg(task: str, code: str, iteration: int) -> ReviewPackage:
             return ReviewPackage(
@@ -914,8 +968,9 @@ def main() -> int:
         return 2
 
     # --enhance (standalone, local route): DeepSeek enhances the prompt and plans
-    # around Gemma's limits, shows the improved prompt + reasoning + plan, then
-    # the ENHANCED prompt is what the local model implements.
+    # around Gemma's limits, shows the improved prompt + reasoning + plan (and
+    # asks for clarification if the task is unclear), then the ENHANCED prompt
+    # is what the local model implements.
     if args.enhance:
         if not MODES[mode]["api_supervision"]:
             _status(f"[hybrid] ⛔ refusal: mode={mode} has no API supervision (only hybrid enables it).")
@@ -925,30 +980,23 @@ def main() -> int:
             _status("[hybrid] ⛔ refusal: --enhance needs the local model as implementer.")
             print("error: --enhance is for the local route; use --local or MODE=hybrid/local.", file=sys.stderr)
             return 3
-        enh_label = "deepseek (prompt enhancer)"
-        _status(f"[hybrid] ▶ {enh_label} working on \"{_task_preview(args.task)}\" ...")
         try:
-            enh_resp = _generate_with_retry(
-                agent, cfg, args, "deepseek", _enhance_request(args.task, context)
-            )
+            task_for_gemma, enhancement, clar_needed = _enhance_task(
+                agent, cfg, args, args.task, context)
         except KeyboardInterrupt:
             return 130
         except Exception as exc:  # noqa: BLE001 - report cleanly
-            _status(f"[hybrid] ✗ {enh_label} failed")
+            _status("[hybrid] ✗ deepseek (prompt enhancer) failed")
             print(f"error: {exc}", file=sys.stderr)
             return 3
-        enhancement = parse_enhancement(enh_resp.text)
-        _status(f"[hybrid] ✓ {enh_label} done · {int(enh_resp.latency_ms)} ms · "
-                f"tokens={_format_tokens(enh_resp)}")
-        if not args.json:
-            print("=== ENHANCED PROMPT ===\n" + enhancement.enhanced_prompt)
-            if enhancement.reasoning:
-                print("\n=== REASONING ===\n" + enhancement.reasoning)
-            if enhancement.plan:
-                print("\n=== PLAN ===\n" + enhancement.plan)
-            print("\n--- sending enhanced prompt to local model ---\n")
+        if clar_needed:
+            _status("[hybrid] ⛔ TASK UNCLEAR: clarify the prompt and re-run.")
+            print("CLARIFICATION_NEEDED: the task has ambiguities. Re-run with a "
+                  "clearer --task, or run interactively to answer DeepSeek's "
+                  "questions.", file=sys.stderr)
+            return 4
         if enhancement.enhanced:
-            args.task = enhancement.enhanced_prompt
+            args.task = task_for_gemma
 
     req = _build_request(agent, args, route, context)
     model_label = _model_label(cfg, route, args.model)

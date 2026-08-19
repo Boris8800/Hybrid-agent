@@ -82,11 +82,13 @@ class Enhancement:
 
     Produced BEFORE the local model implements, so the API model can clarify
     the task and size a plan to the local model's context/output limits.
+    May also carry clarifying questions when the original task is ambiguous.
     """
 
     enhanced_prompt: str = ""
     reasoning: str = ""
     plan: str = ""
+    clarifying_questions: str = ""
     raw: str = ""
 
     @property
@@ -112,6 +114,7 @@ def parse_enhancement(raw: str) -> Enhancement:
     enh.enhanced_prompt = _section("ENHANCED PROMPT")
     enh.reasoning = _section("REASONING")
     enh.plan = _section("PLAN")
+    enh.clarifying_questions = _section("CLARIFYING QUESTIONS")
     if not enh.enhanced_prompt:
         enh.enhanced_prompt = raw.strip()
     return enh
@@ -448,6 +451,11 @@ def _enhance_request(task: str, context: str = "") -> ModelRequest:
             "<what you improved and why>\n"
             "=== PLAN ===\n"
             "<step-by-step plan>\n\n"
+            "=== CLARIFYING QUESTIONS ===\n"
+            "ONLY include this section if the ORIGINAL USER TASK is ambiguous, "
+            "under-specified, or unclear. List 1-5 concise, concrete questions or "
+            "answer-options (e.g., exact target files, expected behavior, edge cases, "
+            "scope). If the task is already clear, OMIT this section entirely.\n\n"
             f"{_local_limits_note()}"
         ),
         user=f"ORIGINAL USER TASK:\n{task}\n"

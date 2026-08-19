@@ -259,6 +259,23 @@ class EnhancementTests(unittest.TestCase):
         self.assertTrue(result.enhanced)
         self.assertEqual(result.raw, raw)
 
+    def test_parse_enhancement_clarifying_questions(self):
+        from supervise import parse_enhancement
+        raw = (
+            "=== ENHANCED PROMPT ===\nA clear prompt\n"
+            "=== REASONING ===\nwhy\n=== PLAN ===\nplan\n"
+            "=== CLARIFYING QUESTIONS ===\nQ1: which file?\nQ2: expected behavior?"
+        )
+        result = parse_enhancement(raw)
+        self.assertIn("Q1: which file?", result.clarifying_questions)
+        self.assertIn("Q2: expected behavior?", result.clarifying_questions)
+
+    def test_parse_enhancement_no_clarifying_questions(self):
+        from supervise import parse_enhancement
+        raw = "=== ENHANCED PROMPT ===\nClear\n=== PLAN ===\nplan"
+        result = parse_enhancement(raw)
+        self.assertEqual(result.clarifying_questions, "")
+
     def test_parse_enhancement_fallback_raw(self):
         from supervise import parse_enhancement
         raw = "Just a plain prompt without sections"
@@ -281,6 +298,101 @@ class EnhancementTests(unittest.TestCase):
         from supervise import _enhance_request
         req = _enhance_request('task', 'ctx info')
         self.assertIn('ctx info', req.user)
+
+    def test_enhance_request_instructs_clarification(self):
+        from supervise import _enhance_request
+        req = _enhance_request('task')
+        self.assertIn('CLARIFYING QUESTIONS', req.system)
+        self.assertIn('ambiguous', req.system)
+        self.assertIn('OMIT this section', req.system)
+
+
+class EnhanceTaskClarificationTests(unittest.TestCase):
+    """The --enhance clarification loop: DeepSeek flags an unclear task, the
+    bridge either asks the user (interactive) or stops for clarification."""
+
+    def setUp(self):
+        import io as _io
+        import ask
+        self.ask = ask
+        self._orig_generate = ask._generate_with_retry
+        self._orig_stdin = sys.stdin
+        self._orig_stdout = sys.stdout
+        # _enhance_task prints the enhanced prompt/questions to stdout; silence it.
+        sys.stdout = _io.StringIO()
+
+    def tearDown(self):
+        self.ask._generate_with_retry = self._orig_generate
+        sys.stdin = self._orig_stdin
+        sys.stdout = self._orig_stdout
+
+    @staticmethod
+    def _resp(text):
+        from backends.base import ModelResponse
+        r = ModelResponse(text=text)
+        r.latency_ms = 10.0
+        r.token_usage = {}
+        return r
+
+    @staticmethod
+    def _stdin(isatty, answers=()):
+        class FakeStdin:
+            def __init__(self, tty, ans):
+                self._tty = tty
+                self._ans = list(ans)
+            def isatty(self):
+                return self._tty
+            def readline(self):
+                return (self._ans.pop(0) if self._ans else "") + "\n"
+        return FakeStdin(isatty, answers)
+
+    @staticmethod
+    def _args():
+        return type("A", (), {"json": False})()
+
+    def test_non_tty_unclear_stops_for_clarification(self):
+        def fake_gen(agent, cfg, args, route, req):
+            return self._resp(
+                "=== ENHANCED PROMPT ===\nEnhanced\n"
+                "=== CLARIFYING QUESTIONS ===\nQ1: which file?")
+        self.ask._generate_with_retry = fake_gen
+        sys.stdin = self._stdin(False)
+        task_for_gemma, enh, clar = self.ask._enhance_task(
+            object(), {}, self._args(), "vague task", "")
+        self.assertTrue(clar)
+        self.assertIn("Q1: which file?", enh.clarifying_questions)
+
+    def test_interactive_answer_re_enhances_and_uses_clarification(self):
+        calls = []
+
+        def fake_gen(agent, cfg, args, route, req):
+            calls.append(req.user)
+            if len(calls) == 1:
+                return self._resp(
+                    "=== ENHANCED PROMPT ===\nEnhanced v1\n"
+                    "=== CLARIFYING QUESTIONS ===\nQ1: which file?")
+            return self._resp("=== ENHANCED PROMPT ===\nEnhanced v2\n=== PLAN ===\np")
+        self.ask._generate_with_retry = fake_gen
+        sys.stdin = self._stdin(True, answers=["use users.py"])
+        task_for_gemma, enh, clar = self.ask._enhance_task(
+            object(), {}, self._args(), "vague task", "")
+        self.assertEqual(len(calls), 2, "clarification must trigger a re-enhance")
+        self.assertIn("USER CLARIFICATION", calls[1])
+        self.assertIn("use users.py", calls[1])
+        self.assertFalse(clar)
+        self.assertEqual(task_for_gemma, "Enhanced v2")
+
+    def test_interactive_skip_proceeds_with_enhanced_prompt(self):
+        def fake_gen(agent, cfg, args, route, req):
+            return self._resp(
+                "=== ENHANCED PROMPT ===\nEnhanced\n"
+                "=== CLARIFYING QUESTIONS ===\nQ1: scope?")
+        self.ask._generate_with_retry = fake_gen
+        sys.stdin = self._stdin(True, answers=[""])
+        task_for_gemma, enh, clar = self.ask._enhance_task(
+            object(), {}, self._args(), "task", "")
+        self.assertFalse(clar)
+        self.assertEqual(task_for_gemma, "Enhanced")
 
 
 if __name__ == "__main__":
