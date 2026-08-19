@@ -11,6 +11,7 @@ Run:  python agent.py --task "add validation to validate_email"
 
 import argparse
 import importlib
+import os
 
 from backends.base import Backend, ModelRequest
 from backends.circuit_breaker import CircuitBreaker
@@ -35,6 +36,7 @@ DEFAULT_CONFIG = {
     "backends": {
         "local": {
             "base_url": "http://localhost:1234/v1",
+            "api_key": "lm-studio",
             "model": "gemma-4-12b",
             "timeout_s": 10,
             "max_retries": 3,
@@ -43,6 +45,7 @@ DEFAULT_CONFIG = {
         },
         "deepseek": {
             "api_key_env": "DEEPSEEK_API_KEY",
+            "base_url": "https://api.deepseek.com",
             "model": "deepseek-chat",
             "timeout_s": 30,
             "max_retries": 4,
@@ -80,10 +83,12 @@ class HybridAgent:
             dc = self.cfg["backends"]["deepseek"]
             self._local = GemmaBackend(
                 lc["base_url"], lc["model"],
+                api_key=lc.get("api_key") or "lm-studio",
                 timeout_s=lc["timeout_s"], max_retries=lc["max_retries"],
             )
             self._cloud = DeepSeekBackend(
                 dc["api_key_env"], dc["model"],
+                base_url=dc.get("base_url") or "https://api.deepseek.com",
                 timeout_s=dc["timeout_s"], max_retries=dc["max_retries"],
             )
         return self._local, self._cloud
@@ -200,6 +205,36 @@ def _load_config(path: str | None) -> dict:
         return DEFAULT_CONFIG
 
 
+def apply_env_overrides(cfg: dict) -> dict:
+    """Apply provider-agnostic model/endpoint overrides from the environment.
+
+    Roles stay architecture (local implementer, API supervisor); only the
+    concrete model and endpoint are reconfigurable:
+      LOCAL_MODEL     local backend model id
+      LOCAL_BASE_URL  local OpenAI-compatible endpoint
+      LOCAL_API_KEY   local endpoint key (defaults to "lm-studio")
+      API_MODEL       API backend model id
+      API_BASE_URL    API OpenAI-compatible endpoint (e.g. any vendor)
+      API_KEY_ENV     env var holding the API key
+    """
+    lc = cfg["backends"]["local"]
+    dc = cfg["backends"]["deepseek"]
+    if os.environ.get("LOCAL_MODEL"):
+        lc["model"] = os.environ["LOCAL_MODEL"]
+    if os.environ.get("LOCAL_BASE_URL"):
+        lc["base_url"] = os.environ["LOCAL_BASE_URL"].rstrip("/")
+    if os.environ.get("LOCAL_API_KEY"):
+        lc["api_key"] = os.environ["LOCAL_API_KEY"]
+    if os.environ.get("API_MODEL"):
+        dc["model"] = os.environ["API_MODEL"]
+    if os.environ.get("API_BASE_URL"):
+        dc["base_url"] = os.environ["API_BASE_URL"].rstrip("/")
+    if os.environ.get("API_KEY_ENV"):
+        dc["api_key_env"] = os.environ["API_KEY_ENV"]
+    cfg.setdefault("roles", {"implementer": "local", "supervisor": "deepseek"})
+    return cfg
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Hybrid coding agent (Gemma 4 12B + DeepSeek)")
     parser.add_argument("--task", required=True, help="coding task description")
@@ -210,6 +245,7 @@ def main() -> None:
     args = parser.parse_args()
 
     cfg = _load_config(args.config)
+    cfg = apply_env_overrides(cfg)
     task = args.task if not args.file else f"{args.task} (in {args.file})"
 
     agent = HybridAgent(cfg)

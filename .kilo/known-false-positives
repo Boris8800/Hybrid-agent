@@ -2,6 +2,6 @@
 # "Failed to parse frontmatter" warning, but `kilo config check` passes.
 # These are known false positives — the files are valid.
 # Source of truth: `kilo config check`.
-.kilo/agent/hybrid.md  # '*' bold at line ~15 triggers YAML alias/anchor parse
+.kilo/agent/hybrid.md  # '*' bold at line ~15 and in AGENT LAWS section triggers YAML alias/anchor parse
 .kilo/agent/local.md   # body content triggers the same whole-file parse issue
 .kilo/agent/code.md    # body content triggers the same whole-file parse issue

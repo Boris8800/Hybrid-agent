@@ -21,6 +21,8 @@ import io
 import json
 import os
 import pathlib
+import re
+import subprocess
 import sys
 import time
 import urllib.request
@@ -29,11 +31,40 @@ from backends.base import ModelRequest, ModelResponse
 from backends.local_gemma import GemmaBackend
 from router.confidence import MemoryView
 
-from agent import HybridAgent, _load_config
+from agent import HybridAgent, _load_config, apply_env_overrides
 from backends.deepseek import _resolve_api_key
-from supervise import ReviewPackage, supervise
+from supervise import GEMMA_MAX_TOKENS, ReviewPackage, supervise
 
-LM_STUDIO_BASE = "http://localhost:1234/v1"
+# --- Self-heal: loading config.yml requires PyYAML + openai, which exist only
+# in the project venv (hybrid-agent/.venv). When invoked with a system python3
+# that lacks them, ask.py silently fell back to embedded defaults (10s local
+# timeout, unloaded model id "gemma-4-12b") - the root cause of slow and
+# truncated local generations. Re-exec with the venv interpreter instead.
+# Guarded by env var so the re-exec cannot loop.
+if os.environ.get("HYBRID_REHEALED") != "1":
+    try:
+        import yaml  # noqa: F401
+    except ImportError:
+        venv_python = pathlib.Path(__file__).resolve().parent / ".venv" / "bin" / "python"
+        if venv_python.is_file():
+            try:
+                probe = subprocess.run(
+                    [str(venv_python), "-c", "import yaml, openai"],
+                    capture_output=True, timeout=10,
+                )
+            except subprocess.SubprocessError:
+                probe = None
+            if probe is not None and probe.returncode == 0:
+                sys.stderr.write(
+                    "[hybrid] re-exec'ing with project venv python "
+                    "(PyYAML/openai missing in current interpreter)\n"
+                )
+                os.environ["HYBRID_REHEALED"] = "1"
+                os.execv(str(venv_python), [str(venv_python), str(pathlib.Path(__file__).resolve()), *sys.argv[1:]])
+        sys.stderr.write(
+            "[hybrid] warning: PyYAML not available anywhere - using embedded defaults "
+            "(local timeout may be too short, expect slow/truncated local calls)\n"
+        )
 
 REVIEW_PROMPT_FILE = pathlib.Path(__file__).resolve().parent / "review" / "supervisor.md"
 
@@ -176,6 +207,46 @@ def _default_config_path() -> str | None:
     return None
 
 
+def is_kilo_logged_in() -> bool:
+    """Check whether a DeepSeek API key is resolvable (env → Kilo auth.json
+    → Kilo config) without actually calling the API."""
+    return _resolve_api_key("DEEPSEEK_API_KEY") is not None
+
+
+def _apply_role_overrides(cfg: dict) -> dict:
+    """Apply model-agnostic role configuration (see agent.apply_env_overrides)."""
+    return apply_env_overrides(cfg)
+
+
+# Mode-based role enforcement (architecture, not a soft rule).
+# Each mode declares which endpoint may implement and whether API supervision
+# is available. Enforcement uses the mode, not an env escape hatch.
+MODES = {
+    "hybrid": {"local_impl": True, "api_impl": False, "api_supervision": True},
+    "local":  {"local_impl": True, "api_impl": False, "api_supervision": False},
+    "code":   {"local_impl": False, "api_impl": True,  "api_supervision": False},
+}
+
+
+def _resolve_mode(args: argparse.Namespace) -> str:
+    """Resolve the agent mode: --mode > $MODE > 'hybrid'."""
+    if args.mode:
+        return args.mode
+    return os.environ.get("MODE", "hybrid")
+
+
+def _mode_impl_violation(mode: str, route: str) -> str | None:
+    """Return a violation message if `route` is not an allowed implementer for `mode`."""
+    m = MODES.get(mode)
+    if not m:
+        return f"unknown mode {mode!r} (use hybrid|local|code)"
+    if route == "local" and not m["local_impl"]:
+        return f"mode={mode} does not allow LOCAL implementation (use --deepseek, the API implementer)"
+    if route == "deepseek" and not m["api_impl"]:
+        return f"mode={mode} forbids API implementation (the local model is the implementer; use --local or --supervise)"
+    return None
+
+
 def _load_config_quiet(path: str | None) -> dict:
     """Load config, diverting _load_config's warnings to stderr so stdout
     stays clean (stdout carries the full untruncated model output)."""
@@ -184,7 +255,7 @@ def _load_config_quiet(path: str | None) -> dict:
         cfg = _load_config(path)
     if buf.getvalue():
         sys.stderr.write(buf.getvalue())
-    return cfg
+    return _apply_role_overrides(cfg)
 
 
 def _normalize_tokens(tokens) -> dict:
@@ -246,10 +317,12 @@ def _http_generate(base_url: str, api_key: str, model: str, req: ModelRequest,
                     data = json.loads(resp.read().decode())
                     text = data["choices"][0]["message"]["content"] or ""
                     usage = data.get("usage") or {}
+                    truncated = data["choices"][0].get("finish_reason") == "length"
                 else:
                     pieces: list[str] = []
                     usage: dict = {}
                     marker = False
+                    finish_reason = None
                     for raw_line in resp:
                         line = raw_line.decode("utf-8", "replace").strip()
                         if not line.startswith("data:"):
@@ -264,6 +337,9 @@ def _http_generate(base_url: str, api_key: str, model: str, req: ModelRequest,
                         if chunk.get("usage"):
                             usage = chunk["usage"] or {}
                         delta = (chunk.get("choices") or [{}])[0].get("delta", {}).get("content")
+                        fr = (chunk.get("choices") or [{}])[0].get("finish_reason")
+                        if fr:
+                            finish_reason = fr
                         if not delta:
                             continue
                         if not marker:
@@ -276,11 +352,13 @@ def _http_generate(base_url: str, api_key: str, model: str, req: ModelRequest,
                         sys.stderr.write("\n")
                         sys.stderr.flush()
                     text = "".join(pieces)
+                    truncated = finish_reason == "length"
             return ModelResponse(
                 text=text, raw=text,
                 token_usage=usage,
                 latency_ms=(time.monotonic() - started) * 1000,
                 backend="http-fallback",
+                truncated=truncated,
             )
         except Exception as exc:  # noqa: BLE001 - retry then surface
             last = exc
@@ -299,20 +377,22 @@ def _generate(agent: HybridAgent, cfg: dict, args: argparse.Namespace,
     if route == "local" and stream:
         lc = cfg["backends"]["local"]
         base_url = lc["base_url"]
-        api_key = "lm-studio"
+        api_key = lc.get("api_key") or "lm-studio"
         model = args.model or lc["model"]
         return _http_generate(base_url, api_key, model, req, stream=True)
+
     if _have_openai():
         backend = _select_backend(agent, cfg, route, args.model)
         return backend.generate(req)
+
     if route == "local":
         lc = cfg["backends"]["local"]
         base_url = lc["base_url"]
-        api_key = "lm-studio"
+        api_key = lc.get("api_key") or "lm-studio"
         model = args.model or lc["model"]
     else:
         dc = cfg["backends"]["deepseek"]
-        base_url = "https://api.deepseek.com"
+        base_url = dc.get("base_url") or "https://api.deepseek.com"
         api_key = _resolve_api_key(dc["api_key_env"])
         model = dc["model"]
         if not api_key:
@@ -321,32 +401,74 @@ def _generate(agent: HybridAgent, cfg: dict, args: argparse.Namespace,
                           stream=stream and route == "local")
 
 
+MAX_OUTPUT_TOKENS = 8192
+# Local (LM Studio) has no vendor output cap; allow a larger budget there so a
+# full multi-file response survives the truncation retry. DeepSeek's API caps
+# output at 8192, so the deepseek route keeps MAX_OUTPUT_TOKENS.
+LOCAL_MAX_OUTPUT_TOKENS = 16384
+
+
+def _generate_with_retry(agent: HybridAgent, cfg: dict, args: argparse.Namespace,
+                         route: str, req: ModelRequest,
+                         stream: bool = False) -> ModelResponse:
+    """Generate, and when the output hits the token cap, retry ONCE with a
+    doubled budget so truncated files are never returned silently. Long local
+    generations (especially thinking-mode models) routinely need more than a
+    single 2k budget; this is the guard that makes truncation rare."""
+    cap = LOCAL_MAX_OUTPUT_TOKENS if route == "local" else MAX_OUTPUT_TOKENS
+    resp = _generate(agent, cfg, args, route, req, stream=stream)
+    if resp.truncated and resp.text and req.max_tokens < cap:
+        req.max_tokens = min(req.max_tokens * 2, cap)
+        req.timeout_s = int(req.timeout_s * 1.5)
+        _status(f"[hybrid] ⚠ TRUNCATED at {req.max_tokens // 2} tokens - "
+                f"retrying once with {req.max_tokens}")
+        resp = _generate(agent, cfg, args, route, req, stream=stream)
+        if resp.truncated:
+            _status("[hybrid] ⚠ still truncated after retry - output is incomplete, do not apply blindly")
+    return resp
+
+
+def _format_tokens(resp: ModelResponse) -> dict:
+    """Token usage for the status line. LM Studio's streaming path does not
+    return usage, so fall back to an estimate so the line is never empty."""
+    tokens = _normalize_tokens(resp.token_usage)
+    if not tokens and resp.text:
+        tokens = {"completion_tokens": max(1, len(resp.text) // 4), "estimated": True}
+    return tokens
+
+
 def _supervise_gemma_generate(cfg: dict, model_override: str | None):
     """Return a streaming wrapper for the supervise loop's local (Gemma) step.
 
     Always streams Gemma's output live to stderr (via the HTTP path) so the
     user can SEE the local model working in every iteration, then returns the
-    full accumulated text for the review package.
+    full accumulated text for the review package. The local config timeout is
+    applied to every request: gemma4 thinking mode can legitimately take 1-2
+    minutes, and a short timeout would kill long full-file generations.
     """
     lc = cfg["backends"]["local"]
     base_url = lc["base_url"]
+    api_key = lc.get("api_key") or "lm-studio"
     model = model_override or lc["model"]
+    timeout_s = lc["timeout_s"]
 
     def _gen(req: ModelRequest) -> ModelResponse:
-        return _http_generate(base_url, "lm-studio", model, req, stream=True)
+        req.timeout_s = timeout_s
+        return _http_generate(base_url, api_key, model, req, stream=True)
 
     return _gen
 
 
-def _list_models() -> int:
-    """Print one loaded LM Studio model id per line. Exit 0 / 1."""
+def _list_models(base_url: str) -> int:
+    """Print one loaded model id per line from the local endpoint. Exit 0 / 1."""
+    base_url = base_url.rstrip("/")
     try:
         from openai import OpenAI
     except ImportError:  # pragma: no cover - fallback below keeps it working
         OpenAI = None  # type: ignore
 
     if OpenAI is not None:
-        client = OpenAI(base_url=LM_STUDIO_BASE, api_key="lm-studio")
+        client = OpenAI(base_url=base_url, api_key="lm-studio")
         try:
             for model in client.models.list().data:
                 print(model.id)
@@ -358,7 +480,7 @@ def _list_models() -> int:
     # No openai package: plain urllib GET with a short timeout.
     import urllib.request
     try:
-        with urllib.request.urlopen(f"{LM_STUDIO_BASE}/models", timeout=5) as resp:
+        with urllib.request.urlopen(f"{base_url}/models", timeout=5) as resp:
             payload = json.loads(resp.read().decode())
         for model in payload.get("data", []):
             print(model.get("id"))
@@ -392,7 +514,7 @@ def _build_request(agent: HybridAgent, args: argparse.Namespace,
     return ModelRequest(
         system=system,
         user=user,
-        max_tokens=args.max_tokens or 2048,
+        max_tokens=args.max_tokens or 4096,
         temperature=args.temperature or 0.2,
         timeout_s=timeout_s,
     )
@@ -416,6 +538,71 @@ def _select_backend(agent: HybridAgent, cfg: dict, route: str,
     )
 
 
+# --- --apply support: write path-labeled fenced code blocks to disk ----------
+
+# Extensions accepted as proof a fenced-block label is a file path (not a language).
+_APPLY_EXTENSIONS = {
+    "py", "js", "jsx", "ts", "tsx", "html", "css", "scss", "json", "jsonc",
+    "md", "yml", "yaml", "toml", "ini", "sh", "bash", "zsh", "sql", "txt",
+    "svg", "xml", "env", "prisma", "go", "rs", "java", "rb", "php", "vue",
+}
+
+
+def _parse_fenced_files(text: str) -> list[tuple[str, str]]:
+    """Parse path-labeled fenced code blocks from model output.
+
+    Accepts ```path, ```path/to/f.ext, ```lang path, and ```lang:path forms.
+    Returns [(relative_path, content)] in document order. Blocks whose label
+    has no plausible path (e.g. bare ```python``` with no filename) are ignored.
+    """
+    pattern = re.compile(r"```([^\n`]*)\n(.*?)```", re.S)
+    files = []
+    for m in pattern.finditer(text):
+        label = m.group(1).strip()
+        body = m.group(2)
+        if not label:
+            continue
+        path = None
+        for token in label.replace(":", " ").split():
+            t = token.strip("`").strip()
+            if not t or t.startswith("_"):
+                continue
+            # A plausible path: contains a "/" or ends with a known extension.
+            if "/" in t or t.lower().rsplit(".", 1)[-1] in _APPLY_EXTENSIONS:
+                path = t
+                break
+        if path:
+            files.append((path, body.rstrip("\n") + "\n"))
+    return files
+
+
+def _apply_fenced_files(text: str, root: str = ".") -> tuple[list[tuple[str, int]], list[str]]:
+    """Write path-labeled fenced blocks from `text` under `root`.
+
+    Returns (written, skipped): `written` is [(relative_path, bytes_written)],
+    `skipped` is a list of human-readable reasons. Absolute paths and paths
+    escaping `root` via ".." are never written.
+    """
+    root_abs = os.path.abspath(root)
+    written, skipped = [], []
+    for rel_path, content in _parse_fenced_files(text):
+        clean = rel_path.replace("\\", "/")
+        # Reject absolute paths and any ".." traversal BEFORE normalization.
+        if clean.startswith("/") or os.path.isabs(clean) \
+                or any(part == ".." for part in clean.split("/")):
+            skipped.append(f"{rel_path} (unsafe path)")
+            continue
+        target = os.path.normpath(os.path.join(root_abs, clean))
+        if target != root_abs and not target.startswith(root_abs + os.sep):
+            skipped.append(f"{rel_path} (escapes root)")
+            continue
+        os.makedirs(os.path.dirname(target), exist_ok=True)
+        with open(target, "w", encoding="utf-8") as fh:
+            fh.write(content)
+        written.append((os.path.relpath(target, root_abs), len(content.encode("utf-8"))))
+    return written, skipped
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(
         description="Hybrid bridge CLI (local LM Studio + DeepSeek cloud)"
@@ -436,7 +623,7 @@ def main() -> int:
     parser.add_argument("--auto", action="store_true",
                         help="let the router decide (default)")
     parser.add_argument("--model", help="override the local LM Studio model id")
-    parser.add_argument("--max-tokens", type=int, help="max output tokens (default 2048)")
+    parser.add_argument("--max-tokens", type=int, help="max output tokens (default 4096; auto-retries once with double budget on truncation)")
     parser.add_argument("--temperature", type=float, help="sampling temperature (default 0.2)")
     parser.add_argument("--config", help="path to an optional YAML config override")
     parser.add_argument("--json", action="store_true",
@@ -449,6 +636,15 @@ def main() -> int:
                              "(default max 3 iterations)")
     parser.add_argument("--max-iterations", type=int, default=3,
                         help="max supervise loop iterations (default 3)")
+    parser.add_argument("--apply", action="store_true",
+                        help="with --supervise: write the approved output's path-labeled "
+                             "fenced code blocks to disk under --root")
+    parser.add_argument("--root", default=".",
+                        help="directory to apply files under (default: current directory)")
+    parser.add_argument("--mode", choices=["hybrid", "local", "code"],
+                        help="agent mode: hybrid (local impl + API supervision), "
+                             "local (local impl, no API), code (API impl, no API supervision). "
+                             "Default from $MODE, else hybrid")
     parser.add_argument("--stats", action="store_true",
                         help="print the 80/20 strategy summary (hybrid-agent/stats.json)")
     args = parser.parse_args()
@@ -459,7 +655,8 @@ def main() -> int:
         return 0
 
     if args.models:
-        return _list_models()
+        cfg = _load_config_quiet(args.config or _default_config_path())
+        return _list_models(cfg["backends"]["local"]["base_url"])
 
     if args.route_only:
         if not args.task:
@@ -480,10 +677,16 @@ def main() -> int:
             print("error: --review requires --task and --code", file=sys.stderr)
             return 2
         cfg = _load_config_quiet(args.config or _default_config_path())
+        mode = _resolve_mode(args)
+        if not MODES[mode]["api_supervision"]:
+            _status(f"[hybrid] ⛔ refusal: mode={mode} has no API supervision (only hybrid enables it).")
+            print(f"error: --review requires hybrid mode (API supervision). Use MODE=hybrid.", file=sys.stderr)
+            return 3
         agent = HybridAgent(cfg)
         api_key_env = cfg["backends"]["deepseek"]["api_key_env"]
         if not _resolve_api_key(api_key_env):
-            print("error: DEEPSEEK_API_KEY is not set", file=sys.stderr)
+            print("error: No DeepSeek API key found. Please log in to Kilo or set "
+                  "DEEPSEEK_API_KEY.", file=sys.stderr)
             return 2
         system = args.system if args.system is not None else _load_supervisor_prompt()
         user = (
@@ -508,14 +711,14 @@ def main() -> int:
         via = "http-fallback" if not _have_openai() else "backend"
         _status(f"[hybrid] ▶ {model_label} working ... (via={via})")
         try:
-            resp = _generate(agent, cfg, args, "deepseek", req)
+            resp = _generate_with_retry(agent, cfg, args, "deepseek", req)
         except KeyboardInterrupt:
             return 130
         except Exception as exc:  # noqa: BLE001 - report any review failure cleanly
             _status(f"[hybrid] ✗ {model_label} failed")
             print(f"error: {exc}", file=sys.stderr)
             return 3
-        tokens = _normalize_tokens(resp.token_usage)
+        tokens = _format_tokens(resp)
         if args.json:
             print(json.dumps({"text": resp.text, "backend": resp.backend,
                               "latency_ms": int(resp.latency_ms), "tokens": tokens},
@@ -530,6 +733,11 @@ def main() -> int:
             print("error: --supervise requires --task", file=sys.stderr)
             return 2
         cfg = _load_config_quiet(args.config or _default_config_path())
+        mode = _resolve_mode(args)
+        if not MODES[mode]["api_supervision"]:
+            _status(f"[hybrid] ⛔ refusal: mode={mode} has no API supervision (only hybrid enables it).")
+            print(f"error: --supervise requires hybrid mode (API supervision). Use MODE=hybrid.", file=sys.stderr)
+            return 3
         agent = HybridAgent(cfg)
         if not _resolve_api_key(cfg["backends"]["deepseek"]["api_key_env"]):
             print("error: --supervise requires a DeepSeek key "
@@ -547,6 +755,15 @@ def main() -> int:
                 verification="None supplied — caller can pass --context with test/lint results.",
             )
 
+        # Results that must NEVER leave files behind: output was either never
+        # independently reviewed (review_failed_no_verdict) or is INCOMPLETE
+        # because even the DeepSeek fallback was truncated (cloud_fallback_truncated).
+        _UNSAFE_REASONS = {"review_failed_no_verdict", "cloud_fallback_truncated"}
+
+        if args.max_tokens is not None and args.max_tokens < 4096:
+            _status(f"[hybrid] ⚠ --max-tokens={args.max_tokens} is low — "
+                    "multi-file tasks need 8192+ (truncation will escalate)")
+
         result = supervise(
             local, cloud,
             task=args.task,
@@ -554,6 +771,7 @@ def main() -> int:
             max_iterations=args.max_iterations,
             gemma_generate=_supervise_gemma_generate(cfg, args.model),
             status=lambda line: _status(line),
+            gemma_max_tokens=args.max_tokens or GEMMA_MAX_TOKENS,
         )
         # Record 80/20 metrics.
         stats = StatsTracker()
@@ -561,6 +779,21 @@ def main() -> int:
             stats.record_review(v.decision, v.quality_score)
         if result.escalated:
             stats.record_fallback()
+
+        # With --apply: write the approved output's path-labeled fenced code
+        # blocks to disk. NEVER apply unreviewed or incomplete output: those
+        # paths return non-zero below and must not leave files behind.
+        applied: list[tuple[str, int]] = []
+        if args.apply and result.reason not in _UNSAFE_REASONS:
+            applied, skipped = _apply_fenced_files(result.final_text, args.root)
+            for rel, nbytes in applied:
+                _status(f"[hybrid] ✓ APPLIED {rel} ({nbytes} B)")
+            if skipped:
+                _status(f"[hybrid] ⚠ skipped {len(skipped)} block(s): "
+                        f"{', '.join(skipped[:3])}")
+            if not applied and not skipped:
+                _status("[hybrid] ⚠ --apply: no path-labeled fenced blocks found in output")
+
         tokens = {}
         if args.json:
             print(json.dumps({
@@ -570,9 +803,30 @@ def main() -> int:
                 "iterations": result.iterations,
                 "verdicts": [v.decision for v in result.verdicts],
                 "quality_scores": [v.quality_score for v in result.verdicts],
+                "applied_files": [rel for rel, _ in applied],
             }, ensure_ascii=False))
         else:
             print(_strip_confidence_tag(result.final_text))
+            if applied:
+                print(f"\nAPPLIED {len(applied)} file(s) to {os.path.abspath(args.root)}:")
+                for rel, nbytes in applied:
+                    print(f"  ✓ {rel} ({nbytes} B)")
+        if result.reason in _UNSAFE_REASONS:
+            # The output above is either UNREVIEWED (DeepSeek never returned a
+            # verdict) or INCOMPLETE (DeepSeek fallback truncated even after a
+            # same-budget retry). Report the failure and exit non-zero so callers
+            # cannot treat the result as supervised, complete, or safe to apply.
+            _status("[hybrid] ⛔ SUPERVISOR/OUTPUT FAILURE: output is "
+                    "unreviewed or INCOMPLETE (truncated) — NOT safe to apply.")
+            if not args.json:
+                print(
+                    "\nFAILURE: the output above was NOT independently reviewed or is "
+                    "INCOMPLETE (truncated). Do not treat it as supervised, complete, "
+                    "or safe to apply. Fix DEEPSEEK_API_KEY/network, raise --max-tokens, "
+                    "and retry.",
+                    file=sys.stderr,
+                )
+            return 3
         _status(f"[hybrid] ✓ supervise done · {result.iterations} iter · reason={result.reason} "
                 f"· verdicts={[v.decision for v in result.verdicts]} "
                 f"· scores={[v.quality_score for v in result.verdicts]}")
@@ -589,20 +843,29 @@ def main() -> int:
     cfg = _load_config_quiet(args.config or _default_config_path())
     agent = HybridAgent(cfg)
     context = args.context or ""
+    mode = _resolve_mode(args)
+    m = MODES[mode]
 
+    # Route resolution: explicit flags win, otherwise default to the mode's implementer.
     if args.local:
         route, reason = "local", "forced:--local"
     elif args.deepseek:
         route, reason = "deepseek", "forced:--deepseek"
-    else:
-        route, reason = agent.route(
-            args.task, context_chars=len(args.task) + len(context),
-            memory=MemoryView(),
-        )
+    elif mode in ("hybrid", "local"):
+        route, reason = "local", f"mode={mode} implementer"
+    else:  # code
+        route, reason = "deepseek", "mode=code implementer"
+
+    violation = _mode_impl_violation(mode, route)
+    if violation:
+        _status(f"[hybrid] ⛔ refusal: {violation} (route={route}).")
+        print(f"error: {violation}", file=sys.stderr)
+        return 3
 
     api_key_env = cfg["backends"]["deepseek"]["api_key_env"]
     if route == "deepseek" and not _resolve_api_key(api_key_env):
-        print("error: DEEPSEEK_API_KEY is not set", file=sys.stderr)
+        print("error: No DeepSeek API key found. Please log in to Kilo or set "
+              "DEEPSEEK_API_KEY.", file=sys.stderr)
         return 2
 
     req = _build_request(agent, args, route, context)
@@ -611,7 +874,7 @@ def main() -> int:
     streaming = " · streaming" if (args.stream and route == "local") else ""
     _status(f"[hybrid] ▶ {model_label} working on \"{_task_preview(args.task)}\" (route={route}, {reason}, via={via}{streaming})")
     try:
-        resp = _generate(agent, cfg, args, route, req, stream=args.stream)
+        resp = _generate_with_retry(agent, cfg, args, route, req, stream=args.stream)
     except KeyboardInterrupt:
         return 130
     except Exception as exc:  # noqa: BLE001 - report any generation failure cleanly
@@ -619,7 +882,9 @@ def main() -> int:
         print(f"error: {exc}", file=sys.stderr)
         return 3
 
-    tokens = _normalize_tokens(resp.token_usage)
+    tokens = _format_tokens(resp)
+    if resp.truncated:
+        _status("[hybrid] ⚠ TRUNCATED: output hit the max_tokens cap — do not apply blindly")
     if args.json:
         payload = {
             "text": resp.text,
@@ -628,6 +893,7 @@ def main() -> int:
             "backend": resp.backend,
             "latency_ms": int(resp.latency_ms),
             "tokens": tokens,
+            "truncated": resp.truncated,
         }
         print(json.dumps(payload, ensure_ascii=False))
     else:

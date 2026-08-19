@@ -14,13 +14,16 @@ except ImportError:  # pragma: no cover - dev can run router-only without client
 class GemmaBackend(Backend):
     name = "local-gemma"
 
-    def __init__(self, base_url: str, model: str, *, timeout_s: float = 10.0,
+    def __init__(self, base_url: str, model: str, *, api_key: str = "lm-studio",
+                 name: str = "local-gemma", timeout_s: float = 10.0,
                  max_retries: int = 3, backoff_s: list[float] | None = None,
                  cold_start_wait_s: float = 30.0):
         if OpenAI is None:
             raise RuntimeError("openai>=1.0 is required for the local backend")
-        self._client = OpenAI(base_url=base_url, api_key="lm-studio")
+        self._client = OpenAI(base_url=base_url, api_key=api_key)
         self.model = model
+        self.base_url = base_url
+        self.name = name
         self.timeout_s = timeout_s
         self.max_retries = max_retries
         self.backoff_s = backoff_s or [0.5, 1.0, 2.0]
@@ -41,12 +44,14 @@ class GemmaBackend(Backend):
                     temperature=request.temperature,
                 )
                 text = completion.choices[0].message.content or ""
+                truncated = completion.choices[0].finish_reason == "length"
                 return ModelResponse(
                     text=text,
                     raw=text,
                     token_usage=getattr(completion, "usage", {}),
                     latency_ms=(time.monotonic() - started) * 1000,
                     backend=self.name,
+                    truncated=truncated,
                 )
             except Exception as exc:  # noqa: BLE001 - surface as BackendError
                 status = getattr(getattr(exc, "response", None), "status_code", None)

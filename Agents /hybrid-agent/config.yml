@@ -14,7 +14,8 @@ router:
 
 backends:
   local:
-    base_url: "http://localhost:1234/v1"   # LM Studio OpenAI-compatible endpoint
+    base_url: "http://localhost:1234/v1"   # local OpenAI-compatible endpoint (LM Studio / Ollama / ...)
+    api_key: "lm-studio"                   # local endpoints usually ignore the key
     model: "google/gemma-4-12b-qat"
     # gemma4 runs in thinking mode (LM Studio ignores thinking-disable API params),
     # so legit calls can take 1-2 min. A 60s timeout was killing slow-but-working
@@ -23,8 +24,9 @@ backends:
     max_retries: 3
     backoff_s: [0.5, 1.0, 2.0]
     cold_start_wait_s: 30
-  deepseek:
+  deepseek:   # the "API" backend - any OpenAI-compatible endpoint works here
     api_key_env: "DEEPSEEK_API_KEY"
+    base_url: "https://api.deepseek.com"
     model: "deepseek-chat"
     timeout_s: 30
     max_retries: 4
@@ -45,3 +47,14 @@ circuit_breaker:
 memory:
   root: "./memory"
   max_project_summary_words: 200
+
+# Roles are architecture (permanent); model names are configuration.
+# The implementer is the local backend; the supervisor is the API backend.
+# Runtime overrides (env): LOCAL_MODEL, LOCAL_BASE_URL, LOCAL_API_KEY,
+# API_MODEL, API_BASE_URL, API_KEY_ENV. Example - swap the API supervisor to
+# another OpenAI-compatible vendor:
+#   API_BASE_URL=https://api.groq.com/openai/v1 API_MODEL=llama-3.3-70b-versatile
+#   API_KEY_ENV=GROQ_API_KEY
+roles:
+  implementer: "local"
+  supervisor: "deepseek"

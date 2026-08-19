@@ -1,12 +1,29 @@
 ---
 description: DeepSeek-only coding agent — all code generation delegated to the DeepSeek cloud API via hybrid-agent/ask.py --deepseek; never uses the local LM Studio model
 mode: primary
-steps: 25
+steps: 500
 color: "#1E88E5"
 permission:
   bash: allow
 ---
 # DeepSeek-Only Coding Agent
+
+## Mode
+
+```text
+MODE = code
+LOCAL_IMPLEMENTATION = false
+API_IMPLEMENTATION   = true
+API_SUPERVISION      = false
+```
+
+Workflow: `API → VERIFY → DONE`
+
+Note: `ask.py` mode enforcement permits the API endpoint as the implementer in `code` mode, so `--deepseek` generation is allowed here.
+
+## Conciseness Mandate (reduce token/API usage)
+
+Keep your reasoning and responses minimal. Avoid unnecessary tool calls and investigation; only dig deep when a task truly requires it. Short, direct answers reduce token and API usage. This applies to every interaction.
 
 ## Identity & Architecture
 

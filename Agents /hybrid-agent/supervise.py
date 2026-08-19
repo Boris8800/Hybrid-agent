@@ -140,7 +140,16 @@ def required_fixes_summary(verdict: Verdict) -> str:
 
 # --- prompts -------------------------------------------------------------
 
-def _gemma_primary_prompt(task: str, prior_fixes: str = "") -> ModelRequest:
+# Output budgets: Gemma must emit the FULL multi-file response in one shot, so
+# the default budget is generous and truncation is retried once with a doubled
+# budget (hard cap GEMMA_MAX_TOKENS_CAP) before any escalation.
+GEMMA_MAX_TOKENS = 8192
+GEMMA_MAX_TOKENS_CAP = 16384
+CLOUD_GEN_TOKENS = 8192
+
+
+def _gemma_primary_prompt(task: str, prior_fixes: str = "",
+                          max_tokens: int = GEMMA_MAX_TOKENS) -> ModelRequest:
     system = (
         "You are a careful mid-level engineer implementing a change. "
         "Write correct, minimal, well-structured code for the given task. "
@@ -150,7 +159,7 @@ def _gemma_primary_prompt(task: str, prior_fixes: str = "") -> ModelRequest:
     if prior_fixes:
         user += f"\nA senior reviewer previously asked you to fix these issues. Apply ALL of them now:\n{prior_fixes}\n"
     user += "\nOutput only the code changes, no preamble."
-    return ModelRequest(system=system, user=user, max_tokens=2048, temperature=0.2)
+    return ModelRequest(system=system, user=user, max_tokens=max_tokens, temperature=0.2)
 
 
 def _supervisor_request(pkg: ReviewPackage, verbose: bool = True) -> ModelRequest:
@@ -206,6 +215,7 @@ def supervise(
     max_iterations: int = 3,
     status: callable = None,
     gemma_generate: callable = None,
+    gemma_max_tokens: int = GEMMA_MAX_TOKENS,
 ) -> SuperviseResult:
     """Run Gemma-primary / DeepSeek-supervisor on a task.
 
@@ -231,14 +241,44 @@ def supervise(
         # 1. Gemma implements (streaming so the user sees it working).
         status(f"[supervise] iter {iteration}: Gemma working...")
         try:
-            resp: ModelResponse = gemma_generate(_gemma_primary_prompt(current, prior_fixes))
+            resp: ModelResponse = gemma_generate(
+                _gemma_primary_prompt(current, prior_fixes, max_tokens=gemma_max_tokens)
+            )
         except Exception as exc:  # noqa: BLE001
             status(f"[supervise] local failed ({exc}); escalating to DeepSeek")
-            plan = cloud.generate(_cloud_plan_request(task))
-            result.final_text = plan.text
+            text, still_truncated = _cloud_generate_guarded(cloud, task, status, use_plan=True)
+            result.final_text = text
             result.escalated = True
-            result.reason = "local_failure_escalation"
+            result.reason = "cloud_fallback_truncated" if still_truncated else "local_failure_escalation"
             return result
+
+        # Truncated local output must never reach the reviewer or be applied
+        # as if complete. Retry ONCE with a doubled budget (long multi-file
+        # generations routinely need more than a single budget); only escalate
+        # when the retry is still cut off.
+        if getattr(resp, "truncated", False):
+            retry_budget = min(gemma_max_tokens * 2, GEMMA_MAX_TOKENS_CAP)
+            if retry_budget >= gemma_max_tokens:
+                status(f"[supervise] iter {iteration}: Gemma output TRUNCATED at "
+                       f"{gemma_max_tokens} tokens - retrying once with {retry_budget}")
+                try:
+                    resp = gemma_generate(
+                        _gemma_primary_prompt(current, prior_fixes, max_tokens=retry_budget)
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    status(f"[supervise] local retry failed ({exc}); escalating to DeepSeek")
+                    text, still_truncated = _cloud_generate_guarded(cloud, task, status, use_plan=False)
+                    result.final_text = text
+                    result.escalated = True
+                    result.reason = "cloud_fallback_truncated" if still_truncated else "local_truncation_escalation"
+                    return result
+            if getattr(resp, "truncated", False):
+                status("[supervise] Gemma still TRUNCATED after retry; escalating to DeepSeek")
+                text, still_truncated = _cloud_generate_guarded(cloud, task, status, use_plan=False)
+                result.final_text = text
+                result.escalated = True
+                result.reason = "cloud_fallback_truncated" if still_truncated else "local_truncation_escalation"
+                return result
         code = resp.text
 
         # 2. Build the compact review package.
@@ -263,10 +303,10 @@ def supervise(
             return result
         if verdict.rejected:
             status(f"[supervise] iter {iteration}: REJECTED (score {verdict.quality_score:.1f}/10) — falling back to DeepSeek")
-            plan = cloud.generate(_cloud_generate_request(task))
-            result.final_text = plan.text
+            text, still_truncated = _cloud_generate_guarded(cloud, task, status, use_plan=False)
+            result.final_text = text
             result.escalated = True
-            result.reason = "deepseek_fallback_rejected"
+            result.reason = "cloud_fallback_truncated" if still_truncated else "deepseek_fallback_rejected"
             return result
 
         # FIX_REQUIRED: feed fixes back to Gemma.
@@ -276,19 +316,37 @@ def supervise(
 
     # Retries exhausted with FIX_REQUIRED: fall back to DeepSeek (80/20 fallback).
     status(f"[supervise] max iterations ({max_iterations}) reached; falling back to DeepSeek")
-    plan = cloud.generate(_cloud_generate_request(task))
-    result.final_text = plan.text
+    text, still_truncated = _cloud_generate_guarded(cloud, task, status, use_plan=False)
+    result.final_text = text
     result.escalated = True
-    result.reason = f"deepseek_fallback_max_iterations_{max_iterations}"
+    result.reason = "cloud_fallback_truncated" if still_truncated else f"deepseek_fallback_max_iterations_{max_iterations}"
     return result
 
 
-def _default_package(task: str, code: str, iteration: int) -> ReviewPackage:
+def _default_package(task: str, code: str, iteration: int = 0) -> ReviewPackage:
     return ReviewPackage(
         task=task,
         changes=f"Gemma output (iteration {iteration}):\n{code}",
         uncertainties="None provided — caller can enrich this package with tests/diff.",
     )
+
+
+def _cloud_generate_guarded(cloud: Backend, task: str, status: callable,
+                            use_plan: bool) -> tuple[str, bool]:
+    """Generate the DeepSeek fallback, retrying ONCE at the same budget when the
+    output is truncated (the API caps output at 8192, so the budget cannot grow).
+
+    Returns (text, still_truncated). When still_truncated is True the caller
+    must NOT let the output be applied as if complete.
+    """
+    request = _cloud_plan_request(task) if use_plan else _cloud_generate_request(task)
+    response = cloud.generate(request)
+    if getattr(response, "truncated", False):
+        status("[supervise] cloud output truncated; retrying once at same budget")
+        response = cloud.generate(request)
+    if getattr(response, "truncated", False):
+        status("[supervise] cloud output STILL truncated — INCOMPLETE, must NOT be applied")
+    return response.text, bool(getattr(response, "truncated", False))
 
 
 def _cloud_plan_request(task: str) -> ModelRequest:
@@ -309,6 +367,6 @@ def _cloud_generate_request(task: str) -> ModelRequest:
             "No preamble."
         ),
         user=f"TASK:\n{task}\n",
-        max_tokens=2048,
+        max_tokens=CLOUD_GEN_TOKENS,
         temperature=0.1,
     )
