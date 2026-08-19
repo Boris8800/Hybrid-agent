@@ -2,6 +2,6 @@
 # Pre-commit hook: validate agent definition files before commit.
 # Install via ./scripts/install-hooks.sh (git hooks are not versioned, so this
 # template lives in the repo and is symlinked into .git/hooks/).
-if [ -x scripts/validate-agents.sh ]; then
-    ./scripts/validate-agents.sh || exit 1
+if [ -x "Agents /scripts/validate-agents.sh" ]; then
+    "Agents /scripts/validate-agents.sh" || exit 1
 fi

@@ -9,7 +9,8 @@ if [ ! -d "$HOOK_DIR" ]; then
     exit 1
 fi
 
-for hook in scripts/hooks/*; do
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+for hook in "$SCRIPT_DIR"/hooks/*; do
     [ -e "$hook" ] || continue
     name="$(basename "$hook")"
     target="$HOOK_DIR/$name"
@@ -17,6 +18,6 @@ for hook in scripts/hooks/*; do
         cp "$target" "$target.bak"
         echo "backed up existing $target -> $target.bak"
     fi
-    ln -sf "$(pwd)/$hook" "$target"
+    ln -sf "$hook" "$target"
     echo "installed $target -> $hook"
 done

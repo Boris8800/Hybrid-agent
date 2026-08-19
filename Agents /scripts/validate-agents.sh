@@ -6,6 +6,7 @@
 
 set -u
 FAILED=0
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 echo "== kilo config check (authoritative gate) =="
 if kilo config check 2>&1 | grep -q "No config warnings"; then
@@ -19,7 +20,7 @@ echo
 echo "== per-file frontmatter check (venv yaml) =="
 for file in .kilo/agent/*.md; do
     if [ -f "$file" ]; then
-        if hybrid-agent/.venv/bin/python - "$file" <<'PY'
+        if "$SCRIPT_DIR/../hybrid-agent/.venv/bin/python" - "$file" <<'PY'
 import sys, yaml
 content = open(sys.argv[1]).read()
 if '---' not in content:

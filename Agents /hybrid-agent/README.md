@@ -12,11 +12,11 @@ Bridge CLI that lets a coding agent delegate work out-of-band to two external mo
 Use the venv python (the system `python3` may not have `openai`/`yaml`):
 
 ```bash
-hybrid-agent/.venv/bin/python hybrid-agent/ask.py --help
-hybrid-agent/.venv/bin/python hybrid-agent/ask.py --models
-hybrid-agent/.venv/bin/python hybrid-agent/ask.py --local --task "<task>" --stream
-hybrid-agent/.venv/bin/python hybrid-agent/ask.py --deepseek --task "<task>"
-hybrid-agent/.venv/bin/python hybrid-agent/ask.py --supervise --task "<task>" --max-iterations 4
+"Agents /hybrid-agent/.venv/bin/python" "Agents /hybrid-agent/ask.py" --help
+"Agents /hybrid-agent/.venv/bin/python" "Agents /hybrid-agent/ask.py" --models
+"Agents /hybrid-agent/.venv/bin/python" "Agents /hybrid-agent/ask.py" --local --task "<task>" --stream
+"Agents /hybrid-agent/.venv/bin/python" "Agents /hybrid-agent/ask.py" --deepseek --task "<task>"
+"Agents /hybrid-agent/.venv/bin/python" "Agents /hybrid-agent/ask.py" --supervise --task "<task>" --max-iterations 4
 ```
 
 Key flags: `--local` / `--deepseek` / `--auto`, `--review` (DeepSeek supervisor review), `--supervise` (Gemma-primary / DeepSeek-supervisor loop), `--models`, `--stream`, `--json`, `--route-only`.
@@ -27,19 +27,19 @@ The hybrid agent can automatically build a project index (files, dependencies, s
 
 ```bash
 # Initial scan (auto-runs on agent load if context.json is missing)
-hybrid-agent/.venv/bin/python hybrid-agent/scan.py --project-root .
+"Agents /hybrid-agent/.venv/bin/python" "Agents /hybrid-agent/scan.py" --project-root .
 
 # See context
-hybrid-agent/manage-context.sh status
+"Agents /hybrid-agent/manage-context.sh" status
 
 # Get task suggestions
-hybrid-agent/.venv/bin/python hybrid-agent/scan.py --project-root . --suggest-tasks
+"Agents /hybrid-agent/.venv/bin/python" "Agents /hybrid-agent/scan.py" --project-root . --suggest-tasks
 
 # Refresh after changes
-hybrid-agent/manage-context.sh update
+"Agents /hybrid-agent/manage-context.sh" update
 
 # Ask a context-aware question (context is auto-appended to every request)
-hybrid-agent/.venv/bin/python hybrid-agent/ask.py --route-only --task "Add tests for the main module"
+"Agents /hybrid-agent/.venv/bin/python" "Agents /hybrid-agent/ask.py" --route-only --task "Add tests for the main module"
 ```
 
 Context is stored in `hybrid-agent/context.json` (git-ignored) and auto-appended to every model request by `ask.py`. The scanner skips `.venv`, `node_modules`, `.git`, and caches.

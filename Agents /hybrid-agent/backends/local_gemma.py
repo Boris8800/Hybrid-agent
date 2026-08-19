@@ -42,6 +42,7 @@ class GemmaBackend(Backend):
                     ],
                     max_tokens=request.max_tokens,
                     temperature=request.temperature,
+                    timeout=request.timeout_s,
                 )
                 text = completion.choices[0].message.content or ""
                 truncated = completion.choices[0].finish_reason == "length"

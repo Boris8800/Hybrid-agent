@@ -224,5 +224,29 @@ class DeepSeekBackendTruncationTests(unittest.TestCase):
         self.assertFalse(resp.truncated)
 
 
+class LocalLimitsAwarenessTests(unittest.TestCase):
+    """DeepSeek must plan within the local model's context/output limits."""
+
+    def test_plan_request_informs_deepseek_of_local_limits(self):
+        from supervise import LOCAL_CONTEXT_TOKENS, LOCAL_OUTPUT_TOKENS, _cloud_plan_request
+        req = _cloud_plan_request("build a multi-file app")
+        self.assertIn("IMPLEMENTER CONSTRAINTS", req.system)
+        self.assertIn(str(LOCAL_CONTEXT_TOKENS), req.system)
+        self.assertIn(str(LOCAL_OUTPUT_TOKENS), req.system)
+        self.assertIn("one response", req.system)
+
+    def test_supervisor_request_notes_local_output_cap(self):
+        from supervise import LOCAL_OUTPUT_TOKENS, ReviewPackage, _supervisor_request
+        req = _supervisor_request(ReviewPackage(task="t", changes="x"))
+        self.assertIn(str(LOCAL_OUTPUT_TOKENS), req.system)
+        self.assertIn("output cap", req.system)
+
+    def test_gemma_prompt_warns_about_output_cap(self):
+        from supervise import LOCAL_OUTPUT_TOKENS, _gemma_primary_prompt
+        req = _gemma_primary_prompt("task")
+        self.assertIn(str(LOCAL_OUTPUT_TOKENS), req.user)
+        self.assertIn("REMAINING WORK", req.user)
+
+
 if __name__ == "__main__":
     unittest.main()

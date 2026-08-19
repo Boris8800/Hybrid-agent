@@ -37,8 +37,8 @@ DEFAULT_CONFIG = {
         "local": {
             "base_url": "http://localhost:1234/v1",
             "api_key": "lm-studio",
-            "model": "gemma-4-12b",
-            "timeout_s": 10,
+            "model": "google/gemma-4-12b-qat",
+            "timeout_s": 180,
             "max_retries": 3,
             "backoff_s": [0.5, 1.0, 2.0],
             "cold_start_wait_s": 30,
@@ -159,7 +159,7 @@ class HybridAgent:
                 "CONTEXT (compressed): imports/signatures placeholder — P2 wires "
                 "context/compress.py header-only extraction.\n"
             ),
-            max_tokens=2048,
+            max_tokens=4096,
             temperature=0.2,
             timeout_s=self.cfg["backends"]["local"]["timeout_s"],
         )

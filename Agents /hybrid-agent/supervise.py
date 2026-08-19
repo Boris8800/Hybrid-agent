@@ -147,6 +147,30 @@ GEMMA_MAX_TOKENS = 8192
 GEMMA_MAX_TOKENS_CAP = 16384
 CLOUD_GEN_TOKENS = 8192
 
+# Local model (Gemma) constraints — the DeepSeek supervisor plans within these.
+# LM Studio loads google/gemma-4-12b-qat with a 32768-token context window and a
+# verified 4096-token output cap: requesting higher budgets still truncates, so
+# plans must split work into steps that fit in ONE local response.
+LOCAL_CONTEXT_TOKENS = 32768
+LOCAL_OUTPUT_TOKENS = 4096
+
+
+def _local_limits_note() -> str:
+    """Compact, factual description of the implementer's constraints.
+
+    Injected into the DeepSeek plan request so the supervisor sizes every step
+    for one local response instead of assuming an unlimited model.
+    """
+    return (
+        "IMPLEMENTER CONSTRAINTS (local Gemma 12B, must be respected): "
+        f"context window {LOCAL_CONTEXT_TOKENS} tokens; hard output cap "
+        f"{LOCAL_OUTPUT_TOKENS} tokens per response (higher budgets still "
+        "truncate); one response = one step; target under ~3500 output tokens "
+        "per step; keep prompt + repo context well under 32768; any task needing "
+        "more output must be split into multiple sequential steps with per-step "
+        "acceptance criteria; truncated output is retried once then escalated."
+    )
+
 
 def _gemma_primary_prompt(task: str, prior_fixes: str = "",
                           max_tokens: int = GEMMA_MAX_TOKENS) -> ModelRequest:
@@ -158,6 +182,11 @@ def _gemma_primary_prompt(task: str, prior_fixes: str = "",
     user = f"TASK:\n{task}\n"
     if prior_fixes:
         user += f"\nA senior reviewer previously asked you to fix these issues. Apply ALL of them now:\n{prior_fixes}\n"
+    user += (
+        f"\nNOTE: your output is capped at {LOCAL_OUTPUT_TOKENS} tokens. If the "
+        "change cannot fit in one response, implement the first coherent chunk "
+        "and explicitly state what remains in a final 'REMAINING WORK' section."
+    )
     user += "\nOutput only the code changes, no preamble."
     return ModelRequest(system=system, user=user, max_tokens=max_tokens, temperature=0.2)
 
@@ -186,7 +215,11 @@ def _supervisor_request(pkg: ReviewPackage, verbose: bool = True) -> ModelReques
         "[only if REJECTED]\n\n"
         "Rules: be specific, show the fix not just describe it, be brutal about "
         "correctness and security, be reasonable about style. Do NOT rewrite the "
-        "whole codebase — you are reviewing, Gemma implements."
+        "whole codebase — you are reviewing, Gemma implements.\n\n"
+        "Note: the code under review was produced by a local model with a "
+        f"{LOCAL_OUTPUT_TOKENS}-token output cap and {LOCAL_CONTEXT_TOKENS}-token "
+        "context window. Judge whether the step was appropriately scoped and "
+        "whether truncation or over-sized single responses are likely."
     )
     user = pkg.to_prompt()
     if verbose:
@@ -350,8 +383,22 @@ def _cloud_generate_guarded(cloud: Backend, task: str, status: callable,
 
 
 def _cloud_plan_request(task: str) -> ModelRequest:
+    """Request DeepSeek to plan the task sized to the local implementer.
+
+    The plan must fit the work into steps that the local model can produce in
+    ONE response (its context window and output cap), each with a file-level
+    breakdown and acceptance criteria — otherwise the plan guarantees
+    truncation and the loop burns tokens on retries and escalation.
+    """
     return ModelRequest(
-        system="You are the senior architect for a hybrid coding agent. Produce a step-by-step plan with file-level breakdown (max 400 words).",
+        system=(
+            "You are the senior architect for a hybrid coding agent. Produce a "
+            "step-by-step plan with file-level breakdown (max 400 words). "
+            "Each step must fit in ONE local model response (target under ~3500 "
+            "output tokens), with per-step acceptance criteria. Split any task "
+            "needing more output into multiple sequential steps.\n\n"
+            f"{_local_limits_note()}"
+        ),
         user=f"OBJECTIVE: {task}\n",
         max_tokens=1200,
         temperature=0.1,
