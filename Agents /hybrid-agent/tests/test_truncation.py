@@ -707,6 +707,69 @@ class FinalVerifyTests(unittest.TestCase):
         self.assertFalse((root / "ok.txt").exists(),
                          "failed verification must roll back the AI's fixes")
 
+    def test_is_environmental_error(self):
+        from ask import _is_environmental_error
+        self.assertTrue(_is_environmental_error("sh: cmd: command not found"))
+        self.assertTrue(_is_environmental_error("ENOENT: no such file"))
+        self.assertTrue(_is_environmental_error("Module not found: 'react'"))
+        self.assertFalse(_is_environmental_error("TypeError: x is undefined"))
+
+    def test_run_final_verify_skips_deepseek_on_env_error(self):
+        import json
+        import tempfile
+        from pathlib import Path
+        from ask import _run_final_verify
+
+        root = Path(tempfile.mkdtemp())
+        (root / "package.json").write_text(json.dumps({
+            "scripts": {"build": "echo 'command not found'; exit 1"}}))
+
+        class FakeCloud:
+            def __init__(self):
+                self.calls = 0
+            def generate(self, req):
+                self.calls += 1
+                return type("R", (), {"text": "```ok.txt\nx\n```"})
+
+        cloud = FakeCloud()
+        verified, report = _run_final_verify(
+            cloud, str(root), "task", ["npm run build"],
+            lambda l: None, max_iter=1)
+        self.assertFalse(verified)
+        self.assertEqual(cloud.calls, 0, "must NOT call DeepSeek on env errors")
+
+    def test_run_regression_guard(self):
+        import tempfile
+        from pathlib import Path
+        from ask import _run_regression_guard
+
+        root = Path(tempfile.mkdtemp())
+        passed, report = _run_regression_guard(str(root), ["echo ok"],
+                                               lambda l: None)
+        self.assertTrue(passed)
+        passed, report = _run_regression_guard(str(root), ["test -f missing"],
+                                               lambda l: None)
+        self.assertFalse(passed)
+
+    def test_record_verify(self):
+        import tempfile
+        import ask
+        with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as f:
+            f.write("{}")
+            path = f.name
+        st = ask.StatsTracker(path)
+        st.record_verify({"iterations": 2, "api_calls": 1, "tokens_used": 400,
+                          "estimated_cost_usd": 0.001, "status": "PASSED"})
+        st.record_verify({"iterations": 3, "api_calls": 2, "tokens_used": 800,
+                          "estimated_cost_usd": 0.002, "status": "FAILED"})
+        v = st.stats["verify"]
+        self.assertEqual(v["runs"], 2)
+        self.assertEqual(v["iterations"], 5)
+        self.assertEqual(v["api_calls"], 3)
+        self.assertEqual(v["tokens_used"], 1200)
+        self.assertEqual(v["passed"], 1)
+        self.assertEqual(v["failed"], 1)
+
 
 if __name__ == "__main__":
     unittest.main()

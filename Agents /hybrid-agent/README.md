@@ -32,6 +32,9 @@ The final `--verify` stage protects you and your code:
 - **Automatic rollback** — the working tree is git-snapshotted before fixes; if verification still fails after retries, the AI's fix files are restored, so your codebase is never left broken.
 - **Diff logging** — every DeepSeek fix is written as a unified diff to `hybrid-verify/fixes.diff` under the project root.
 - **Timeout** — each verification command is killed after `--verify-timeout` (or `review.verify_timeout`, default 600s) so a stuck build can't hang the pipeline.
+- **Regression guard** — after verification passes, `--regression` runs the full test suite (`review.regression` in config.yml, e.g. `["npm test"]`) to catch fixes that break tests elsewhere; if tests fail the task is reported FAILED.
+- **Environmental-error skip** — errors like `command not found`, `ENOENT`, or `Module not found` are detected and **DeepSeek is not called** for them (nothing it can fix), saving API tokens.
+- **Verify cost tracking** — verify iterations, DeepSeek API calls, tokens, estimated cost, and pass/fail status are recorded in `stats.json` under `verify` (visible via `--stats` / `--evaluate`).
 
 ## Project Context Feature
 

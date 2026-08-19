@@ -44,6 +44,11 @@ review:
   verify: []
   # Per-command timeout (seconds) for verification commands (default 600).
   verify_timeout: 600
+  # Regression guard: full test suite run AFTER verification passes, to catch
+  # fixes that break tests elsewhere. Empty = regression guard disabled.
+  # Example: ["npm test", "python -m pytest"]
+  regression: []
+  regression_timeout: 600
 
 circuit_breaker:
   window_size: 20

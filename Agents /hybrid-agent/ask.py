@@ -227,6 +227,27 @@ class StatsTracker:
             p["quality_count"] += 1
         self._save()
 
+    def record_verify(self, metrics: dict) -> None:
+        """Record final-verify metrics (iterations, API calls, tokens, cost)."""
+        s = self.stats
+        v = s.setdefault("verify", {
+            "runs": 0, "iterations": 0, "api_calls": 0, "tokens_used": 0,
+            "estimated_cost_usd": 0.0, "passed": 0, "failed": 0, "last": {},
+        })
+        v["runs"] += 1
+        v["iterations"] += metrics.get("iterations", 0)
+        v["api_calls"] += metrics.get("api_calls", 0)
+        v["tokens_used"] += metrics.get("tokens_used", 0)
+        v["estimated_cost_usd"] = round(
+            v["estimated_cost_usd"] + metrics.get("estimated_cost_usd", 0.0), 5)
+        status = metrics.get("status", "FAILED")
+        if status == "PASSED":
+            v["passed"] += 1
+        elif status in ("FAILED", "REGRESSION_FAILED", "ENV_ERROR", "BLOCKED"):
+            v["failed"] += 1
+        v["last"] = metrics
+        self._save()
+
     def evaluate(self) -> dict:
         """Self-evaluation report for the current week vs the previous week."""
         s = self.stats
@@ -867,6 +888,52 @@ def _write_diff_log(root: str, files: list[str]) -> str:
         return ""
 
 
+# Error patterns that DeepSeek cannot fix (setup/environment) — skip the call.
+_ENV_ERROR_MARKERS = (
+    "command not found", "enoent", "cannot find module", "module not found",
+    "no module named", "no such file or directory", "not found",
+    "npm error code enoent", "cannot resolve", "could not find", "is not installed",
+)
+
+
+def _is_environmental_error(text: str) -> bool:
+    """True when the error is environmental and not fixable by DeepSeek."""
+    lowered = (text or "").lower()
+    return any(m in lowered for m in _ENV_ERROR_MARKERS)
+
+
+def _run_regression_guard(root: str, cmds, status,
+                          timeout_s: int = 600) -> tuple[bool, str]:
+    """Run the full test suite after verification passes, to catch fixes that
+    break tests elsewhere. Regression commands are allowlisted too.
+    Returns (passed, report). Does not apply fixes.
+    """
+    if not cmds:
+        return True, "no regression commands configured"
+    unsafe = [c for c in cmds if not _is_safe_verify_cmd(c)]
+    if unsafe:
+        blocked = "; ".join(unsafe[:3])
+        status(f"[hybrid] ⛔ BLOCKED unsafe regression command(s): {blocked}")
+        return False, f"blocked unsafe regression commands: {blocked}"
+    failed: list[str] = []
+    for cmd in cmds:
+        status(f"[hybrid] 🧪 regression: {cmd}")
+        try:
+            proc = subprocess.run(cmd, shell=True, cwd=root,
+                                  capture_output=True, text=True, timeout=timeout_s)
+        except subprocess.TimeoutExpired:
+            failed.append(f"$ {cmd}\n[timed out after {timeout_s}s]")
+            continue
+        output = (proc.stdout or "") + "\n" + (proc.stderr or "")
+        if proc.returncode != 0:
+            failed.append(f"$ {cmd} (exit {proc.returncode})\n{output}")
+    if failed:
+        status("[hybrid] ⛔ REGRESSION FAILED: the fixes broke tests")
+        return False, "regression failed:\n\n" + "\n\n".join(failed)
+    status("[hybrid] ✅ regression passed")
+    return True, "regression passed"
+
+
 def _deepseek_fix(cloud, task: str, error_text: str):
     """Ask DeepSeek to fix the errors and return the fixed files."""
     system = (
@@ -886,27 +953,42 @@ def _deepseek_fix(cloud, task: str, error_text: str):
 
 
 def _run_final_verify(cloud, root: str, task: str, cmds, status,
-                      max_iter: int = 2, timeout_s: int = 600) -> tuple[bool, str]:
+                      max_iter: int = 2, timeout_s: int = 600,
+                      verify_stats: dict | None = None,
+                      regression_cmds=None,
+                      regression_timeout: int = 600) -> tuple[bool, str]:
     """Final error-check stage: run verification commands and, on errors, have
     DeepSeek fix them (applied to disk) until clean or max_iter exhausted.
 
     Safety: commands are allowlisted; the working tree is snapshotted before
     fixes so a failed run rolls back the AI's changes; every fix is diff-logged.
+    Cost: error text is truncated; environmental errors skip the DeepSeek call.
+    Regression: after verification passes, the regression test suite runs.
     Returns (verified, report). verified True when all commands pass.
     """
+    if verify_stats is None:
+        verify_stats = {}
+    verify_stats.update({"iterations": 0, "api_calls": 0, "tokens_used": 0,
+                         "status": "FAILED"})
+    api_calls = 0
+    tokens_used = 0
+
     if not cmds:
+        verify_stats["status"] = "PASSED"
         return True, "no verification commands configured"
 
     unsafe = [c for c in cmds if not _is_safe_verify_cmd(c)]
     if unsafe:
         blocked = "; ".join(unsafe[:3])
         status(f"[hybrid] ⛔ BLOCKED unsafe verify command(s): {blocked}")
+        verify_stats["status"] = "BLOCKED"
         return False, f"blocked unsafe verification commands: {blocked}"
     safe_cmds = [c for c in cmds if _is_safe_verify_cmd(c)]
 
     fixed_files: list[str] = []
     snapshot: str | None = None
     for iteration in range(max_iter + 1):
+        verify_stats["iterations"] = iteration + 1
         errors: list[str] = []
         for cmd in safe_cmds:
             status(f"[hybrid] 🔍 verify: {cmd}")
@@ -927,9 +1009,22 @@ def _run_final_verify(cloud, root: str, task: str, cmds, status,
                 log = _write_diff_log(root, fixed_files)
                 if log:
                     status(f"[hybrid] 📄 fix diff: {log}")
-            return True, "verification passed"
+            # Regression guard: run the full test suite to catch broken tests.
+            reg_pass, reg_report = _run_regression_guard(
+                root, list(regression_cmds or []), status, timeout_s=regression_timeout)
+            if reg_pass:
+                verify_stats["status"] = "PASSED"
+                return True, "verification passed"
+            verify_stats["status"] = "REGRESSION_FAILED"
+            return False, reg_report
 
         error_text = "\n\n".join(errors)
+        # Skip DeepSeek on environmental errors it cannot fix.
+        if _is_environmental_error(error_text):
+            status("[hybrid] ⛔ environmental error (not fixable by DeepSeek) — skipped")
+            verify_stats["status"] = "ENV_ERROR"
+            return False, "environmental error:\n\n" + _truncate_error(error_text)
+
         status(f"[hybrid] ⚠ {len(errors)} error(s) — DeepSeek fixing "
                f"(attempt {iteration + 1}/{max_iter + 1})")
         if snapshot is None:
@@ -941,6 +1036,8 @@ def _run_final_verify(cloud, root: str, task: str, cmds, status,
             if snapshot:
                 _git_restore(root, snapshot, fixed_files)
             return False, error_text
+        api_calls += 1
+        tokens_used += len(fix_text or "") // 4
 
         applied, skipped = _apply_fenced_files(fix_text, root)
         for rel, nbytes in applied:
@@ -964,6 +1061,9 @@ def _run_final_verify(cloud, root: str, task: str, cmds, status,
     log = _write_diff_log(root, fixed_files)
     if log:
         status(f"[hybrid] 📄 fix diff: {log}")
+    verify_stats.update({"api_calls": api_calls, "tokens_used": tokens_used,
+                         "estimated_cost_usd": round(tokens_used * 0.000002, 5),
+                         "status": "FAILED"})
     status("[hybrid] ⛔ verification still failing after max attempts")
     return False, error_text
 
@@ -1133,6 +1233,14 @@ def main() -> int:
     parser.add_argument("--verify-timeout", type=int, default=0,
                         help="per-command timeout in seconds for verification "
                              "(default from review.verify_timeout, else 600)")
+    parser.add_argument("--regression", action="store_true",
+                        help="run the full test suite (review.regression) AFTER "
+                             "verification passes, to catch fixes that break tests")
+    parser.add_argument("--regression-cmd", action="append", default=[],
+                        help="add a regression test command (repeatable); implies --regression")
+    parser.add_argument("--regression-timeout", type=int, default=0,
+                        help="per-command timeout for regression tests "
+                             "(default from review.regression_timeout, else 600)")
     args = parser.parse_args()
 
     if args.evaluate:
@@ -1344,15 +1452,25 @@ def main() -> int:
         # review.verify is configured.
         verified = True
         verify_report = ""
+        verify_stats: dict = {}
         verify_cmds = list(args.verify_cmds)
         if args.verify and not verify_cmds:
             verify_cmds = list(cfg.get("review", {}).get("verify", []) or [])
+        regression_cmds = list(args.regression_cmds)
+        if args.regression and not regression_cmds:
+            regression_cmds = list(cfg.get("review", {}).get("regression", []) or [])
         if verify_cmds:
             verify_timeout = (args.verify_timeout
                               or cfg.get("review", {}).get("verify_timeout", 600))
+            regression_timeout = (args.regression_timeout
+                                  or cfg.get("review", {}).get("regression_timeout", 600))
             verified, verify_report = _run_final_verify(
                 cloud, args.root, args.task, verify_cmds, _status,
-                max_iter=args.verify_max, timeout_s=verify_timeout)
+                max_iter=args.verify_max, timeout_s=verify_timeout,
+                verify_stats=verify_stats, regression_cmds=regression_cmds,
+                regression_timeout=regression_timeout)
+        if verify_stats:
+            stats.record_verify(verify_stats)
         if not verified:
             _status("[hybrid] ⛔ FINAL CHECK FAILED: the task is NOT fully verified. "
                     "Fix DEEPSEEK_API_KEY/network, the verify command, or the code.")
