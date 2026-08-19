@@ -34,8 +34,12 @@ from router.confidence import MemoryView
 
 from agent import HybridAgent, _load_config, apply_env_overrides
 from backends.deepseek import _resolve_api_key
-from supervise import GEMMA_MAX_TOKENS, ReviewPackage, _enhance_request, parse_enhancement, supervise
+from supervise import (GEMMA_MAX_TOKENS, ChainOfThoughtParser, ReviewPackage,
+                       SuperviseResult, _enhance_request, _supervisor_request,
+                       parse_enhancement, parse_verdict, supervise)
 from context import ProjectContext
+from parallel import (DependencyAnalyzer, ParallelExecutor, parse_plan_steps,
+                      summarize)
 
 # --- Self-heal: loading config.yml requires PyYAML + openai, which exist only
 # in the project venv (hybrid-agent/.venv). When invoked with a system python3
@@ -623,7 +627,7 @@ def _enhance_task(agent: HybridAgent, cfg: dict, args: argparse.Namespace,
         enh_label = "deepseek (prompt enhancer)"
         _status(f"[hybrid] ▶ {enh_label} working on \"{_task_preview(current)}\" ...")
         enh_resp = _generate_with_retry(
-            agent, cfg, args, "deepseek", _enhance_request(current, context)
+            agent, cfg, args, "deepseek", _enhance_request(current, context, cot=args.cot)
         )
         enhancement = parse_enhancement(enh_resp.text)
         _status(f"[hybrid] ✓ {enh_label} done · {int(enh_resp.latency_ms)} ms · "
@@ -637,6 +641,10 @@ def _enhance_task(agent: HybridAgent, cfg: dict, args: argparse.Namespace,
                 print("\n=== PLAN ===\n" + enhancement.plan)
             if enhancement.clarifying_questions:
                 print("\n=== CLARIFYING QUESTIONS ===\n" + enhancement.clarifying_questions)
+            if args.cot:
+                cot = ChainOfThoughtParser(enh_resp.text)
+                for icon, title, body in cot.get_reasoning_chain():
+                    print(f"\n{icon} {title}\n" + body)
 
         if not enhancement.clarifying_questions:
             break  # prompt is clear
@@ -695,6 +703,56 @@ def _scan_project_context(root: str, task: str = "") -> str:
     except Exception as exc:  # noqa: BLE001 - never block the run on a scan failure
         _status(f"[hybrid] ⚠ context scan failed: {exc}")
         return ""
+
+
+def _run_parallel(agent: HybridAgent, cfg: dict, args: argparse.Namespace,
+                  cloud, task: str, enhancement, context: str) -> SuperviseResult:
+    """Parallel --supervise path: split the plan into steps, run independent
+    steps in parallel on the local model, then DeepSeek reviews the combined
+    output. Returns a SuperviseResult so the existing apply/stats/print tail
+    in the --supervise branch works unchanged.
+    """
+    steps = parse_plan_steps(enhancement.plan if enhancement else "")
+    analyzer = DependencyAnalyzer(steps)
+    groups = analyzer.get_parallel_groups()
+    executor = ParallelExecutor(
+        _supervise_gemma_generate(cfg, args.model),
+        max_workers=args.parallel_workers,
+        max_tokens=args.max_tokens or GEMMA_MAX_TOKENS,
+    )
+    texts: list[str] = []
+    for group in groups:
+        if len(group) > 1:
+            _status(f"[hybrid] ⚡ Running {len(group)} steps in parallel...")
+        results = executor.execute_parallel(group, task, context)
+        _status(f"[hybrid] 📝 {summarize(results)}")
+        for r in results:
+            if r["status"] == "success":
+                texts.append(r["text"])
+            else:
+                _status(f"[hybrid] ⚠ step {r['id']} failed: {r['error']}")
+    final_text = "\n\n".join(t for t in texts if t)
+
+    _status("[hybrid] ▶ deepseek reviewing parallel output ...")
+    try:
+        pkg = ReviewPackage(
+            task=task,
+            plan=enhancement.plan if enhancement else "",
+            changes=f"Parallel output:\n{final_text}",
+            uncertainties=context,
+        )
+        review_resp = cloud.generate(_supervisor_request(pkg))
+    except Exception as exc:  # noqa: BLE001 - report cleanly
+        _status(f"[hybrid] ⚠ review failed ({exc}); applying without review")
+        return SuperviseResult(task=task, final_text=final_text, route="local",
+                               reason="review_failed_no_verdict",
+                               iterations=max(1, len(groups)))
+
+    verdict = parse_verdict(review_resp.text)
+    _status(f"[hybrid] {verdict.decision} (score {verdict.quality_score:.1f}/10)")
+    return SuperviseResult(task=task, final_text=final_text, route="local",
+                           reason="parallel", verdicts=[verdict],
+                           iterations=max(1, len(groups)))
 
 
 def _select_backend(agent: HybridAgent, cfg: dict, route: str,
@@ -839,6 +897,16 @@ def main() -> int:
                              "coding standards, code examples) and inject the rendered "
                              "context into the enhancement/supervise flow so DeepSeek "
                              "and Gemma understand the codebase")
+    parser.add_argument("--cot", action="store_true",
+                        help="chain-of-thought planning: DeepSeek shows TASK "
+                             "UNDERSTANDING, CONSTRAINT ANALYSIS, and ALTERNATIVES "
+                             "before the plan, so you can verify its reasoning")
+    parser.add_argument("--parallel", action="store_true",
+                        help="with --supervise --enhance: split the plan into steps, "
+                             "run independent steps in parallel via the local model, "
+                             "then DeepSeek reviews")
+    parser.add_argument("--parallel-workers", type=int, default=4,
+                        help="max parallel workers for --parallel (default 4)")
     args = parser.parse_args()
 
     if args.evaluate:
@@ -994,15 +1062,24 @@ def main() -> int:
             _status(f"[hybrid] ⚠ --max-tokens={args.max_tokens} is low — "
                     "multi-file tasks need 8192+ (truncation will escalate)")
 
-        result = supervise(
-            local, cloud,
-            task=task_for_gemma,
-            package_builder=_pkg,
-            max_iterations=args.max_iterations,
-            gemma_generate=_supervise_gemma_generate(cfg, args.model),
-            status=lambda line: _status(line),
-            gemma_max_tokens=args.max_tokens or GEMMA_MAX_TOKENS,
-        )
+        if args.parallel:
+            if not enhancement:
+                _status("[hybrid] ⛔ refusal: --parallel requires --enhance (needs the plan).")
+                print("error: --parallel requires --enhance so steps can be split from the plan.",
+                      file=sys.stderr)
+                return 3
+            result = _run_parallel(
+                agent, cfg, args, cloud, task_for_gemma, enhancement, context)
+        else:
+            result = supervise(
+                local, cloud,
+                task=task_for_gemma,
+                package_builder=_pkg,
+                max_iterations=args.max_iterations,
+                gemma_generate=_supervise_gemma_generate(cfg, args.model),
+                status=lambda line: _status(line),
+                gemma_max_tokens=args.max_tokens or GEMMA_MAX_TOKENS,
+            )
         # Record 80/20 metrics.
         stats = StatsTracker()
         for v in result.verdicts:

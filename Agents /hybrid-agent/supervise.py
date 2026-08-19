@@ -120,6 +120,48 @@ def parse_enhancement(raw: str) -> Enhancement:
     return enh
 
 
+class ChainOfThoughtParser:
+    """Parses DeepSeek's chain-of-thought planning sections.
+
+    Reads the same `=== SECTION ===` markers used by the enhancement stage so
+    DeepSeek can show WHY it made each planning decision, which the user can
+    verify before the local model implements.
+    """
+
+    SECTIONS = ('TASK UNDERSTANDING', 'CONSTRAINT ANALYSIS', 'REASONING',
+                'ALTERNATIVES', 'FINAL PLAN')
+
+    def __init__(self, text: str):
+        self.text = text or ""
+        self.sections: dict = {}
+        self._parse()
+
+    def _section(self, label: str) -> str:
+        m = re.search(rf"===\s*{label}\s*===\s*(.*?)(?:\n\s*===|\Z)",
+                      self.text, re.S | re.I)
+        return m.group(1).strip() if m else ""
+
+    def _parse(self) -> None:
+        for label in self.SECTIONS:
+            key = label.lower().replace(" ", "_")
+            self.sections[key] = self._section(label)
+
+    def get_reasoning_chain(self) -> list:
+        """Flatten the sections into a displayable list of (icon, title, body)."""
+        chain = []
+        if self.sections.get('task_understanding'):
+            chain.append(("📝", "TASK UNDERSTANDING", self.sections['task_understanding']))
+        if self.sections.get('constraint_analysis'):
+            chain.append(("⚡", "CONSTRAINT ANALYSIS", self.sections['constraint_analysis']))
+        if self.sections.get('reasoning'):
+            chain.append(("🧩", "REASONING", self.sections['reasoning']))
+        if self.sections.get('alternatives'):
+            chain.append(("🤔", "ALTERNATIVES", self.sections['alternatives']))
+        if self.sections.get('final_plan'):
+            chain.append(("📋", "FINAL PLAN", self.sections['final_plan']))
+        return chain
+
+
 def _decision_from(raw: str) -> str:
     """Extract the decision keyword from a review response."""
     m = re.search(r"\b(APPROVED|FIX_REQUIRED|REJECTED)\b", raw.upper())
@@ -426,15 +468,27 @@ def _cloud_generate_guarded(cloud: Backend, task: str, status: callable,
     return response.text, bool(getattr(response, "truncated", False))
 
 
-def _enhance_request(task: str, context: str = "") -> ModelRequest:
+def _enhance_request(task: str, context: str = "", cot: bool = False) -> ModelRequest:
     """Request DeepSeek to ENHANCE the task and plan it for the local implementer.
 
     Runs BEFORE the local model implements: DeepSeek clarifies the user's prompt
     into a self-contained implementation prompt AND produces a step-by-step plan
     where each step fits in ONE local response (context window / output cap),
     so the local model never receives an oversized prompt that guarantees
-    truncation.
+    truncation. With cot=True it also shows its step-by-step reasoning
+    (TASK UNDERSTANDING / CONSTRAINT ANALYSIS / ALTERNATIVES sections).
     """
+    cot_extra = (
+        "\n\nAdditionally produce these chain-of-thought sections so the user "
+        "can verify your reasoning:\n"
+        "=== TASK UNDERSTANDING ===\n"
+        "<what the task really asks for>\n"
+        "=== CONSTRAINT ANALYSIS ===\n"
+        "<how you size each step to the local model's limits>\n"
+        "=== ALTERNATIVES ===\n"
+        "<other approaches you considered and why you chose this one>\n"
+        if cot else ""
+    )
     return ModelRequest(
         system=(
             "You are the senior architect for a hybrid coding agent. Your job:\n"
@@ -455,12 +509,13 @@ def _enhance_request(task: str, context: str = "") -> ModelRequest:
             "ONLY include this section if the ORIGINAL USER TASK is ambiguous, "
             "under-specified, or unclear. List 1-5 concise, concrete questions or "
             "answer-options (e.g., exact target files, expected behavior, edge cases, "
-            "scope). If the task is already clear, OMIT this section entirely.\n\n"
+            "scope). If the task is already clear, OMIT this section entirely.\n"
+            f"{cot_extra}\n"
             f"{_local_limits_note()}"
         ),
         user=f"ORIGINAL USER TASK:\n{task}\n"
              + (f"\nCONTEXT:\n{context}\n" if context else ""),
-        max_tokens=1200,
+        max_tokens=1600 if cot else 1200,
         temperature=0.1,
     )
 

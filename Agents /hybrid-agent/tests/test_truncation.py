@@ -348,7 +348,7 @@ class EnhanceTaskClarificationTests(unittest.TestCase):
 
     @staticmethod
     def _args():
-        return type("A", (), {"json": False})()
+        return type("A", (), {"json": False, "cot": False})()
 
     def test_non_tty_unclear_stops_for_clarification(self):
         def fake_gen(agent, cfg, args, route, req):
@@ -531,6 +531,86 @@ class ProjectContextTests(unittest.TestCase):
         c = ProjectContext(str(Path(tempfile.mkdtemp())))
         ctx = c.scan()
         self.assertEqual(ctx['architecture'].get('type'), 'unknown')
+
+
+class ChainOfThoughtTests(unittest.TestCase):
+    """Chain-of-thought planning parsing."""
+
+    def test_parser_extracts_sections(self):
+        from supervise import ChainOfThoughtParser
+        text = (
+            "=== TASK UNDERSTANDING ===\nCRUD app\n"
+            "=== CONSTRAINT ANALYSIS ===\n4096 cap -> 4 steps\n"
+            "=== REASONING ===\nmodels first\n"
+            "=== ALTERNATIVES ===\nraw sql vs orm\n"
+            "=== FINAL PLAN ===\nStep 1: models\nStep 2: routes\n"
+        )
+        p = ChainOfThoughtParser(text)
+        self.assertEqual(p.sections['task_understanding'], 'CRUD app')
+        self.assertEqual(p.sections['constraint_analysis'], '4096 cap -> 4 steps')
+        self.assertIn('models first', p.sections['reasoning'])
+        self.assertIn('raw sql', p.sections['alternatives'])
+        self.assertEqual(len(p.get_reasoning_chain()), 5)
+
+    def test_enhance_request_cot_requests_sections(self):
+        from supervise import _enhance_request
+        req = _enhance_request('task', cot=True)
+        self.assertIn('TASK UNDERSTANDING', req.system)
+        self.assertIn('CONSTRAINT ANALYSIS', req.system)
+        self.assertIn('ALTERNATIVES', req.system)
+        self.assertEqual(req.max_tokens, 1600)
+        req2 = _enhance_request('task', cot=False)
+        self.assertNotIn('TASK UNDERSTANDING', req2.system)
+        self.assertEqual(req2.max_tokens, 1200)
+
+
+class ParallelTests(unittest.TestCase):
+    """Parallel step execution: plan parsing + dependency grouping."""
+
+    def test_parse_plan_steps_and_groups(self):
+        from parallel import DependencyAnalyzer, parse_plan_steps
+        plan = (
+            "Step 1: Models\nDependencies: none\n"
+            "Step 2: Schemas\nDependencies: none\n"
+            "Step 3: Routes\nDependencies: 1, 2\n"
+            "Step 4: Tests\nDependencies: 1, 2, 3\n"
+        )
+        steps = parse_plan_steps(plan)
+        self.assertEqual([s['id'] for s in steps], [1, 2, 3, 4])
+        groups = DependencyAnalyzer(steps).get_parallel_groups()
+        self.assertEqual([[s['id'] for s in g] for g in groups],
+                         [[1, 2], [3], [4]])
+
+    def test_parse_plan_steps_fallback_single(self):
+        from parallel import parse_plan_steps
+        steps = parse_plan_steps("just prose, no steps here")
+        self.assertEqual(len(steps), 1)
+        self.assertEqual(steps[0]['name'], 'whole task')
+
+    def test_execute_parallel_runs_all_and_orders(self):
+        import threading
+        import time
+        from parallel import ParallelExecutor
+
+        class FakeGen:
+            def __init__(self):
+                self.lock = threading.Lock()
+                self.active = 0
+                self.max_active = 0
+            def __call__(self, req):
+                with self.lock:
+                    self.active += 1
+                    self.max_active = max(self.max_active, self.active)
+                time.sleep(0.05)
+                with self.lock:
+                    self.active -= 1
+                return type('R', (), {'text': 'out'})()
+        steps = [{'id': 1, 'name': 'a', 'description': '', 'files': [], 'dependencies': []},
+                 {'id': 2, 'name': 'b', 'description': '', 'files': [], 'dependencies': []}]
+        ex = ParallelExecutor(FakeGen(), max_workers=4)
+        res = ex.execute_parallel(steps, 'task')
+        self.assertEqual([r['status'] for r in res], ['success', 'success'])
+        self.assertEqual([r['id'] for r in res], [1, 2])
 
 
 if __name__ == "__main__":
