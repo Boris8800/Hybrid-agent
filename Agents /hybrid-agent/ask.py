@@ -755,6 +755,83 @@ def _run_parallel(agent: HybridAgent, cfg: dict, args: argparse.Namespace,
                            iterations=max(1, len(groups)))
 
 
+def _looks_like_error(output: str) -> bool:
+    """Heuristic: does the verification output look like it contains errors?"""
+    if not output:
+        return False
+    lowered = output.lower()
+    markers = ("error", " failed", "cannot find", "is not assignable",
+               "typescript error", "exception", "undefined", "traceback",
+               "cannot resolve", "no module", "syntaxerror", "exit code")
+    return any(m in lowered for m in markers)
+
+
+def _deepseek_fix(cloud, task: str, error_text: str):
+    """Ask DeepSeek to fix the errors and return the fixed files."""
+    system = (
+        "You are a senior engineer fixing errors found during verification. "
+        "Analyze the errors and the task, then output the COMPLETE corrected "
+        "file(s) in fenced code blocks labeled with their paths. Only change "
+        "what is needed to fix the errors. No preamble."
+    )
+    user = (
+        f"TASK:\n{task}\n\n"
+        f"VERIFICATION ERRORS:\n{error_text}\n\n"
+        "Fix every error. Output corrected files as path-labeled fenced blocks."
+    )
+    return cloud.generate(ModelRequest(
+        system=system, user=user, max_tokens=8192, temperature=0.1,
+    )).text
+
+
+def _run_final_verify(cloud, root: str, task: str, cmds, status,
+                      max_iter: int = 2) -> tuple[bool, str]:
+    """Final error-check stage: run verification commands and, on errors, have
+    DeepSeek fix them (applied to disk) until clean or max_iter exhausted.
+
+    Returns (verified, report). verified True when all commands pass.
+    """
+    if not cmds:
+        return True, "no verification commands configured"
+    for iteration in range(max_iter + 1):
+        errors: list[str] = []
+        for cmd in cmds:
+            status(f"[hybrid] 🔍 verify: {cmd}")
+            try:
+                proc = subprocess.run(cmd, shell=True, cwd=root,
+                                      capture_output=True, text=True, timeout=600)
+            except subprocess.TimeoutExpired:
+                errors.append(f"$ {cmd}\n[timed out]")
+                continue
+            output = (proc.stdout or "") + "\n" + (proc.stderr or "")
+            if proc.returncode != 0 or _looks_like_error(output):
+                errors.append(f"$ {cmd} (exit {proc.returncode})\n{output}")
+        if not errors:
+            status("[hybrid] ✅ verification passed")
+            return True, "verification passed"
+        error_text = "\n\n".join(errors)
+        status(f"[hybrid] ⚠ verification found {len(errors)} error(s) — "
+               f"DeepSeek fixing (attempt {iteration + 1}/{max_iter + 1})")
+        try:
+            fix_text = _deepseek_fix(cloud, task, error_text)
+        except Exception as exc:  # noqa: BLE001
+            status(f"[hybrid] ⚠ DeepSeek fix failed: {exc}")
+            return False, error_text
+        applied, skipped = _apply_fenced_files(fix_text, root)
+        for rel, nbytes in applied:
+            status(f"[hybrid] ✓ FIXED {rel} ({nbytes} B)")
+        if skipped:
+            status(f"[hybrid] ⚠ skipped {len(skipped)} fix block(s): "
+                   f"{', '.join(skipped[:3])}")
+        if not applied:
+            status("[hybrid] ⚠ DeepSeek returned no fixable files")
+            return False, error_text
+        if iteration >= max_iter:
+            break
+    status("[hybrid] ⛔ verification still failing after max attempts")
+    return False, error_text
+
+
 def _select_backend(agent: HybridAgent, cfg: dict, route: str,
                     model_override: str | None):
     """Return the backend for `route`, applying the local model override.
@@ -907,6 +984,16 @@ def main() -> int:
                              "then DeepSeek reviews")
     parser.add_argument("--parallel-workers", type=int, default=4,
                         help="max parallel workers for --parallel (default 4)")
+    parser.add_argument("--verify", action="store_true",
+                        help="final error-check stage: run the verification commands "
+                             "from review.verify (config.yml) after the task is applied; "
+                             "on errors DeepSeek analyzes and fixes them before finishing")
+    parser.add_argument("--verify-cmd", action="append", default=[],
+                        help="add a verification command to run before finishing "
+                             "(repeatable, e.g. --verify-cmd 'npm run build'); "
+                             "implies --verify")
+    parser.add_argument("--verify-max", type=int, default=2,
+                        help="max verify-fix iterations before giving up (default 2)")
     args = parser.parse_args()
 
     if args.evaluate:
@@ -1112,6 +1199,23 @@ def main() -> int:
             quality=final_quality,
         )
 
+        # Final error-check stage: before the task is marked complete, run the
+        # verification commands and have DeepSeek fix any errors (looping until
+        # clean). Only runs when requested (--verify / --verify-cmd) or when
+        # review.verify is configured.
+        verified = True
+        verify_report = ""
+        verify_cmds = list(args.verify_cmds)
+        if args.verify and not verify_cmds:
+            verify_cmds = list(cfg.get("review", {}).get("verify", []) or [])
+        if verify_cmds:
+            verified, verify_report = _run_final_verify(
+                cloud, args.root, args.task, verify_cmds, _status,
+                max_iter=args.verify_max)
+        if not verified:
+            _status("[hybrid] ⛔ FINAL CHECK FAILED: the task is NOT fully verified. "
+                    "Fix DEEPSEEK_API_KEY/network, the verify command, or the code.")
+
         tokens = {}
         if args.json:
             payload = {
@@ -1122,6 +1226,7 @@ def main() -> int:
                 "verdicts": [v.decision for v in result.verdicts],
                 "quality_scores": [v.quality_score for v in result.verdicts],
                 "applied_files": [rel for rel, _ in applied],
+                "verified": verified,
             }
             if args.enhance and enhancement is not None:
                 payload["enhanced_prompt"] = enhancement.enhanced_prompt
@@ -1134,6 +1239,9 @@ def main() -> int:
                 print(f"\nAPPLIED {len(applied)} file(s) to {os.path.abspath(args.root)}:")
                 for rel, nbytes in applied:
                     print(f"  ✓ {rel} ({nbytes} B)")
+            if verify_cmds:
+                print("\nFINAL CHECK:", "PASSED" if verified else "FAILED",
+                      f"({verify_report})")
         if result.reason in _UNSAFE_REASONS:
             # The output above is either UNREVIEWED (DeepSeek never returned a
             # verdict) or INCOMPLETE (DeepSeek fallback truncated even after a

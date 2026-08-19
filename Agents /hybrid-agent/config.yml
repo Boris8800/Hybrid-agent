@@ -37,6 +37,11 @@ review:
   max_depth_tokens: 600
   max_failure_summary_words: 150
   daily_token_budget: 200000
+  # Final error-check stage: commands run before the task is marked complete.
+  # On errors, DeepSeek analyzes the output and produces fixes that are applied
+  # and re-verified (loop until clean). Empty = final check disabled.
+  # Example: ["npm run build", "npx tsc --noEmit", "npm run lint"]
+  verify: []
 
 circuit_breaker:
   window_size: 20

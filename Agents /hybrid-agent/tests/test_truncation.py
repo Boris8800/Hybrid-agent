@@ -613,5 +613,46 @@ class ParallelTests(unittest.TestCase):
         self.assertEqual([r['id'] for r in res], [1, 2])
 
 
+class FinalVerifyTests(unittest.TestCase):
+    """Final error-check stage: run verification, have DeepSeek fix errors."""
+
+    def test_looks_like_error(self):
+        from ask import _looks_like_error
+        self.assertTrue(_looks_like_error("error: cannot find module 'x'"))
+        self.assertTrue(_looks_like_error("TypeScript error: Property 'x' has no"))
+        self.assertTrue(_looks_like_error("Traceback (most recent call last)"))
+        self.assertFalse(_looks_like_error("Build completed successfully."))
+
+    def test_run_final_verify_passes_when_clean(self):
+        from ask import _run_final_verify
+        verified, report = _run_final_verify(None, ".", "task", ["echo ok"],
+                                             lambda l: None, max_iter=1)
+        self.assertTrue(verified)
+
+    def test_run_final_verify_fixes_and_repairs(self):
+        import tempfile
+        from pathlib import Path
+        from backends.base import ModelResponse
+        from ask import _run_final_verify
+
+        root = Path(tempfile.mkdtemp())
+
+        class FakeCloud:
+            def generate(self, req):
+                return ModelResponse(text="```ok.txt\ncreated\n```\n")
+
+        verified, report = _run_final_verify(
+            FakeCloud(), str(root), "task", ["test -f ok.txt"],
+            lambda l: None, max_iter=1)
+        self.assertTrue(verified)
+        self.assertTrue((root / "ok.txt").exists())
+
+    def test_run_final_verify_no_cmds_returns_verified(self):
+        from ask import _run_final_verify
+        verified, report = _run_final_verify(None, ".", "task", [],
+                                             lambda l: None)
+        self.assertTrue(verified)
+
+
 if __name__ == "__main__":
     unittest.main()
