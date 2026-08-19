@@ -17,9 +17,10 @@ Use the venv python (the system `python3` may not have `openai`/`yaml`):
 "Agents /hybrid-agent/.venv/bin/python" "Agents /hybrid-agent/ask.py" --local --task "<task>" --stream
 "Agents /hybrid-agent/.venv/bin/python" "Agents /hybrid-agent/ask.py" --deepseek --task "<task>"
 "Agents /hybrid-agent/.venv/bin/python" "Agents /hybrid-agent/ask.py" --supervise --task "<task>" --max-iterations 4
+"Agents /hybrid-agent/.venv/bin/python" "Agents /hybrid-agent/ask.py" --supervise --enhance --task "<task>" --apply
 ```
 
-Key flags: `--local` / `--deepseek` / `--auto`, `--review` (DeepSeek supervisor review), `--supervise` (Gemma-primary / DeepSeek-supervisor loop), `--models`, `--stream`, `--json`, `--route-only`.
+Key flags: `--local` / `--deepseek` / `--auto`, `--review` (DeepSeek supervisor review), `--supervise` (Gemma-primary / DeepSeek-supervisor loop), `--enhance` (DeepSeek enhances the prompt and plans around Gemma's context/output limits BEFORE implementing — the improved prompt + reasoning + plan are shown, then sent to the local model), `--models`, `--stream`, `--json`, `--route-only`.
 
 ## Project Context Feature
 

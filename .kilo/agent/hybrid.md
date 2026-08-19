@@ -21,10 +21,12 @@ permission:
 >
 > 1. You MUST run the hybrid bridge via the terminal:
 >    ```bash
->    python3 "Agents /hybrid-agent/ask.py" --supervise --mode hybrid --apply --root "$(pwd)" --task "<task description>"
+>    python3 "Agents /hybrid-agent/ask.py" --supervise --enhance --mode hybrid --apply --root "$(pwd)" --task "<task description>"
 >    ```
 >    (or use the `/hybrid <task>` command, which is the same thing)
-> 2. The bridge runs the full loop: Gemma implements → DeepSeek reviews →
+> 2. The bridge runs the full loop: DeepSeek ENHANCES the prompt and plans
+>    around Gemma's context/output limits → shows the improved prompt +
+>    reasoning + plan → Gemma implements the ENHANCED prompt → DeepSeek reviews →
 >    loops until APPROVED → `--apply` writes the approved files itself.
 > 3. You ONLY:
 >    - Route tasks to the bridge
@@ -62,8 +64,8 @@ The user gives one original task. The original task must remain available throug
 The workflow is:
 
 USER TASK
-→ DEEPSEEK INITIAL REASONING
-→ DEEPSEEK MASTER PLAN
+→ DEEPSEEK ENHANCES PROMPT (clarify, disambiguate, size to Gemma's limits)
+→ DEEPSEEK MASTER PLAN (each step fits in ONE local response)
 → GEMMA IMPLEMENTS ONE STEP
 → GEMMA TESTS
 → DEEPSEEK REVIEWS
@@ -172,6 +174,17 @@ Do not allow requirements to disappear during the workflow.
 # 5. INITIAL DEEPSEEK CALL
 
 Before Gemma starts implementing, send the original user prompt to DeepSeek.
+
+DeepSeek does two things in this call:
+
+1. **ENHANCES the prompt** — clarifies the terse original task into a clear,
+   self-contained, unambiguous implementation prompt for the local model, and
+   plans AROUND Gemma's limits (32768-token context window, 4096-token output
+   cap) so each step fits in ONE local response and never triggers truncation.
+2. **Produces the MASTER PLAN** (below).
+
+The improved prompt + reasoning + plan are shown to the user before Gemma
+implements.
 
 Use a supervisor prompt similar to:
 
@@ -824,6 +837,11 @@ APPROVED
 The hybrid controller should follow this state machine:
 
 USER_TASK
+
+↓
+
+API_ENHANCE_PROMPT
+(DeepSeek clarifies the prompt + plans around Gemma's context/output limits)
 
 ↓
 

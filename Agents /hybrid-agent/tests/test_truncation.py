@@ -248,5 +248,40 @@ class LocalLimitsAwarenessTests(unittest.TestCase):
         self.assertIn("REMAINING WORK", req.user)
 
 
+class EnhancementTests(unittest.TestCase):
+    def test_parse_enhancement_sections(self):
+        from supervise import parse_enhancement
+        raw = "=== ENHANCED PROMPT ===\nEnhanced content here\n=== REASONING ===\nReasoning here\n=== PLAN ===\nPlan here"
+        result = parse_enhancement(raw)
+        self.assertEqual(result.enhanced_prompt, "Enhanced content here")
+        self.assertEqual(result.reasoning, "Reasoning here")
+        self.assertEqual(result.plan, "Plan here")
+        self.assertTrue(result.enhanced)
+        self.assertEqual(result.raw, raw)
+
+    def test_parse_enhancement_fallback_raw(self):
+        from supervise import parse_enhancement
+        raw = "Just a plain prompt without sections"
+        result = parse_enhancement(raw)
+        self.assertEqual(result.enhanced_prompt, raw.strip())
+        # fallback fills enhanced_prompt with the raw text, so it is non-empty.
+        self.assertTrue(result.enhanced)
+
+    def test_enhance_request_informs_deepseek_of_local_limits(self):
+        from supervise import LOCAL_CONTEXT_TOKENS, LOCAL_OUTPUT_TOKENS, _enhance_request
+        req = _enhance_request('build a multi-file app')
+        self.assertTrue(req.user.startswith('ORIGINAL USER TASK:'))
+        self.assertIn('IMPLEMENTER CONSTRAINTS', req.system)
+        self.assertIn(str(LOCAL_CONTEXT_TOKENS), req.system)
+        self.assertIn(str(LOCAL_OUTPUT_TOKENS), req.system)
+        self.assertIn('=== ENHANCED PROMPT ===', req.system)
+        self.assertEqual(req.max_tokens, 1200)
+
+    def test_enhance_request_includes_context(self):
+        from supervise import _enhance_request
+        req = _enhance_request('task', 'ctx info')
+        self.assertIn('ctx info', req.user)
+
+
 if __name__ == "__main__":
     unittest.main()

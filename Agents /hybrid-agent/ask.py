@@ -33,7 +33,7 @@ from router.confidence import MemoryView
 
 from agent import HybridAgent, _load_config, apply_env_overrides
 from backends.deepseek import _resolve_api_key
-from supervise import GEMMA_MAX_TOKENS, ReviewPackage, supervise
+from supervise import GEMMA_MAX_TOKENS, ReviewPackage, _enhance_request, parse_enhancement, supervise
 
 # --- Self-heal: loading config.yml requires PyYAML + openai, which exist only
 # in the project venv (hybrid-agent/.venv). When invoked with a system python3
@@ -634,6 +634,12 @@ def main() -> int:
                         help="Gemma-primary / DeepSeek-supervisor loop: Gemma implements, "
                              "DeepSeek reviews a compact package, loop until APPROVED "
                              "(default max 3 iterations)")
+    parser.add_argument("--enhance", action="store_true",
+                        help="DeepSeek enhances the prompt and plans around the LOCAL "
+                             "model's context/output limits BEFORE it implements. The "
+                             "improved prompt + reasoning + plan are shown, then sent "
+                             "to the local model. Pairs with --supervise (full loop) "
+                             "or the local route (single shot). Requires hybrid mode.")
     parser.add_argument("--max-iterations", type=int, default=3,
                         help="max supervise loop iterations (default 3)")
     parser.add_argument("--apply", action="store_true",
@@ -747,9 +753,43 @@ def main() -> int:
 
         # Optional context (files/diff) goes into the review package via a builder.
         context = args.context or ""
+
+        # --enhance: DeepSeek enhances the task and plans around Gemma's limits
+        # BEFORE Gemma implements. The improved prompt + reasoning + plan are
+        # shown, then the enhanced prompt is what Gemma implements.
+        enhancement = None
+        task_for_gemma = args.task
+        if args.enhance:
+            enh_label = "deepseek (prompt enhancer)"
+            _status(f"[hybrid] ▶ {enh_label} working on \"{_task_preview(args.task)}\" ...")
+            try:
+                enh_resp = _generate_with_retry(
+                    agent, cfg, args, "deepseek",
+                    _enhance_request(args.task, context),
+                )
+            except KeyboardInterrupt:
+                return 130
+            except Exception as exc:  # noqa: BLE001 - report cleanly
+                _status(f"[hybrid] ✗ {enh_label} failed")
+                print(f"error: {exc}", file=sys.stderr)
+                return 3
+            enhancement = parse_enhancement(enh_resp.text)
+            _status(f"[hybrid] ✓ {enh_label} done · {int(enh_resp.latency_ms)} ms · "
+                    f"tokens={_format_tokens(enh_resp)}")
+            if not args.json:
+                print("=== ENHANCED PROMPT ===\n" + enhancement.enhanced_prompt)
+                if enhancement.reasoning:
+                    print("\n=== REASONING ===\n" + enhancement.reasoning)
+                if enhancement.plan:
+                    print("\n=== PLAN ===\n" + enhancement.plan)
+                print("\n--- sending enhanced prompt to local model ---\n")
+            if enhancement.enhanced:
+                task_for_gemma = enhancement.enhanced_prompt
+
         def _pkg(task: str, code: str, iteration: int) -> ReviewPackage:
             return ReviewPackage(
                 task=task,
+                plan=enhancement.plan if enhancement else "",
                 changes=f"Gemma output (iteration {iteration}):\n{code}",
                 uncertainties=context,
                 verification="None supplied — caller can pass --context with test/lint results.",
@@ -766,7 +806,7 @@ def main() -> int:
 
         result = supervise(
             local, cloud,
-            task=args.task,
+            task=task_for_gemma,
             package_builder=_pkg,
             max_iterations=args.max_iterations,
             gemma_generate=_supervise_gemma_generate(cfg, args.model),
@@ -796,7 +836,7 @@ def main() -> int:
 
         tokens = {}
         if args.json:
-            print(json.dumps({
+            payload = {
                 "text": result.final_text,
                 "route": result.route,
                 "reason": result.reason,
@@ -804,7 +844,12 @@ def main() -> int:
                 "verdicts": [v.decision for v in result.verdicts],
                 "quality_scores": [v.quality_score for v in result.verdicts],
                 "applied_files": [rel for rel, _ in applied],
-            }, ensure_ascii=False))
+            }
+            if args.enhance and enhancement is not None:
+                payload["enhanced_prompt"] = enhancement.enhanced_prompt
+                payload["reasoning"] = enhancement.reasoning
+                payload["plan"] = enhancement.plan
+            print(json.dumps(payload, ensure_ascii=False))
         else:
             print(_strip_confidence_tag(result.final_text))
             if applied:
@@ -868,6 +913,43 @@ def main() -> int:
               "DEEPSEEK_API_KEY.", file=sys.stderr)
         return 2
 
+    # --enhance (standalone, local route): DeepSeek enhances the prompt and plans
+    # around Gemma's limits, shows the improved prompt + reasoning + plan, then
+    # the ENHANCED prompt is what the local model implements.
+    if args.enhance:
+        if not MODES[mode]["api_supervision"]:
+            _status(f"[hybrid] ⛔ refusal: mode={mode} has no API supervision (only hybrid enables it).")
+            print(f"error: --enhance requires hybrid mode (API supervision). Use MODE=hybrid.", file=sys.stderr)
+            return 3
+        if route != "local":
+            _status("[hybrid] ⛔ refusal: --enhance needs the local model as implementer.")
+            print("error: --enhance is for the local route; use --local or MODE=hybrid/local.", file=sys.stderr)
+            return 3
+        enh_label = "deepseek (prompt enhancer)"
+        _status(f"[hybrid] ▶ {enh_label} working on \"{_task_preview(args.task)}\" ...")
+        try:
+            enh_resp = _generate_with_retry(
+                agent, cfg, args, "deepseek", _enhance_request(args.task, context)
+            )
+        except KeyboardInterrupt:
+            return 130
+        except Exception as exc:  # noqa: BLE001 - report cleanly
+            _status(f"[hybrid] ✗ {enh_label} failed")
+            print(f"error: {exc}", file=sys.stderr)
+            return 3
+        enhancement = parse_enhancement(enh_resp.text)
+        _status(f"[hybrid] ✓ {enh_label} done · {int(enh_resp.latency_ms)} ms · "
+                f"tokens={_format_tokens(enh_resp)}")
+        if not args.json:
+            print("=== ENHANCED PROMPT ===\n" + enhancement.enhanced_prompt)
+            if enhancement.reasoning:
+                print("\n=== REASONING ===\n" + enhancement.reasoning)
+            if enhancement.plan:
+                print("\n=== PLAN ===\n" + enhancement.plan)
+            print("\n--- sending enhanced prompt to local model ---\n")
+        if enhancement.enhanced:
+            args.task = enhancement.enhanced_prompt
+
     req = _build_request(agent, args, route, context)
     model_label = _model_label(cfg, route, args.model)
     via = "http-fallback" if not _have_openai() else "backend"
@@ -895,6 +977,10 @@ def main() -> int:
             "tokens": tokens,
             "truncated": resp.truncated,
         }
+        if args.enhance:
+            payload["enhanced_prompt"] = enhancement.enhanced_prompt
+            payload["reasoning"] = enhancement.reasoning
+            payload["plan"] = enhancement.plan
         print(json.dumps(payload, ensure_ascii=False))
     else:
         print(_strip_confidence_tag(resp.text))

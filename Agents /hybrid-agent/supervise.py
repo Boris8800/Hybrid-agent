@@ -76,6 +76,47 @@ class ReviewPackage:
         return "\n\n".join(blocks)
 
 
+@dataclass
+class Enhancement:
+    """DeepSeek's enhanced prompt plus the reasoning/plan behind it.
+
+    Produced BEFORE the local model implements, so the API model can clarify
+    the task and size a plan to the local model's context/output limits.
+    """
+
+    enhanced_prompt: str = ""
+    reasoning: str = ""
+    plan: str = ""
+    raw: str = ""
+
+    @property
+    def enhanced(self) -> bool:
+        return bool(self.enhanced_prompt.strip())
+
+
+def parse_enhancement(raw: str) -> Enhancement:
+    """Parse DeepSeek enhancement output into an Enhancement.
+
+    Expects the section markers the enhancement prompt requests:
+        === ENHANCED PROMPT ===
+        === REASONING ===
+        === PLAN ===
+    Falls back to using the whole response as the enhanced prompt when no
+    ENHANCED PROMPT section is present.
+    """
+    def _section(label: str) -> str:
+        m = re.search(rf"===\s*{label}\s*===\s*(.*?)(?:\n\s*===|\Z)", raw, re.S | re.I)
+        return m.group(1).strip() if m else ""
+
+    enh = Enhancement(raw=raw)
+    enh.enhanced_prompt = _section("ENHANCED PROMPT")
+    enh.reasoning = _section("REASONING")
+    enh.plan = _section("PLAN")
+    if not enh.enhanced_prompt:
+        enh.enhanced_prompt = raw.strip()
+    return enh
+
+
 def _decision_from(raw: str) -> str:
     """Extract the decision keyword from a review response."""
     m = re.search(r"\b(APPROVED|FIX_REQUIRED|REJECTED)\b", raw.upper())
@@ -380,6 +421,40 @@ def _cloud_generate_guarded(cloud: Backend, task: str, status: callable,
     if getattr(response, "truncated", False):
         status("[supervise] cloud output STILL truncated — INCOMPLETE, must NOT be applied")
     return response.text, bool(getattr(response, "truncated", False))
+
+
+def _enhance_request(task: str, context: str = "") -> ModelRequest:
+    """Request DeepSeek to ENHANCE the task and plan it for the local implementer.
+
+    Runs BEFORE the local model implements: DeepSeek clarifies the user's prompt
+    into a self-contained implementation prompt AND produces a step-by-step plan
+    where each step fits in ONE local response (context window / output cap),
+    so the local model never receives an oversized prompt that guarantees
+    truncation.
+    """
+    return ModelRequest(
+        system=(
+            "You are the senior architect for a hybrid coding agent. Your job:\n"
+            "(a) ENHANCE the user's prompt into a clear, self-contained, "
+            "unambiguous implementation prompt ready to send to the local "
+            "implementer. Do not invent requirements that conflict with the task.\n"
+            "(b) Produce a REASONING section explaining what you improved and why.\n"
+            "(c) Produce a PLAN section giving a step-by-step implementation plan "
+            "where EACH STEP fits in ONE local model response.\n\n"
+            "Format your response with these exact section markers:\n"
+            "=== ENHANCED PROMPT ===\n"
+            "<the enhanced prompt>\n"
+            "=== REASONING ===\n"
+            "<what you improved and why>\n"
+            "=== PLAN ===\n"
+            "<step-by-step plan>\n\n"
+            f"{_local_limits_note()}"
+        ),
+        user=f"ORIGINAL USER TASK:\n{task}\n"
+             + (f"\nCONTEXT:\n{context}\n" if context else ""),
+        max_tokens=1200,
+        temperature=0.1,
+    )
 
 
 def _cloud_plan_request(task: str) -> ModelRequest:
