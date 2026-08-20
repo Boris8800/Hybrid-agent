@@ -81,6 +81,13 @@ circuit_breaker:
   deepseek_error_ceiling: 0.30
   cooldown_s: 60
 
+# Deploy step: runs AFTER verification passes when --deploy (or --deploy-cmd)
+# is used. The command runs from deploy.cwd (default: the project root).
+deploy:
+  command: ""            # e.g. "docker compose up -d --build" or "git push origin main"
+  cwd: ""                # default: the project root given to --root
+  timeout: 1800
+
 memory:
   root: "./memory"
   max_project_summary_words: 200

@@ -227,7 +227,8 @@ class TaskRunner:
         cmd = [sys.executable, str(ASK_PATH), "--task", item.get("task", ""),
                "--mode", item.get("mode", "hybrid"), "--root", self.root]
         for flag in ("enhance", "verify", "regression", "apply", "parallel",
-                     "cot", "context_scan", "turbo", "proceed"):
+                     "cot", "context_scan", "turbo", "proceed", "pull", "push",
+                     "deploy"):
             if item.get(flag):
                 cmd.append("--" + flag.replace("_", "-"))
         if item.get("max_iterations"):
@@ -489,8 +490,10 @@ def create_app(root: str = str(ENGINE_DIR.parent), config_path: str | None = Non
             "enhance": bool(body.get("enhance")), "verify": bool(body.get("verify")),
             "regression": bool(body.get("regression")), "apply": bool(body.get("apply")),
             "parallel": bool(body.get("parallel")),             "cot": bool(body.get("cot")),
-            "context_scan": bool(body.get("context_scan")), "turbo": bool(body.get("turbo")),
+            "context_scan": bool(body.get("context_scan")),             "turbo": bool(body.get("turbo")),
             "proceed": bool(body.get("proceed")),
+            "pull": bool(body.get("pull")), "push": bool(body.get("push")),
+            "deploy": bool(body.get("deploy")),
             "max_iterations": int(body["max_iterations"]) if body.get("max_iterations") else 0,
             "online_provider": body.get("online_provider") or "",
             "local_provider": body.get("local_provider") or "",

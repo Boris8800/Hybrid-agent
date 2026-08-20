@@ -44,6 +44,7 @@ from parallel import (DependencyAnalyzer, ParallelExecutor, parse_plan_steps,
                       summarize)
 from memory import TaskMemory, TaskRecord, memory_root_from_cfg
 from embed import memory_embed_callable
+from gitops import git_pull, git_push, run_deploy
 from providers import (backend_for, enabled_online, get_local, get_online,
                        load_providers, resolve_api_key)
 
@@ -581,6 +582,7 @@ _KNOWN_CONFIG_KEYS = {
     "memory": {"root", "max_project_summary_words", "semantic_similarity",
                "embedding_model", "embedding_threshold"},
     "providers": {"online", "local"},
+    "deploy": {"command", "cwd", "timeout"},
     "roles": {"implementer", "supervisor"},
 }
 
@@ -1640,6 +1642,7 @@ def _run_final_verify(cloud, root: str, task: str, cmds, status,
                 root, list(regression_cmds or []), status, timeout_s=regression_timeout)
             if reg_pass:
                 verify_stats["status"] = "PASSED"
+                verify_stats["files"] = list(fixed_files)
                 return True, "verification passed"
             verify_stats["status"] = "REGRESSION_FAILED"
             return False, reg_report
@@ -1689,7 +1692,7 @@ def _run_final_verify(cloud, root: str, task: str, cmds, status,
         status(f"[hybrid] 📄 fix diff: {log}")
     verify_stats.update({"api_calls": api_calls, "tokens_used": tokens_used,
                          "estimated_cost_usd": round(tokens_used * 0.000002, 5),
-                         "status": "FAILED"})
+                         "status": "FAILED", "files": list(fixed_files)})
     status("[hybrid] ⛔ verification still failing after max attempts")
     return False, error_text
 
@@ -1890,6 +1893,18 @@ def main() -> int:
                         help="with --enhance in a non-interactive run: continue with the "
                              "enhanced prompt even when DeepSeek raised clarifying "
                              "questions (otherwise the run aborts with TASK UNCLEAR)")
+    parser.add_argument("--pull", action="store_true",
+                        help="git pull --ff-only before the task (best-effort; dirty "
+                             "tree or missing upstream is reported, never fatal)")
+    parser.add_argument("--push", action="store_true",
+                        help="after the task is verified: git add + commit + push the "
+                             "engine's changes (applied files + verification fixes) with "
+                             "an identifiable 'hybrid-agent: ...' message. Never force-pushes")
+    parser.add_argument("--deploy", action="store_true",
+                        help="after verification passes, run the deploy command from "
+                             "deploy.command in config.yml (or --deploy-cmd)")
+    parser.add_argument("--deploy-cmd", default=None,
+                        help="deploy command override (implies --deploy)")
     parser.add_argument("--stats", action="store_true",
                         help="print the 80/20 strategy summary (hybrid-agent/stats.json)")
     parser.add_argument("--evaluate", action="store_true",
@@ -2061,6 +2076,12 @@ def main() -> int:
         cloud = _budgeted_cloud(cloud, cfg)
         cloud = (_parallel_cloud(cloud, cfg, args) if args.turbo
                  else _failover_cloud(cloud, cfg, args))
+
+        # --pull: refresh the baseline before the agent works (best-effort).
+        if args.pull:
+            _status("[hybrid] ⬇ git pull (baseline) ...")
+            ok, msg = git_pull(args.root)
+            _status(f"[hybrid] {'⬇ pulled' if ok else '⚠ pull skipped'}: {msg}")
 
         # Optional context (files/diff) goes into the review package via a builder.
         context = args.context or ""
@@ -2249,6 +2270,28 @@ def main() -> int:
             _status("[hybrid] ⛔ FINAL CHECK FAILED: the task is NOT fully verified. "
                     "Fix DEEPSEEK_API_KEY/network, the verify command, or the code.")
 
+        # --push / --deploy: ship the verified changes. Never run when the
+        # final check failed or the run never independently reviewed its output.
+        push_ok = deploy_ok = None
+        push_msg = deploy_msg = ""
+        if verified and result.reason not in _UNSAFE_REASONS:
+            if args.push:
+                push_files = [rel for rel, _ in applied]
+                push_files += list(verify_stats.get("files", []))
+                _status("[hybrid] ⬆ git push ...")
+                push_ok, push_msg = git_push(
+                    args.root, files=push_files or None,
+                    message=f"hybrid-agent: {args.task[:100]}")
+                _status(f"[hybrid] {'⬆ pushed' if push_ok else '⚠ push skipped'}: {push_msg}")
+            if args.deploy or args.deploy_cmd:
+                deploy_cmd = args.deploy_cmd or (cfg.get("deploy") or {}).get("command", "")
+                deploy_cwd = (cfg.get("deploy") or {}).get("cwd") or args.root
+                _status("[hybrid] 🚀 deploy ...")
+                deploy_ok, deploy_msg = run_deploy(
+                    args.root, deploy_cmd, cwd=deploy_cwd,
+                    timeout=int((cfg.get("deploy") or {}).get("timeout", 1800)))
+                _status(f"[hybrid] {'🚀 deployed' if deploy_ok else '⛔ deploy failed'}: {deploy_msg}")
+
         tokens = {}
         if args.json:
             payload = {
@@ -2266,6 +2309,10 @@ def main() -> int:
                 payload["enhanced_prompt"] = enhancement.enhanced_prompt
                 payload["reasoning"] = enhancement.reasoning
                 payload["plan"] = enhancement.plan
+            if push_ok is not None:
+                payload["push"] = {"ok": push_ok, "message": push_msg}
+            if deploy_ok is not None:
+                payload["deploy"] = {"ok": deploy_ok, "message": deploy_msg}
             print(json.dumps(payload, ensure_ascii=False))
         else:
             print(_strip_confidence_tag(result.final_text))
@@ -2278,6 +2325,10 @@ def main() -> int:
             if verify_cmds:
                 print("\nFINAL CHECK:", "PASSED" if verified else "FAILED",
                       f"({verify_report})")
+            if push_ok is not None:
+                print("\nPUSH:", "OK" if push_ok else "SKIPPED", f"({push_msg})")
+            if deploy_ok is not None:
+                print("DEPLOY:", "OK" if deploy_ok else "FAILED", f"({deploy_msg})")
         if result.reason in _UNSAFE_REASONS:
             # The output above is either UNREVIEWED (DeepSeek never returned a
             # verdict) or INCOMPLETE (DeepSeek fallback truncated even after a

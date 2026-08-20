@@ -14,6 +14,7 @@ The bridge is a self-contained CLI (`ask.py`) that talks directly to two OpenAI-
 - [Setup](#setup)
 - [Web dashboard](#web-dashboard)
 - [Providers & multi-model](#providers--multi-model)
+- [Git & deploy](#git--deploy-pull--push--deploy)
 - [Quick start](#quick-start)
 - [CLI reference](#cli-reference)
 - [The supervise loop](#the-supervise-loop)
@@ -147,6 +148,33 @@ fleet of **2 online + 2 local providers** configured out of the box:
   Uses many AIs at the same time; multiplies API spend (still capped by
   `review.daily_token_budget`).
 
+## Git & deploy (pull / push / deploy)
+
+The engine can manage the whole ship-and-ship-it loop:
+
+- **`--pull`** — `git pull --ff-only` before the agent starts, so it works on
+  the freshest baseline. Best-effort: a dirty tree or missing upstream is
+  reported, never fatal.
+- **`--push`** — after verification passes, stage exactly the engine's own
+  changes (applied files + verification fixes), commit with an identifiable
+  `hybrid-agent: <task>` message, and push. Never force-pushes; the first push
+  of a new branch auto-sets upstream.
+- **`--deploy`** / `--deploy-cmd` — after verification passes, run the deploy
+  command from `deploy.command` (config.yml) or the flag override, from
+  `deploy.cwd` (default: the project root). E.g. `docker compose up -d --build`
+  or `git push origin main`.
+
+Push and deploy only run when the task is **verified** and the output was
+independently reviewed — never on `review_failed_no_verdict` or truncated
+fallbacks. Results (ok/message) are reported in the status lines, the printed
+summary, and the `--json` payload under `push` / `deploy`.
+
+```bash
+# Pull latest, fix, verify, commit+push, then deploy — in one shot:
+python3 ask.py --supervise --enhance --task "fix the checkout bug" \
+  --verify --verify-cmd "npm run build" --apply --pull --push --deploy
+```
+
 ## Quick start
 
 ```bash
@@ -224,6 +252,9 @@ use plain `python3 ask.py …` (the CLI self-heals into the venv interpreter).
 | Flag | Description |
 |------|-------------|
 | `--verify` | Run the final error-check stage (build/lint/tests) before the task is marked complete. |
+| `--pull` | `git pull --ff-only` before the task (best-effort). |
+| `--push` | After verification: git add + commit + push the engine's changes. |
+| `--deploy` / `--deploy-cmd CMD` | After verification: run the deploy command. |
 | `--verify-cmd CMD` | Add a verification command (repeatable; implies `--verify`). |
 | `--verify-max N` | Max verify-fix iterations (default 2). |
 | `--verify-timeout S` | Per-command timeout (default `review.verify_timeout`, 600s). |
@@ -434,6 +465,7 @@ Unknown keys are ignored by the loader, and every section has a safe default.
 | `circuit_breaker` | `window_size`, `local_error_ceiling`, `deepseek_error_ceiling`, `cooldown_s` |
 | `memory` | `root`, `max_project_summary_words`, `semantic_similarity`, `embedding_model`, `embedding_threshold` |
 | `providers` | `online`, `local` (lists of `{name, base_url, model, api_key_env, api_key, enabled, timeout_s, max_retries}`) |
+| `deploy` | `command`, `cwd`, `timeout` |
 | `roles` | `implementer`, `supervisor` (architecture — do not change) |
 
 **Environment overrides** (roles stay architecture; only models/endpoints change):
@@ -472,7 +504,7 @@ report.
 
 ```bash
 cd "Agents /hybrid-agent"
-./.venv/bin/python -m unittest discover -s tests -v    # 142 tests
+./.venv/bin/python -m unittest discover -s tests -v    # 151 tests
 ```
 
 Coverage includes: the fenced-file parser, the apply overwrite/unsafe-path guards,
@@ -483,8 +515,9 @@ similarity), the local-first `review=False` supervise path, token-budget account
 embedding clients and cosine, per-project memory scoping, config-key validation,
 provider registry (2+2, overrides, key resolution), failover + turbo cloud wrappers,
 the encrypted secrets store, the dashboard API (stats/providers/config/auth),
-parallel-verify groups, truncation retries, and parallel step conflict
-detection/serialization.
+gitops pull/push/deploy (commit-to-bare-remote, no-changes skip, upstream
+auto-set, deploy commands), parallel-verify groups, truncation retries, and
+parallel step conflict detection/serialization.
 
 `.github/workflows/ci.yml` runs the full suite on Python 3.11 and 3.12 for every push and
 pull request, plus a syntax check of every engine module and the `.kilo/agent/*.md`
@@ -505,6 +538,7 @@ repo root/
     ├── memory.py                # Persistent task memory (semantic recall, consolidation)
     ├── embed.py                 # Local embeddings client (/v1/embeddings) + cosine
     ├── providers.py             # Provider registry (2 online + 2 local, failover-ready)
+    ├── gitops.py                # git pull / push / deploy helpers
     ├── web_dashboard.py         # Web control panel (Flask + SocketIO, port 8660)
     ├── dashboard/               # Dashboard UI + encrypted secrets store
     ├── context.py / scan.py     # Project context scanner

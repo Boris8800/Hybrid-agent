@@ -205,6 +205,9 @@ h4.sub{font-size:13px;margin:20px 0 10px;color:var(--muted);text-transform:upper
         <label class="chk"><input type="checkbox" id="f-turbo"><b>turbo</b></label>
         <label class="chk"><input type="checkbox" id="f-scan"> context-scan</label>
         <label class="chk" title="Continue with the enhanced prompt even when DeepSeek asks clarifying questions"><input type="checkbox" id="f-proceed" checked> proceed if unclear</label>
+        <label class="chk" title="git pull --ff-only before the task"><input type="checkbox" id="f-pull"> ⬇ pull</label>
+        <label class="chk" title="git add + commit + push the engine's changes after verification"><input type="checkbox" id="f-push"> ⬆ push</label>
+        <label class="chk" title="Run deploy.command after verification passes"><input type="checkbox" id="f-deploy"> 🚀 deploy</label>
       </div>
       <div class="row" style="margin-top:12px">
         <button class="green" onclick="submitTask()">▶ Run task</button>
@@ -370,6 +373,7 @@ function submitTask(){
     enhance:$id('f-enhance').checked,verify:$id('f-verify').checked,regression:$id('f-regression').checked,
     apply:$id('f-apply').checked,parallel:$id('f-parallel').checked,cot:$id('f-cot').checked,
     turbo:$id('f-turbo').checked,context_scan:$id('f-scan').checked,proceed:$id('f-proceed').checked,
+    pull:$id('f-pull').checked,push:$id('f-push').checked,deploy:$id('f-deploy').checked,
     max_iterations:parseInt($id('max-iter').value||'3',10)};
   fetch('/api/task',{method:'POST',headers:headers(),body:JSON.stringify(body)})
     .then(r=>r.json()).then(d=>{
