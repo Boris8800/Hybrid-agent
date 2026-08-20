@@ -91,6 +91,54 @@ deploy:
   cwd: ""                # default: the project root given to --root
   timeout: 1800
 
+# BOUND (Ouro Loop pattern): hard constraints the agent can NEVER bypass.
+# Enforced at runtime — files in danger zones are never written, never_do
+# commands never run, and an apply that attempts a violation exits with code 2.
+# --no-bound disables enforcement (user-level escape hatch only).
+bound:
+  danger_zones:
+    - "**/.env"
+    - "**/.env.*"
+    - "**/*.pem"
+    - "**/*.key"
+    - ".git/**"
+    - ".kilo/**"
+    - "Agents /hybrid-agent/**"
+    - "**/memory/**"
+    - "**/.cache/**"
+  never_do:
+    - "rm -rf"
+    - "git push --force"
+    - "git reset --hard"
+    - "git clean -f"
+    - "chmod 777"
+    - "sudo "
+    - "shutdown"
+    - "reboot"
+    - "mkfs"
+  iron_laws:
+    - "Never modify or create secrets, credentials, .env files, private keys, or certs."
+    - "Never run destructive git operations (force push, hard reset, clean, delete)."
+    - "Never write files outside the project root or inside declared danger zones."
+    - "Never modify the agent's own configuration, memory, or cache."
+    - "Never bypass, disable, or weaken the BOUND or the verification gates."
+    - "Always leave the project in a building state; revert if you cannot verify."
+
+# Bounded-autonomy program: phases with verification gates and a remediation
+# playbook (retry / revert / escalate). Runs inside the verify stage when
+# configured. Empty = phases disabled (the standard --verify flow runs).
+program:
+  phases: []
+  # Example:
+  # phases:
+  #   - name: build
+  #     gate: ["npm run build"]
+  #     max_fix_rounds: 2
+  #     on_fail: retry        # retry | revert | escalate
+  #   - name: test
+  #     gate: ["npm test"]
+  #     on_fail: escalate
+
 memory:
   root: "./memory"
   max_project_summary_words: 200

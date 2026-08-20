@@ -265,7 +265,7 @@ def _local_limits_note() -> str:
 
 
 def _gemma_primary_prompt(task: str, prior_fixes: str = "",
-                          terminal_output: str = "",
+                          terminal_output: str = "", bound_text: str = "",
                           max_tokens: int = GEMMA_MAX_TOKENS) -> ModelRequest:
     system = (
         "You are a careful mid-level engineer implementing a change. "
@@ -275,6 +275,8 @@ def _gemma_primary_prompt(task: str, prior_fixes: str = "",
         "'RUN: npm run build' and you will receive the command output in the "
         "next turn. Use it to confirm your changes work."
     )
+    if bound_text:
+        system += "\n\n" + bound_text  # RECALL gate: the BOUND re-injected every iteration
     user = f"TASK:\n{task}\n"
     if prior_fixes:
         user += f"\nA senior reviewer previously asked you to fix these issues. Apply ALL of them now:\n{prior_fixes}\n"
@@ -371,6 +373,7 @@ def supervise(
     review_quality_hint: float = 0.0,
     terminal_tool: callable = None,
     max_terminal_rounds: int = 3,
+    bound_text: str = "",
 ) -> SuperviseResult:
     """Run Gemma-primary / DeepSeek-supervisor on a task.
 
@@ -405,7 +408,7 @@ def supervise(
         status(f"[supervise] iter {iteration}: Gemma working...")
         try:
             resp: ModelResponse = gemma_generate(
-                _gemma_primary_prompt(current, prior_fixes, max_tokens=gemma_max_tokens)
+                _gemma_primary_prompt(current, prior_fixes, bound_text=bound_text, max_tokens=gemma_max_tokens)
             )
         except Exception as exc:  # noqa: BLE001
             status(f"[supervise] local failed ({exc}); escalating to DeepSeek")
@@ -426,7 +429,7 @@ def supervise(
                        f"{gemma_max_tokens} tokens - retrying once with {retry_budget}")
                 try:
                     resp = gemma_generate(
-                        _gemma_primary_prompt(current, prior_fixes, max_tokens=retry_budget)
+                        _gemma_primary_prompt(current, prior_fixes, bound_text=bound_text, max_tokens=retry_budget)
                     )
                 except Exception as exc:  # noqa: BLE001
                     status(f"[supervise] local retry failed ({exc}); escalating to DeepSeek")
@@ -461,7 +464,7 @@ def supervise(
             try:
                 resp = gemma_generate(_gemma_primary_prompt(
                     current, prior_fixes, terminal_output=terminal_feedback,
-                    max_tokens=gemma_max_tokens))
+                    bound_text=bound_text, max_tokens=gemma_max_tokens))
             except Exception as exc:  # noqa: BLE001 - keep the last good output
                 status(f"[supervise] terminal re-generate failed ({exc}); continuing")
                 break

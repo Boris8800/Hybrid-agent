@@ -16,6 +16,7 @@ The bridge is a self-contained CLI (`ask.py`) that talks directly to two OpenAI-
 - [Providers & multi-model](#providers--multi-model)
 - [Git & deploy](#git--deploy-pull--push--deploy)
 - [Terminal tool (RUN:)](#terminal-tool-run)
+- [Bounded autonomy (BOUND)](#bounded-autonomy-bound)
 - [Quick start](#quick-start)
 - [CLI reference](#cli-reference)
 - [The supervise loop](#the-supervise-loop)
@@ -200,6 +201,53 @@ RUN: npm run build        ← the model inspects/verifies
 - `--terminal-rounds 0` disables the tool; it's enabled by default in the
   supervise loop.
 
+## Bounded autonomy (BOUND)
+
+The **Ouro Loop pattern**: hard constraints enforced at runtime, so the agent
+can run unattended without breaking things.
+
+**The BOUND** (`bound:` in config.yml) has three parts:
+
+- **DANGER ZONES** — glob patterns the agent can never write (`**/.env`,
+  `**/*.pem`, `**/*.key`, `.git/**`, the engine dir, memory/cache, …).
+- **NEVER DO** — command patterns that never run (`rm -rf`, `git push --force`,
+  `git reset --hard`, `chmod 777`, `sudo`, …).
+- **IRON LAWS** — human rules injected into every prompt.
+
+**Runtime enforcement (the agent cannot bypass it):**
+- Files matching a danger zone are **never written** by `--apply` — the run
+  reports `BOUND_VIOLATION` and exits with **code 2**.
+- `never_do` commands are blocked in the `RUN:` terminal tool.
+- Verification-fix outputs are BOUND-checked too; a violation reverts the fixes.
+- `--no-bound` is the user-level escape hatch — the agent has no path to it.
+
+**RECALL gate** — the BOUND is re-injected into the enhance context, the review
+package, and **every** Gemma iteration, so the models can't "forget" it as the
+conversation grows.
+
+**Program phases** (`program:` in config.yml) — structured Build → Verify →
+Self-Fix cycles inside the verify stage, each with its own gate and a
+remediation playbook:
+
+```yaml
+program:
+  phases:
+    - name: build
+      gate: ["npm run build"]
+      max_fix_rounds: 2
+      on_fail: retry        # retry | revert | escalate
+    - name: test
+      gate: ["npm test"]
+      on_fail: escalate
+```
+
+- **`retry`** — DeepSeek fixes the gate errors (BOUND-enforced), re-verify.
+- **`revert`** — git-restore the phase's changes and fail the program.
+- **`escalate`** — stop and flag the run for human review.
+
+Phases run when `program.phases` is configured; otherwise the standard
+`--verify` flow runs unchanged.
+
 ## Quick start
 
 ```bash
@@ -281,6 +329,7 @@ use plain `python3 ask.py …` (the CLI self-heals into the venv interpreter).
 | `--push` | After verification: git add + commit + push the engine's changes. |
 | `--deploy` / `--deploy-cmd CMD` | After verification: run the deploy command. |
 | `--terminal-rounds N` | Max terminal rounds for the `RUN:` tool (0 disables). |
+| `--no-bound` | Disable BOUND runtime enforcement (user-level escape hatch). |
 | `--verify-cmd CMD` | Add a verification command (repeatable; implies `--verify`). |
 | `--verify-max N` | Max verify-fix iterations (default 2). |
 | `--verify-timeout S` | Per-command timeout (default `review.verify_timeout`, 600s). |
@@ -494,6 +543,8 @@ Unknown keys are ignored by the loader, and every section has a safe default.
 | `memory` | `root`, `max_project_summary_words`, `semantic_similarity`, `embedding_model`, `embedding_threshold` |
 | `providers` | `online`, `local` (lists of `{name, base_url, model, api_key_env, api_key, enabled, timeout_s, max_retries}`) |
 | `deploy` | `command`, `cwd`, `timeout` |
+| `bound` | `danger_zones`, `never_do`, `iron_laws` |
+| `program` | `phases` (list of `{name, gate, max_fix_rounds, on_fail}`) |
 | `roles` | `implementer`, `supervisor` (architecture — do not change) |
 
 **Environment overrides** (roles stay architecture; only models/endpoints change):
@@ -532,7 +583,7 @@ report.
 
 ```bash
 cd "Agents /hybrid-agent"
-./.venv/bin/python -m unittest discover -s tests -v    # 164 tests
+./.venv/bin/python -m unittest discover -s tests -v    # 178 tests
 ```
 
 Coverage includes: the fenced-file parser, the apply overwrite/unsafe-path guards,
@@ -567,6 +618,7 @@ repo root/
     ├── embed.py                 # Local embeddings client (/v1/embeddings) + cosine
     ├── providers.py             # Provider registry (2 online + 2 local, failover-ready)
     ├── gitops.py                # git pull / push / deploy helpers
+    ├── bound.py                 # BOUND: danger zones, never_do, iron laws (Ouro Loop)
     ├── web_dashboard.py         # Web control panel (Flask + SocketIO, port 8660)
     ├── dashboard/               # Dashboard UI + encrypted secrets store
     ├── context.py / scan.py     # Project context scanner

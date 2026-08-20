@@ -45,6 +45,7 @@ from parallel import (DependencyAnalyzer, ParallelExecutor, parse_plan_steps,
 from memory import TaskMemory, TaskRecord, memory_root_from_cfg
 from embed import memory_embed_callable
 from gitops import git_pull, git_push, run_deploy
+from bound import load_bound
 from providers import (backend_for, enabled_online, get_local, get_online,
                        load_providers, resolve_api_key)
 
@@ -584,6 +585,8 @@ _KNOWN_CONFIG_KEYS = {
                "embedding_model", "embedding_threshold"},
     "providers": {"online", "local"},
     "deploy": {"command", "cwd", "timeout"},
+    "bound": {"danger_zones", "never_do", "iron_laws"},
+    "program": {"phases"},
     "roles": {"implementer", "supervisor"},
 }
 
@@ -1054,7 +1057,7 @@ def _supervise_gemma_generate(cfg: dict, model_override: str | None,
     return _gen
 
 
-def _make_terminal_tool(cfg: dict, args: argparse.Namespace):
+def _make_terminal_tool(cfg: dict, args: argparse.Namespace, bound=None):
     """Build the RUN: terminal tool for the supervise loop: executes allowlisted
     commands in the task root and returns captured output (never raises)."""
     timeout = int((cfg.get("review") or {}).get("terminal_timeout", 120))
@@ -1063,6 +1066,10 @@ def _make_terminal_tool(cfg: dict, args: argparse.Namespace):
         c = (cmd or "").strip().lower()
         if not c or any(m in c for m in _DANGEROUS_VERIFY_MARKERS):
             return "⚠ BLOCKED: dangerous command pattern."
+        if bound is not None:
+            reason = bound.check_command(cmd)
+            if reason:
+                return f"⚠ BLOCKED: violates the BOUND ({reason})."
         if not (_is_safe_verify_cmd(cmd) or c.startswith(_TERMINAL_TOOL_PREFIXES)):
             return ("⚠ BLOCKED: not an allowlisted terminal command "
                     "(add it to review.verify_allowlist if you trust it).")
@@ -1653,7 +1660,7 @@ def _run_final_verify(cloud, root: str, task: str, cmds, status,
                       regression_timeout: int = 600,
                       cache=None,
                       parallel=False, parallel_workers=4,
-                      verify_groups=None) -> tuple[bool, str]:
+                      verify_groups=None, bound=None) -> tuple[bool, str]:
     """Final error-check stage: run verification commands and, on errors, have
     DeepSeek fix them (applied to disk) until clean or max_iter exhausted.
 
@@ -1729,7 +1736,13 @@ def _run_final_verify(cloud, root: str, task: str, cmds, status,
         api_calls += 1
         tokens_used += len(fix_text or "") // 4
 
-        applied, skipped = _apply_fenced_files(fix_text, root)
+        applied, skipped = _apply_fenced_files(fix_text, root, bound=bound)
+        if any("(bound:" in s for s in skipped):
+            status("[hybrid] ⛔ BOUND VIOLATION in fix output — reverting")
+            if snapshot:
+                _git_restore(root, snapshot, fixed_files)
+            verify_stats["status"] = "BOUND_VIOLATION"
+            return False, "fix output violated the BOUND (danger zone)"
         for rel, nbytes in applied:
             status(f"[hybrid] ✓ FIXED {rel} ({nbytes} B)")
             fixed_files.append(rel)
@@ -1756,6 +1769,79 @@ def _run_final_verify(cloud, root: str, task: str, cmds, status,
                          "status": "FAILED", "files": list(fixed_files)})
     status("[hybrid] ⛔ verification still failing after max attempts")
     return False, error_text
+
+
+def _run_program_phases(cloud, root: str, task: str, bound, cfg: dict, status,
+                        cache=None, timeout_s: int = 600) -> tuple[bool, str]:
+    """Bounded-autonomy program: phases with verification gates and a
+    remediation playbook.
+
+    Each phase in program.phases runs its gate commands (allowlisted). On gate
+    failure the phase consults on_fail: 'retry' (DeepSeek fixes, applied with
+    the BOUND enforced, re-verify up to max_fix_rounds), 'revert' (git-restore
+    the phase's changes), or 'escalate' (stop for human review). Returns
+    (ok, report); True when no phases are configured."""
+    phases = (cfg.get("program") or {}).get("phases") or []
+    if not phases:
+        return True, ""
+    snapshot = _git_snapshot(root)
+    for phase in phases:
+        name = str(phase.get("name", "phase"))
+        cmds = list(phase.get("gate") or [])
+        max_rounds = int(phase.get("max_fix_rounds", 2))
+        on_fail = str(phase.get("on_fail", "retry"))
+        if on_fail not in ("retry", "revert", "escalate"):
+            status(f"[hybrid] ⚠ phase {name}: unknown on_fail={on_fail!r} — treating as retry")
+            on_fail = "retry"
+        unsafe = [c for c in cmds if not _is_safe_verify_cmd(c)]
+        if unsafe:
+            status(f"[hybrid] ⛔ phase {name}: gate not allowlisted: {unsafe[:2]}")
+            return False, f"phase {name} gate blocked (not allowlisted)"
+        if not cmds:
+            status(f"[hybrid] ⚠ phase {name}: no gate commands — skipped")
+            continue
+        status(f"[hybrid] 🚦 phase {name}: gate {cmds} (on_fail={on_fail})")
+        fixed_files: list[str] = []
+        passed = False
+        for round_num in range(max_rounds + 1):
+            errors = _run_verify_commands(root, cmds, status, timeout_s)
+            if not errors:
+                status(f"[hybrid] ✅ phase {name} passed")
+                passed = True
+                break
+            if round_num >= max_rounds:
+                break
+            status(f"[hybrid] ⚠ phase {name}: {len(errors)} error(s) — remediating "
+                   f"({on_fail}), attempt {round_num + 1}/{max_rounds}")
+            if on_fail == "revert":
+                if snapshot:
+                    _git_restore(root, snapshot, fixed_files)
+                status(f"[hybrid] ↩ phase {name}: changes reverted")
+                return False, f"phase {name} failed and was reverted"
+            if on_fail == "escalate":
+                status(f"[hybrid] ⛔ phase {name}: escalated for human review")
+                return False, f"phase {name} escalated for human review"
+            try:
+                fix_text = _deepseek_fix(cloud, task, "\n\n".join(errors), cache=cache)
+            except Exception as exc:  # noqa: BLE001
+                status(f"[hybrid] ⚠ phase {name}: fix call failed ({exc})")
+                break
+            applied, skipped = _apply_fenced_files(fix_text, root, bound=bound)
+            if any("(bound:" in s for s in skipped):
+                status(f"[hybrid] ⛔ phase {name}: fix violated the BOUND — reverting")
+                if snapshot:
+                    _git_restore(root, snapshot, fixed_files)
+                return False, f"phase {name} fix violated the BOUND"
+            for rel, nbytes in applied:
+                status(f"[hybrid] ✓ phase {name} FIXED {rel} ({nbytes} B)")
+                fixed_files.append(rel)
+            if not applied:
+                status(f"[hybrid] ⚠ phase {name}: no fixable files returned")
+                break
+        if not passed:
+            status(f"[hybrid] ⛔ phase {name}: gate still failing after remediation")
+            return False, f"phase {name} still failing after remediation"
+    return True, "all program phases passed"
 
 
 def _select_backend(agent: HybridAgent, cfg: dict, route: str,
@@ -1845,12 +1931,13 @@ def _clean_path(t: str) -> bool:
 
 
 def _apply_fenced_files(text: str, root: str = ".",
-                        dry_run: bool = False) -> tuple[list[tuple[str, int]], list[str]]:
+                        dry_run: bool = False, bound=None) -> tuple[list[tuple[str, int]], list[str]]:
     """Write path-labeled fenced blocks from `text` under `root`.
 
     Returns (written, skipped): `written` is [(relative_path, bytes_written)],
     `skipped` is a list of human-readable reasons. Absolute paths, Windows
-    drive/UNC paths, and paths escaping `root` via ".." are never written.
+    drive/UNC paths, paths escaping `root` via "..", and BOUND danger zones are
+    never written (bound violations are reported as '(bound: ...)').
     With dry_run=True nothing touches disk; `written` still lists what would
     be written."""
     root_abs = os.path.abspath(root)
@@ -1864,6 +1951,12 @@ def _apply_fenced_files(text: str, root: str = ".",
                 or _WIN_DRIVE.match(clean) or clean.startswith("\\\\"):
             skipped.append(f"{rel_path} (unsafe path)")
             continue
+        # BOUND: danger zones are never written.
+        if bound is not None:
+            reason = bound.enforce_path(rel_path)
+            if reason:
+                skipped.append(f"{rel_path} (bound: {reason})")
+                continue
         target = os.path.normpath(os.path.join(root_abs, clean))
         if target != root_abs and not target.startswith(root_abs + os.sep):
             skipped.append(f"{rel_path} (escapes root)")
@@ -1975,6 +2068,10 @@ def main() -> int:
     parser.add_argument("--consolidate", action="store_true",
                         help="force a memory consolidation pass and print the insights "
                              "(offline; normally runs automatically when stale)")
+    parser.add_argument("--no-bound", action="store_true",
+                        help="disable the BOUND runtime enforcement (danger zones / "
+                             "never_do / exit code 2). User-level escape hatch — the "
+                             "agent can never bypass it on its own")
     parser.add_argument("--stats", action="store_true",
                         help="print the 80/20 strategy summary (hybrid-agent/stats.json)")
     parser.add_argument("--evaluate", action="store_true",
@@ -2187,6 +2284,15 @@ def main() -> int:
         if insights:
             context = (context + "\n\n" + insights).strip() if context else insights
 
+        # BOUND (Ouro Loop): hard constraints enforced at runtime (danger zones,
+        # never_do, iron laws). RECALL gate: the BOUND is re-injected into the
+        # context (enhance + review package) and every Gemma iteration.
+        bound = None if args.no_bound else load_bound(cfg)
+        bound_text = bound.prompt_text() if bound is not None else ""
+        if bound_text:
+            _status("[hybrid] 🧱 BOUND active (danger zones, never_do, iron laws)")
+            context = (context + "\n\n" + bound_text).strip() if context else bound_text
+
         # --enhance: DeepSeek enhances the task and plans around Gemma's limits
         # BEFORE Gemma implements. The improved prompt + reasoning + plan are
         # shown (and DeepSeek asks for clarification if the task is unclear),
@@ -2260,8 +2366,9 @@ def main() -> int:
                     status=lambda line: tracker.tick(line),
                     gemma_max_tokens=args.max_tokens or GEMMA_MAX_TOKENS,
                     review=(plan != "local_first"),
-                    terminal_tool=_make_terminal_tool(cfg, args),
+                    terminal_tool=_make_terminal_tool(cfg, args, bound=bound),
                     max_terminal_rounds=args.terminal_rounds,
+                    bound_text=bound_text,
                 )
         except BudgetExceeded as exc:
             _status("[hybrid] ⛔ supervise aborted: daily DeepSeek token budget exhausted")
@@ -2282,7 +2389,8 @@ def main() -> int:
         if args.apply and result.reason not in _UNSAFE_REASONS:
             tracker.start_phase("apply")
             applied, skipped = _apply_fenced_files(result.final_text, args.root,
-                                                   dry_run=args.apply_dry_run)
+                                                   dry_run=args.apply_dry_run,
+                                                   bound=bound)
             verb = "DRY-RUN" if args.apply_dry_run else "APPLIED"
             for rel, nbytes in applied:
                 _status(f"[hybrid] {verb} {rel} ({nbytes} B)"
@@ -2292,7 +2400,16 @@ def main() -> int:
                         f"{', '.join(skipped[:3])}")
             if not applied and not skipped:
                 _status("[hybrid] ⚠ --apply: no path-labeled fenced blocks found in output")
+            bound_violations = [s for s in skipped if "(bound:" in s]
             tracker.end_phase()
+            # BOUND: the agent attempted something it can never do. Exit code 2
+            # — the violation cannot be bypassed (--no-bound is user-level).
+            if bound_violations and not args.apply_dry_run:
+                _status("[hybrid] ⛔ BOUND VIOLATION — refusing to apply: "
+                        + "; ".join(bound_violations[:3]))
+                print("BOUND_VIOLATION: " + "; ".join(bound_violations),
+                      file=sys.stderr)
+                return 2
 
         # Record the session for self-evaluation (files, iterations, truncation,
         # and the final quality score).
@@ -2325,6 +2442,7 @@ def main() -> int:
         verified = True
         verify_report = ""
         verify_stats: dict = {}
+        program_phases = (cfg.get("program") or {}).get("phases") or []
         verify_cmds = list(args.verify_cmd)
         if args.verify and not verify_cmds:
             verify_cmds = list(cfg.get("review", {}).get("verify", []) or [])
@@ -2341,14 +2459,23 @@ def main() -> int:
                               or cfg.get("review", {}).get("verify_timeout", 600))
             regression_timeout = (args.regression_timeout
                                   or cfg.get("review", {}).get("regression_timeout", 600))
-            verified, verify_report = _run_final_verify(
-                cloud, args.root, args.task, verify_cmds,
-                lambda line: tracker.tick(line),
-                max_iter=args.verify_max, timeout_s=verify_timeout,
-                verify_stats=verify_stats, regression_cmds=regression_cmds,
-                regression_timeout=regression_timeout, cache=cache,
-                parallel=args.verify_parallel, parallel_workers=args.verify_workers,
-                verify_groups=verify_groups)
+            # Bounded-autonomy program: phases with verification gates and a
+            # remediation playbook (retry / revert / escalate). Runs first.
+            if program_phases:
+                _status("[hybrid] 🚦 program: running bounded phases ...")
+                verified, verify_report = _run_program_phases(
+                    cloud, args.root, args.task, bound, cfg,
+                    lambda line: tracker.tick(line), cache=cache,
+                    timeout_s=verify_timeout)
+            if verified:
+                verified, verify_report = _run_final_verify(
+                    cloud, args.root, args.task, verify_cmds,
+                    lambda line: tracker.tick(line),
+                    max_iter=args.verify_max, timeout_s=verify_timeout,
+                    verify_stats=verify_stats, regression_cmds=regression_cmds,
+                    regression_timeout=regression_timeout, cache=cache,
+                    parallel=args.verify_parallel, parallel_workers=args.verify_workers,
+                    verify_groups=verify_groups, bound=bound)
             tracker.end_phase()
         if verify_stats:
             stats.record_verify(verify_stats)
