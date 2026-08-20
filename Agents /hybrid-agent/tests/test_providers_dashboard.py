@@ -37,10 +37,10 @@ PROVIDER_CFG = {
              "model": "llama-3.3-70b-versatile", "api_key_env": "GROQ_API_KEY", "enabled": True},
         ],
         "local": [
-            {"name": "gemma", "base_url": "http://localhost:1234/v1",
-             "model": "google/gemma-4-12b-qat", "api_key": "lm-studio", "enabled": True},
-            {"name": "local-2", "base_url": "http://localhost:1234/v1",
-             "model": "qwen2.5-coder-7b-instruct", "api_key": "lm-studio", "enabled": True},
+            {"name": "gemma", "base_url": "http://localhost:1234/api/v1",
+             "model": "qwen2.5-coder-14b-instruct-mlx", "api_key": "lm-studio", "enabled": True},
+            {"name": "local-2", "base_url": "http://localhost:1234/api/v1",
+             "model": "qwen2.5-coder-14b-instruct-mlx", "api_key": "lm-studio", "enabled": True},
         ],
     },
 }
@@ -286,6 +286,23 @@ class TestEnhanceProceed(unittest.TestCase):
         task_for_gemma, clar_needed = self._run(proceed=True)
         self.assertFalse(clar_needed)
         self.assertIn("Do the thing.", task_for_gemma)
+
+
+    def test_local_providers_exclude_max_tokens_by_default(self):
+        prov = load_providers(PROVIDER_CFG)
+        for p in prov["local"]:
+            self.assertIn("max_tokens", p.request_exclude)  # MLX server rejects it
+        for p in prov["online"]:
+            self.assertEqual(p.request_exclude, [])
+
+    def test_request_exclude_configurable(self):
+        cfg = {"providers": {"local": [
+            {"name": "x", "base_url": "u", "model": "m",
+             "request_exclude": ["temperature"], "request_extra": {"top_p": 0.9}},
+        ], "online": []}}
+        p = load_providers(cfg)["local"][0]
+        self.assertIn("temperature", p.request_exclude)
+        self.assertEqual(p.request_extra, {"top_p": 0.9})
 
 
 if __name__ == "__main__":

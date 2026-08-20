@@ -69,14 +69,21 @@ class EmbeddingClient:
 
 def make_embedding_client(cfg: dict):
     """Build an EmbeddingClient from the engine config (None when disabled by
-    config or missing backend settings)."""
+    config or missing backend settings). Embeddings use the LEGACY OpenAI-
+    compatible /v1/embeddings endpoint (memory.embedding_base_url), which the
+    local server still serves even though chat moved to /api/v1."""
     try:
         mem = cfg.get("memory") or {}
         if not mem.get("semantic_similarity", True):
             return None
         lc = cfg["backends"]["local"]
+        base = mem.get("embedding_base_url")
+        if not base:
+            base = lc.get("base_url", "")
+            if base.endswith("/api/v1"):
+                base = base[: -len("/api/v1")] + "/v1"
         return EmbeddingClient(
-            lc.get("base_url", ""),
+            str(base),
             api_key=lc.get("api_key") or "lm-studio",
             model=mem.get("embedding_model", DEFAULT_MODEL),
         )

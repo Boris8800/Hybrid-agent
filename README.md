@@ -60,7 +60,7 @@ DeepSeek never rewrites code directly in the supervise loop — it returns verdi
 and required fixes, and the local model implements them. **API tokens are spent on
 judgement, not on doing the coding.**
 
-- **Local implementer** — `google/gemma-4-12b-qat` via LM Studio at `http://localhost:1234/v1`. Fast, free, no API key. Best for mechanical, well-specified edits.
+- **Local implementer** — `qwen2.5-coder-14b-instruct-mlx` via the local MLX-style API at `http://localhost:1234/api/v1` (embeddings via the legacy `/v1/embeddings`). Fast, free, no API key. Best for mechanical, well-specified edits.
 - **API supervisor** — `deepseek-chat`, requires `DEEPSEEK_API_KEY` (or a key under `deepseek.key` in Kilo's `auth.json`). Best for architecture, design review, and ambiguous debugging.
 - **Router** — archetype pinning, confidence scoring, adaptive threshold, and circuit breakers decide local-vs-API routing (`--route-only` previews the decision).
 
@@ -139,8 +139,8 @@ fleet of **2 online + 2 local providers** configured out of the box:
 |------|---------|----------|-------|
 | online | `deepseek` | `api.deepseek.com` | `deepseek-chat` |
 | online | `groq` | `api.groq.com/openai/v1` | `llama-3.3-70b-versatile` |
-| local | `gemma` | `localhost:1234/v1` | `google/gemma-4-12b-qat` |
-| local | `local-2` | `localhost:1234/v1` | (pick any loaded model) |
+| local | `gemma` | `localhost:1234/api/v1` | `qwen2.5-coder-14b-instruct-mlx` |
+| local | `local-2` | `localhost:1234/api/v1` | (pick any loaded model) |
 
 - **API keys** resolve in order: environment variable → Kilo `auth.json` → the
   dashboard's encrypted secrets store. Manage them in the web UI.

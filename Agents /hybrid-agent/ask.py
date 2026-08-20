@@ -51,6 +51,8 @@ from differential import analyze_changes
 from guardrails import check_guardrails
 from patcher import (apply_unified_diff, extract_context, extract_error_location,
                      is_diff)
+from contract import parse_contract
+from dependencies import build_dependency_context
 from providers import (backend_for, enabled_online, get_local, get_online,
                        load_providers, resolve_api_key)
 
@@ -587,7 +589,7 @@ _KNOWN_CONFIG_KEYS = {
     "circuit_breaker": {"window_size", "local_error_ceiling",
                         "deepseek_error_ceiling", "cooldown_s"},
     "memory": {"root", "max_project_summary_words", "semantic_similarity",
-               "embedding_model", "embedding_threshold"},
+               "embedding_model", "embedding_threshold", "embedding_base_url"},
     "providers": {"online", "local"},
     "deploy": {"command", "cwd", "timeout"},
     "bound": {"danger_zones", "never_do", "iron_laws"},
@@ -643,86 +645,53 @@ def _have_openai() -> bool:
 
 
 def _http_generate(base_url: str, api_key: str, model: str, req: ModelRequest,
-                   stream: bool = False) -> ModelResponse:
-    """Dependency-free OpenAI-compatible chat completion via urllib.
+                   stream: bool = False, exclude_keys: tuple = (),
+                   extra_body: dict | None = None) -> ModelResponse:
+    """Local MLX-format chat via urllib (POST {base_url}/chat).
 
-    Used only when the `openai` package isn't installed. With stream=True it
-    emits generated tokens live to stderr (so the user sees the local model
-    working as it writes), while still returning the full text for stdout."""
-    url = base_url.rstrip("/") + "/chat/completions"
-    payload = {
-        "model": model,
-        "messages": [
-            {"role": "system", "content": req.system},
-            {"role": "user", "content": req.user},
-        ],
-        "max_tokens": req.max_tokens,
-        "temperature": req.temperature,
-    }
+    Streams generated tokens live to stderr (so the user sees the local model
+    working as it writes), while still returning the full text for stdout.
+    """
+    from backends.local_gemma import mlx_chat_request, mlx_chat_stream
     last: Exception | None = None
     for attempt in range(3):
         try:
-            body = json.dumps(payload).encode()
-            if stream:
-                body = json.dumps({**payload, "stream": True}).encode()
-            request = urllib.request.Request(
-                url, data=body,
-                headers={"Content-Type": "application/json",
-                         "Authorization": f"Bearer {api_key}"},
-            )
             started = time.monotonic()
-            with urllib.request.urlopen(request, timeout=req.timeout_s) as resp:
-                if not stream:
-                    data = json.loads(resp.read().decode())
-                    text = data["choices"][0]["message"]["content"] or ""
-                    usage = data.get("usage") or {}
-                    truncated = data["choices"][0].get("finish_reason") == "length"
-                else:
-                    pieces: list[str] = []
-                    usage: dict = {}
-                    marker = False
-                    finish_reason = None
-                    for raw_line in resp:
-                        line = raw_line.decode("utf-8", "replace").strip()
-                        if not line.startswith("data:"):
-                            continue
-                        data_payload = line[len("data:"):].strip()
-                        if data_payload == "[DONE]":
-                            break
-                        try:
-                            chunk = json.loads(data_payload)
-                        except json.JSONDecodeError:
-                            continue
-                        if chunk.get("usage"):
-                            usage = chunk["usage"] or {}
-                        delta = (chunk.get("choices") or [{}])[0].get("delta", {}).get("content")
-                        fr = (chunk.get("choices") or [{}])[0].get("finish_reason")
-                        if fr:
-                            finish_reason = fr
-                        if not delta:
-                            continue
-                        if not marker:
-                            _status("[hybrid]  <<stream>> ")
-                            marker = True
-                        pieces.append(delta)
-                        sys.stderr.write(delta)
-                        sys.stderr.flush()
-                    if marker:
-                        sys.stderr.write("\n")
-                        sys.stderr.flush()
-                    text = "".join(pieces)
-                    truncated = finish_reason == "length"
+            if stream:
+                res = mlx_chat_stream(
+                    base_url, api_key, model, req.system, req.user,
+                    timeout_s=req.timeout_s, temperature=req.temperature,
+                    max_tokens=req.max_tokens, exclude_keys=exclude_keys,
+                    extra_body=extra_body)
+                marker = False
+                for token in (res["text"] or ""):
+                    if not marker:
+                        _status("[hybrid]  <<stream>> ")
+                        marker = True
+                    sys.stderr.write(token)
+                    sys.stderr.flush()
+                if marker:
+                    sys.stderr.write("\n")
+                    sys.stderr.flush()
+                text = res["text"]
+            else:
+                res = mlx_chat_request(
+                    base_url, api_key, model, req.system, req.user,
+                    stream=False, timeout_s=req.timeout_s,
+                    temperature=req.temperature, max_tokens=req.max_tokens,
+                    exclude_keys=exclude_keys, extra_body=extra_body)
+                text = res["text"]
             return ModelResponse(
-                text=text, raw=text,
-                token_usage=usage,
-                latency_ms=(time.monotonic() - started) * 1000,
-                backend="http-fallback",
-                truncated=truncated,
+                text=text, raw=res["raw"],
+                token_usage=res["token_usage"],
+                latency_ms=res.get("latency_ms", (time.monotonic() - started) * 1000),
+                backend="local-gemma",
+                truncated=res["truncated"],
             )
         except Exception as exc:  # noqa: BLE001 - retry then surface
             last = exc
             time.sleep(0.5 * (attempt + 1))
-    raise RuntimeError(f"http fallback to {url} failed: {last}")
+    raise RuntimeError(f"local request to {base_url}/chat failed: {last}")
 
 
 def _generate(agent: HybridAgent, cfg: dict, args: argparse.Namespace,
@@ -734,11 +703,20 @@ def _generate(agent: HybridAgent, cfg: dict, args: argparse.Namespace,
     (not the SDK backend), because that is the only path that emits live
     tokens to stderr — the user's visibility into the local model working."""
     if route == "local" and stream:
-        lc = cfg["backends"]["local"]
-        base_url = lc["base_url"]
-        api_key = lc.get("api_key") or "lm-studio"
-        model = args.model or lc["model"]
-        return _http_generate(base_url, api_key, model, req, stream=True)
+        lp = get_local(cfg, name=agent.local_provider)
+        if lp is not None:
+            base_url = lp.base_url
+            api_key = lp.api_key or "lm-studio"
+            model = args.model or lp.model
+            exclude_keys, extra_body = tuple(lp.request_exclude), lp.request_extra
+        else:
+            lc = cfg["backends"]["local"]
+            base_url = lc["base_url"]
+            api_key = lc.get("api_key") or "lm-studio"
+            model = args.model or lc["model"]
+            exclude_keys, extra_body = ("max_tokens",), {}
+        return _http_generate(base_url, api_key, model, req, stream=True,
+                              exclude_keys=exclude_keys, extra_body=extra_body)
 
     if _have_openai():
         backend = _select_backend(agent, cfg, route, args.model)
@@ -1050,16 +1028,21 @@ def _supervise_gemma_generate(cfg: dict, model_override: str | None,
         api_key = lp.api_key or "lm-studio"
         model = model_override or lp.model
         timeout_s = lp.timeout_s
+        exclude_keys = tuple(lp.request_exclude)
+        extra_body = lp.request_extra
     else:
         lc = cfg["backends"]["local"]
         base_url = lc["base_url"]
         api_key = lc.get("api_key") or "lm-studio"
         model = model_override or lc["model"]
         timeout_s = lc["timeout_s"]
+        exclude_keys = ("max_tokens",)  # MLX server rejects it
+        extra_body = {}
 
     def _gen(req: ModelRequest) -> ModelResponse:
         req.timeout_s = timeout_s
-        return _http_generate(base_url, api_key, model, req, stream=True)
+        return _http_generate(base_url, api_key, model, req, stream=True,
+                              exclude_keys=exclude_keys, extra_body=extra_body)
 
     return _gen
 
@@ -1119,34 +1102,30 @@ def _memory_report(cfg: dict, force: bool = False, cwd: str = ".") -> dict:
 
 
 def _list_models(base_url: str) -> int:
-    """Print one loaded model id per line from the local endpoint. Exit 0 / 1."""
-    base_url = base_url.rstrip("/")
-    try:
-        from openai import OpenAI
-    except ImportError:  # pragma: no cover - fallback below keeps it working
-        OpenAI = None  # type: ignore
-
-    if OpenAI is not None:
-        client = OpenAI(base_url=base_url, api_key="lm-studio")
-        try:
-            for model in client.models.list().data:
-                print(model.id)
-            return 0
-        except Exception as exc:  # noqa: BLE001 - surface connection failure
-            print(f"error: {exc}", file=sys.stderr)
-            return 1
-
-    # No openai package: plain urllib GET with a short timeout.
+    """Print one loaded model id per line from the local endpoint. Exit 0 / 1.
+    Handles both the modern shape (models[].key) and the OpenAI shape
+    (data[].id)."""
     import urllib.request
-    try:
-        with urllib.request.urlopen(f"{base_url}/models", timeout=5) as resp:
-            payload = json.loads(resp.read().decode())
-        for model in payload.get("data", []):
-            print(model.get("id"))
+    import urllib.error
+    base_url = base_url.rstrip("/")
+    ids: list[str] = []
+    for url in (f"{base_url}/models", f"http://127.0.0.1:1234/v1/models"):
+        try:
+            with urllib.request.urlopen(url, timeout=5) as resp:
+                payload = json.loads(resp.read().decode())
+            ids = [m.get("key") or m.get("id") or ""
+                   for m in payload.get("models", payload.get("data", [])) if m]
+            ids = [i for i in ids if i]
+            if ids:
+                break
+        except Exception:  # noqa: BLE001 - try the next candidate
+            continue
+    if ids:
+        for i in ids:
+            print(i)
         return 0
-    except Exception as exc:  # noqa: BLE001 - surface connection failure
-        print(f"error: {exc}", file=sys.stderr)
-        return 1
+    print("error: could not list local models (endpoint unreachable)", file=sys.stderr)
+    return 1
 
 
 def _build_request(agent: HybridAgent, args: argparse.Namespace,
@@ -1999,6 +1978,61 @@ def _run_differential_gate(cloud, root: str, task: str, bound, status,
     return False, "differential gate: violations remain"
 
 
+# Adversarial final auditor: a DIFFERENT role from the reviewer. It does not
+# suggest improvements — it tries to PROVE the implementation is wrong.
+_AUDIT_SYSTEM = (
+    "You are an adversarial final auditor. Your ONLY job is to try to PROVE "
+    "that the implementation is wrong. Do NOT suggest improvements, refactors, "
+    "or style notes. Examine the task contract, the final diff, the tests, and "
+    "the test output. Return FAIL if you find any evidence that: the "
+    "implementation violates an acceptance criterion or an acceptance case; "
+    "the diff contradicts the contract's 'Must change'/'Must NOT change'; tests "
+    "were weakened or skipped; or the changed files do not satisfy the goal. "
+    "Otherwise return PASS.\n\n"
+    "Format exactly:\n=== DECISION ===\nPASS\nor\nFAIL\n\n"
+    "=== EVIDENCE ===\n<what proves it wrong, if FAIL>\n\n"
+    "=== AFFECTED REQUIREMENT ===\n<the contract requirement that fails, if FAIL>"
+)
+
+
+def _parse_audit(text: str) -> tuple[str, str, str]:
+    """Return (decision, evidence, affected_requirement)."""
+    decision = "FAIL"
+    if re.search(r"^\s*PASS\b", text or "", re.M):
+        decision = "PASS"
+    elif re.search(r"^\s*FAIL\b", text or "", re.M):
+        decision = "FAIL"
+
+    def _section(label: str) -> str:
+        m = re.search(rf"===\s*{label}[\w ]*===\s*(.*?)(?=\n\s*===\s*|\Z)",
+                      text or "", re.S | re.I)
+        return m.group(1).strip() if m else ""
+
+    return decision, _section("EVIDENCE")[:800], _section("AFFECTED")[:300]
+
+
+def _run_final_audit(cloud, cfg, args, contract, applied_files,
+                     verify_report: str, task: str) -> tuple[bool, str]:
+    """Adversarial final audit of the verified implementation. Returns
+    (ok, report). FAIL means the implementation could not be proved correct."""
+    diff = _current_diff(args.root)
+    changed = ", ".join(rel for rel, _ in applied_files) or "(verify-fixed files)"
+    user = (
+        f"ORIGINAL TASK:\n{task}\n\n"
+        f"TASK CONTRACT:\n{contract.to_prompt() or '(none supplied)'}\n\n"
+        f"CHANGED FILES:\n{changed}\n\n"
+        f"FINAL DIFF:\n{(diff or '(no diff)')[:6000]}\n\n"
+        f"TEST OUTPUT:\n{(verify_report or 'no test output')[:3000]}"
+    )
+    resp = cloud.generate(ModelRequest(
+        system=_AUDIT_SYSTEM, user=user, max_tokens=1024, temperature=0.1))
+    decision, evidence, affected = _parse_audit(resp.text)
+    if decision == "FAIL":
+        return False, (f"auditor FAIL: {evidence or 'no evidence given'}"
+                       + (f" (affects: {affected})" if affected else ""))
+    return True, "auditor PASS"
+
+
 def _select_backend(agent: HybridAgent, cfg: dict, route: str,
                     model_override: str | None):
     """Return the backend for `route`, applying the local model override and
@@ -2235,6 +2269,12 @@ def main() -> int:
     parser.add_argument("--journeys-timeout", type=int, default=0,
                         help="per-step timeout in seconds for journey verification "
                              "(default: journey.timeout_s in config, 30)")
+    parser.add_argument("--auditor-provider", default=None, metavar="NAME",
+                        help="run the adversarial final auditor on a DIFFERENT online "
+                             "provider (e.g. groq) for model-independent review; "
+                             "default: the primary online provider")
+    parser.add_argument("--no-audit", action="store_true",
+                        help="skip the adversarial final auditor pass")
     parser.add_argument("--stats", action="store_true",
                         help="print the 80/20 strategy summary (hybrid-agent/stats.json)")
     parser.add_argument("--evaluate", action="store_true",
@@ -2506,6 +2546,31 @@ def main() -> int:
                 return 4
             tracker.end_phase()
 
+        # Task Contract: the machine-readable spine every stage consumes.
+        # Risk HIGH/CRITICAL forces critical supervision; "browser journey" in
+        # Verification required enables the journeys gate; Files likely
+        # involved drives dependency-aware context retrieval.
+        contract = parse_contract(enhancement.raw if enhancement else args.task)
+        if contract.complete:
+            _status(f"[hybrid] 📋 contract: risk={contract.risk or 'n/a'} · "
+                    f"files={len(contract.files)} · "
+                    f"acceptance_cases={len(contract.acceptance_cases)}")
+        dep_ctx = ""
+        if contract.risky and args.router == "auto" and plan != "critical":
+            plan = "critical"
+            _status("[hybrid] 🧭 contract risk HIGH/CRITICAL — forcing critical supervision")
+        if not args.journeys and "browser journey" in contract.verification_required:
+            jf = str((cfg.get("journey") or {}).get("file", "journeys.yml"))
+            if (pathlib.Path(args.root) / jf).is_file():
+                args.journeys = jf
+                _status(f"[hybrid] 🚦 contract requires browser journey — enabling {jf}")
+        if contract.files:
+            dep_ctx = build_dependency_context(args.root, contract.files)
+            if dep_ctx:
+                _status(f"[hybrid] 🕸 dependency-aware context: {len(dep_ctx)} chars "
+                        f"for {len(contract.files)} file(s)")
+                context = (context + "\n\n" + dep_ctx).strip() if context else dep_ctx
+
         def _pkg(task: str, code: str, iteration: int) -> ReviewPackage:
             return ReviewPackage(
                 task=task,
@@ -2549,6 +2614,8 @@ def main() -> int:
                     terminal_tool=_make_terminal_tool(cfg, args, bound=bound),
                     max_terminal_rounds=args.terminal_rounds,
                     bound_text=bound_text,
+                    contract_text=contract.to_prompt(),
+                    source_context=dep_ctx,
                 )
         except BudgetExceeded as exc:
             _status("[hybrid] ⛔ supervise aborted: daily DeepSeek token budget exhausted")
@@ -2679,6 +2746,29 @@ def main() -> int:
                 max_iter=args.verify_max)
             if diff_report:
                 verify_report = diff_report
+        # Adversarial final auditor: an independent pass whose ONLY job is to
+        # prove the implementation wrong (contract + diff + tests). Optionally
+        # on a DIFFERENT provider for true model independence.
+        if applied and not args.apply_dry_run and not args.no_audit and verified:
+            auditor = cloud
+            if args.auditor_provider:
+                ap = get_online(cfg, name=args.auditor_provider)
+                if ap is not None and resolve_api_key(ap):
+                    auditor = _budgeted_cloud(backend_for(ap), cfg)
+                    _status(f"[hybrid] 🛡 auditor provider: {ap.name}")
+                else:
+                    _status(f"[hybrid] ⚠ auditor provider '{args.auditor_provider}' "
+                            "unavailable — using the primary provider")
+            _status("[hybrid] 🛡 adversarial final auditor ...")
+            audit_ok, audit_report = _run_final_audit(
+                auditor, cfg, args, contract, applied,
+                verify_report or "no test output", args.task)
+            _status("[hybrid] 🛡 auditor "
+                    + ("PASS — nothing proved the implementation wrong"
+                       if audit_ok else f"FAIL: {audit_report}"))
+            if not audit_ok:
+                verified = False
+                verify_report = audit_report
         if verify_stats:
             stats.record_verify(verify_stats)
         stats.record_phases(tracker.phases())

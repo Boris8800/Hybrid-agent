@@ -239,10 +239,10 @@ GEMMA_MAX_TOKENS = 8192
 GEMMA_MAX_TOKENS_CAP = 16384
 CLOUD_GEN_TOKENS = 8192
 
-# Local model (Gemma) constraints — the DeepSeek supervisor plans within these.
-# LM Studio loads google/gemma-4-12b-qat with a 32768-token context window and a
-# verified 4096-token output cap: requesting higher budgets still truncates, so
-# plans must split work into steps that fit in ONE local response.
+# Local model (qwen) constraints — the DeepSeek supervisor plans within these.
+# The local server runs qwen2.5-coder-14b-instruct-mlx with a 32768-token
+# context window; a conservative 4096-token output cap is assumed so plans must
+# split work into steps that fit in ONE local response.
 LOCAL_CONTEXT_TOKENS = 32768
 LOCAL_OUTPUT_TOKENS = 4096
 
@@ -266,6 +266,7 @@ def _local_limits_note() -> str:
 
 def _gemma_primary_prompt(task: str, prior_fixes: str = "",
                           terminal_output: str = "", bound_text: str = "",
+                          contract_text: str = "", source_context: str = "",
                           max_tokens: int = GEMMA_MAX_TOKENS) -> ModelRequest:
     system = (
         "You are a careful mid-level engineer implementing a change. "
@@ -278,8 +279,13 @@ def _gemma_primary_prompt(task: str, prior_fixes: str = "",
     if bound_text:
         system += "\n\n" + bound_text  # RECALL gate: the BOUND re-injected every iteration
     user = f"TASK:\n{task}\n"
+    if contract_text:
+        user += f"\n{contract_text}\n"  # the formal Task Contract (same one every stage uses)
     if prior_fixes:
         user += f"\nA senior reviewer previously asked you to fix these issues. Apply ALL of them now:\n{prior_fixes}\n"
+    if source_context:
+        user += (f"\nRELEVANT SOURCE (dependency-aware context for the files "
+                 f"involved):\n{source_context}\n")
     if terminal_output:
         user += (
             f"\nTERMINAL SESSION (output of the commands you asked to run):\n"
@@ -374,6 +380,8 @@ def supervise(
     terminal_tool: callable = None,
     max_terminal_rounds: int = 3,
     bound_text: str = "",
+    contract_text: str = "",
+    source_context: str = "",
 ) -> SuperviseResult:
     """Run Gemma-primary / DeepSeek-supervisor on a task.
 
@@ -408,7 +416,9 @@ def supervise(
         status(f"[supervise] iter {iteration}: Gemma working...")
         try:
             resp: ModelResponse = gemma_generate(
-                _gemma_primary_prompt(current, prior_fixes, bound_text=bound_text, max_tokens=gemma_max_tokens)
+                _gemma_primary_prompt(current, prior_fixes, bound_text=bound_text,
+                    contract_text=contract_text, source_context=source_context,
+                    max_tokens=gemma_max_tokens)
             )
         except Exception as exc:  # noqa: BLE001
             status(f"[supervise] local failed ({exc}); escalating to DeepSeek")
@@ -429,7 +439,9 @@ def supervise(
                        f"{gemma_max_tokens} tokens - retrying once with {retry_budget}")
                 try:
                     resp = gemma_generate(
-                        _gemma_primary_prompt(current, prior_fixes, bound_text=bound_text, max_tokens=retry_budget)
+                        _gemma_primary_prompt(current, prior_fixes, bound_text=bound_text,
+                    contract_text=contract_text, source_context=source_context,
+                    max_tokens=retry_budget)
                     )
                 except Exception as exc:  # noqa: BLE001
                     status(f"[supervise] local retry failed ({exc}); escalating to DeepSeek")
@@ -464,7 +476,8 @@ def supervise(
             try:
                 resp = gemma_generate(_gemma_primary_prompt(
                     current, prior_fixes, terminal_output=terminal_feedback,
-                    bound_text=bound_text, max_tokens=gemma_max_tokens))
+                    bound_text=bound_text, contract_text=contract_text,
+                    source_context=source_context, max_tokens=gemma_max_tokens))
             except Exception as exc:  # noqa: BLE001 - keep the last good output
                 status(f"[supervise] terminal re-generate failed ({exc}); continuing")
                 break
@@ -589,6 +602,23 @@ def _enhance_request(task: str, context: str = "", cot: bool = False) -> ModelRe
             "Format your response with these exact section markers:\n"
             "=== ENHANCED PROMPT ===\n"
             "<the enhanced prompt>\n"
+            "=== TASK CONTRACT ===\n"
+            "ALWAYS include this machine-readable contract; every stage follows "
+            "it. Use exactly these labeled fields (lists as '- item' lines):\n"
+            "Goal: <one-sentence goal>\n"
+            "Must change:\n- <file or behavior that MUST change>\n"
+            "Must NOT change:\n- <things that must stay untouched, if any>\n"
+            "Acceptance criteria:\n- <verifiable criteria>\n"
+            "Files likely involved:\n- <path>, <path>\n"
+            "Dependencies:\n- <apis/modules the change depends on, if known>\n"
+            "Risk: <LOW | MEDIUM | HIGH | CRITICAL>\n"
+            "Verification required:\n- <build | unit tests | integration tests | "
+            "browser journey, as appropriate>\n"
+            "Rollback strategy: <how to undo this change safely>\n"
+            "=== ACCEPTANCE CASES ===\n"
+            "A concrete input->expected table for the acceptance criteria "
+            "(e.g. 'min price £20 -> accepted'), one per line:\n"
+            "- <input> -> <expected>\n"
             "=== REASONING ===\n"
             "<what you improved and why>\n"
             "=== PLAN ===\n"
@@ -603,7 +633,7 @@ def _enhance_request(task: str, context: str = "", cot: bool = False) -> ModelRe
         ),
         user=f"ORIGINAL USER TASK:\n{task}\n"
              + (f"\nCONTEXT:\n{context}\n" if context else ""),
-        max_tokens=1600 if cot else 1200,
+        max_tokens=2400 if not cot else 3200,
         temperature=0.1,
     )
 

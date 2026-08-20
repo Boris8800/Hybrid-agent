@@ -4,7 +4,7 @@ Operational conventions and known pitfalls for this workspace (`/Users/user/Desk
 
 ## Local AI / LM Studio
 
-- Local model: `google/gemma-4-12b-qat` via LM Studio at `http://localhost:1234/v1`. Run the bridge with `python3 hybrid-agent/ask.py` — it self-heals into `hybrid-agent/.venv` for PyYAML/openai, so `config.yml` (180s local timeout) is always loaded.
+- Local model: `qwen2.5-coder-14b-instruct-mlx` via the MLX-style chat API at `http://localhost:1234/api/v1` (POST {base}/chat with `system_prompt`/`input`; embeddings stay on the legacy `http://localhost:1234/v1/embeddings`). Run the bridge with `python3 hybrid-agent/ask.py` — it self-heals into `hybrid-agent/.venv` for PyYAML/openai, so `config.yml` (180s local timeout) is always loaded.
 - The hybrid agent runs the 80/20 law: local model generates first, DeepSeek reviews (needs `DEEPSEEK_API_KEY`; when unset the Kilo brain is the review gate).
 
 ## Known pitfall: indexing embedding baseUrl (MUST include `/v1`)

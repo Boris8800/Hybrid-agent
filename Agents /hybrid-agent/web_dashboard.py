@@ -534,7 +534,9 @@ def _ping_local(p) -> tuple[bool, list]:
             headers={"Authorization": f"Bearer {p.api_key or 'lm-studio'}"})
         with urllib.request.urlopen(req, timeout=4) as resp:
             data = json.loads(resp.read().decode())
-        return True, [m.get("id") for m in data.get("data", [])]
+        return True, [m.get("key") or m.get("id") or ""
+                      for m in data.get("models", data.get("data", []))
+                      if m and (m.get("key") or m.get("id"))]
     except Exception:  # noqa: BLE001
         return False, []
 

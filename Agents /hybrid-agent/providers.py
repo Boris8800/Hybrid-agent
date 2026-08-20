@@ -31,10 +31,10 @@ DEFAULT_ONLINE = [
      "model": "llama-3.3-70b-versatile", "api_key_env": "GROQ_API_KEY"},
 ]
 DEFAULT_LOCAL = [
-    {"name": "gemma", "base_url": "http://localhost:1234/v1",
-     "model": "google/gemma-4-12b-qat", "api_key": "lm-studio"},
-    {"name": "local-2", "base_url": "http://localhost:1234/v1",
-     "model": "qwen2.5-coder-7b-instruct", "api_key": "lm-studio"},
+    {"name": "gemma", "base_url": "http://localhost:1234/api/v1",
+     "model": "qwen2.5-coder-14b-instruct-mlx", "api_key": "lm-studio"},
+    {"name": "local-2", "base_url": "http://localhost:1234/api/v1",
+     "model": "qwen2.5-coder-14b-instruct-mlx", "api_key": "lm-studio"},
 ]
 
 
@@ -50,18 +50,28 @@ class Provider:
     timeout_s: float = 30.0
     max_retries: int = 4
     backoff_s: list = field(default_factory=lambda: [1.0, 2.0, 4.0])
+    # Model-specific request-body control (unified-interface pattern): keys to
+    # drop from the request (e.g. local MLX servers reject 'max_tokens') and
+    # fixed extra body params. Config-driven, so new endpoints need no code.
+    request_exclude: list = field(default_factory=list)
+    request_extra: dict = field(default_factory=dict)
 
     def describe(self) -> str:
         return f"{self.name} ({self.kind}: {self.model} @ {self.base_url})"
 
 
 def _provider(name, kind, base_url, model, api_key_env="", api_key="",
-              enabled=True, timeout_s=30.0, max_retries=4, backoff_s=None):
+              enabled=True, timeout_s=30.0, max_retries=4, backoff_s=None,
+              request_exclude=None, request_extra=None):
     return Provider(
         name=name, kind=kind, base_url=base_url, model=model,
         api_key_env=api_key_env, api_key=api_key, enabled=enabled,
         timeout_s=timeout_s, max_retries=max_retries,
-        backoff_s=backoff_s or ([1.0, 2.0, 4.0] if kind == "online" else [0.5, 1.0, 2.0]))
+        backoff_s=backoff_s or ([1.0, 2.0, 4.0] if kind == "online" else [0.5, 1.0, 2.0]),
+        request_exclude=list(request_exclude) if request_exclude is not None
+        else (["max_tokens"] if kind == "local" else []),
+        request_extra=dict(request_extra) if request_extra else {},
+    )
 
 
 def _from_dict(d: dict, kind: str) -> Provider:
@@ -75,6 +85,8 @@ def _from_dict(d: dict, kind: str) -> Provider:
         enabled=bool(d.get("enabled", True)),
         timeout_s=float(d.get("timeout_s", 180.0 if kind == "local" else 30.0)),
         max_retries=int(d.get("max_retries", 3 if kind == "local" else 4)),
+        request_exclude=d.get("request_exclude"),
+        request_extra=d.get("request_extra"),
     )
 
 
@@ -117,7 +129,7 @@ def load_providers(cfg: dict) -> dict[str, list[Provider]]:
         _provider(
             name="gemma", kind="local",
             base_url=str(lc.get("base_url", "http://localhost:1234/v1")),
-            model=str(lc.get("model", "google/gemma-4-12b-qat")),
+            model=str(lc.get("model", "qwen2.5-coder-14b-instruct-mlx")),
             api_key=str(lc.get("api_key", "lm-studio")),
             timeout_s=float(lc.get("timeout_s", 180.0)),
             max_retries=int(lc.get("max_retries", 3)),
@@ -218,12 +230,13 @@ def has_api_key(p: Provider) -> bool:
 
 
 def backend_for(p: Provider):
-    """Build a working backend for a provider (DeepSeek for online, Gemma for
-    local). The caller supplies the key at request time via env."""
+    """Build a working backend for a provider (MLX local / OpenAI-compatible
+    online). Model-specific request quirks come from the provider config."""
     if p.kind == "online":
         return DeepSeekBackend(
             api_key_env=p.api_key_env or "DEEPSEEK_API_KEY", model=p.model,
             base_url=p.base_url, timeout_s=p.timeout_s, max_retries=p.max_retries)
     return GemmaBackend(
         base_url=p.base_url, model=p.model, api_key=p.api_key or "lm-studio",
-        timeout_s=p.timeout_s, max_retries=p.max_retries)
+        timeout_s=p.timeout_s, max_retries=p.max_retries,
+        exclude_keys=tuple(p.request_exclude), extra_body=p.request_extra)

@@ -39,9 +39,9 @@ DEFAULT_CONFIG = {
     },
     "backends": {
         "local": {
-            "base_url": "http://localhost:1234/v1",
+            "base_url": "http://localhost:1234/api/v1",
             "api_key": "lm-studio",
-            "model": "google/gemma-4-12b-qat",
+            "model": "qwen2.5-coder-14b-instruct-mlx",
             "timeout_s": 180,
             "max_retries": 3,
             "backoff_s": [0.5, 1.0, 2.0],

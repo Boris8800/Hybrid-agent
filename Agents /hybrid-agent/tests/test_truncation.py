@@ -292,7 +292,7 @@ class EnhancementTests(unittest.TestCase):
         self.assertIn(str(LOCAL_CONTEXT_TOKENS), req.system)
         self.assertIn(str(LOCAL_OUTPUT_TOKENS), req.system)
         self.assertIn('=== ENHANCED PROMPT ===', req.system)
-        self.assertEqual(req.max_tokens, 1200)
+        self.assertEqual(req.max_tokens, 2400)
 
     def test_enhance_request_includes_context(self):
         from supervise import _enhance_request
@@ -558,10 +558,10 @@ class ChainOfThoughtTests(unittest.TestCase):
         self.assertIn('TASK UNDERSTANDING', req.system)
         self.assertIn('CONSTRAINT ANALYSIS', req.system)
         self.assertIn('ALTERNATIVES', req.system)
-        self.assertEqual(req.max_tokens, 1600)
+        self.assertEqual(req.max_tokens, 3200)
         req2 = _enhance_request('task', cot=False)
         self.assertNotIn('TASK UNDERSTANDING', req2.system)
-        self.assertEqual(req2.max_tokens, 1200)
+        self.assertEqual(req2.max_tokens, 2400)
 
 
 class ParallelTests(unittest.TestCase):
