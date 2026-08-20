@@ -91,6 +91,39 @@ memory:
   embedding_model: "text-embedding-nomic-embed-text-v1.5"
   embedding_threshold: 0.60
 
+# Multi-model providers: ANY OpenAI-compatible endpoint works in either role.
+# 2 online + 2 local by default; manage keys and settings via the web dashboard
+# (keys never stored in this file). API keys resolve: env var -> Kilo auth.json
+# -> dashboard secrets store. --online-provider / --local-provider select which
+# provider is primary; --turbo fans online calls out to all enabled providers.
+providers:
+  online:
+    - name: deepseek
+      base_url: "https://api.deepseek.com"
+      model: "deepseek-chat"
+      api_key_env: "DEEPSEEK_API_KEY"
+      enabled: true
+    - name: groq
+      base_url: "https://api.groq.com/openai/v1"
+      model: "llama-3.3-70b-versatile"
+      api_key_env: "GROQ_API_KEY"
+      enabled: true
+  local:
+    - name: gemma
+      base_url: "http://localhost:1234/v1"
+      model: "google/gemma-4-12b-qat"
+      api_key: "lm-studio"
+      timeout_s: 180
+      max_retries: 3
+      enabled: true
+    - name: local-2
+      base_url: "http://localhost:1234/v1"
+      model: "qwen2.5-coder-7b-instruct"
+      api_key: "lm-studio"
+      timeout_s: 180
+      max_retries: 3
+      enabled: true
+
 # Roles are architecture (permanent); model names are configuration.
 # The implementer is the local backend; the supervisor is the API backend.
 # Runtime overrides (env): LOCAL_MODEL, LOCAL_BASE_URL, LOCAL_API_KEY,

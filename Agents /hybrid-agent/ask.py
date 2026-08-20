@@ -30,7 +30,7 @@ import urllib.request
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import date, datetime, timedelta
 
-from backends.base import ModelRequest, ModelResponse
+from backends.base import BackendError, ModelRequest, ModelResponse
 from backends.local_gemma import GemmaBackend
 
 from agent import HybridAgent, _load_config, apply_env_overrides
@@ -44,6 +44,8 @@ from parallel import (DependencyAnalyzer, ParallelExecutor, parse_plan_steps,
                       summarize)
 from memory import TaskMemory, TaskRecord, memory_root_from_cfg
 from embed import memory_embed_callable
+from providers import (backend_for, enabled_online, get_local, get_online,
+                       load_providers, resolve_api_key)
 
 # --- Self-heal: loading config.yml requires PyYAML + openai, which exist only
 # in the project venv (hybrid-agent/.venv). When invoked with a system python3
@@ -578,6 +580,7 @@ _KNOWN_CONFIG_KEYS = {
                         "deepseek_error_ceiling", "cooldown_s"},
     "memory": {"root", "max_project_summary_words", "semantic_similarity",
                "embedding_model", "embedding_threshold"},
+    "providers": {"online", "local"},
     "roles": {"implementer", "supervisor"},
 }
 
@@ -807,6 +810,73 @@ def _cached_cloud(cloud, cache, kind: str = "review"):
     return type("_CachedCloud", (), {"generate": generate})()
 
 
+def _failover_cloud(primary_cloud, cfg: dict, args: argparse.Namespace):
+    """Wrap the primary online backend with sequential provider failover: when
+    the active provider raises a BackendError, retry the request on the next
+    enabled online provider. No-op with a single online provider."""
+    online = enabled_online(cfg)
+    if len(online) <= 1:
+        return primary_cloud
+
+    def generate(self, req):
+        last_exc = None
+        for i, prov in enumerate(online):
+            if i == 0:
+                backend = primary_cloud
+            else:
+                if not resolve_api_key(prov):
+                    continue
+                backend = backend_for(prov)
+            try:
+                return backend.generate(req)
+            except BackendError as exc:
+                last_exc = exc
+                _status(f"[hybrid] ⚠ provider '{prov.name}' failed ({exc}); "
+                        f"trying next online provider")
+        if last_exc is not None:
+            raise last_exc
+        raise BackendError("no enabled online provider could serve the request")
+
+    return type("_FailoverCloud", (), {"generate": generate})()
+
+
+def _parallel_cloud(primary_cloud, cfg: dict, args: argparse.Namespace):
+    """Turbo mode: fan the SAME request out to every enabled online provider in
+    parallel and return the longest non-truncated response. Uses many AIs at
+    the same time; multiplies online spend (still capped by the token budget)."""
+    online = enabled_online(cfg)
+    if len(online) <= 1:
+        return primary_cloud
+
+    def generate(self, req):
+        workers = [primary_cloud]
+        for i, prov in enumerate(online):
+            if i == 0:
+                continue
+            if not resolve_api_key(prov):
+                continue
+            workers.append(backend_for(prov))
+        results = []
+        with ThreadPoolExecutor(max_workers=len(workers)) as executor:
+            futs = [executor.submit(w.generate, req) for w in workers]
+            for f in futs:
+                try:
+                    results.append(f.result())
+                except Exception:  # noqa: BLE001 - a failed provider is tolerated
+                    pass
+        good = [r for r in results if r and r.text and not r.truncated]
+        if not good:
+            good = [r for r in results if r and r.text]
+        if not good:
+            raise BackendError("turbo: all online providers failed")
+        best = max(good, key=lambda r: len(r.text))
+        _status(f"[hybrid] ⚡ turbo: {len(good)}/{len(workers)} provider(s) "
+                f"returned; using {best.backend or 'provider'}")
+        return best
+
+    return type("_ParallelCloud", (), {"generate": generate})()
+
+
 def _detect_step_conflicts(steps: list[dict]) -> set[str]:
     """Plan-declared files claimed by more than one step in the same batch."""
     claims: dict[str, list] = {}
@@ -950,20 +1020,29 @@ def _format_tokens(resp: ModelResponse) -> dict:
     return tokens
 
 
-def _supervise_gemma_generate(cfg: dict, model_override: str | None):
-    """Return a streaming wrapper for the supervise loop's local (Gemma) step.
+def _supervise_gemma_generate(cfg: dict, model_override: str | None,
+                              local_provider: str | None = None):
+    """Return a streaming wrapper for the supervise loop's local step.
 
-    Always streams Gemma's output live to stderr (via the HTTP path) so the
-    user can SEE the local model working in every iteration, then returns the
-    full accumulated text for the review package. The local config timeout is
-    applied to every request: gemma4 thinking mode can legitimately take 1-2
-    minutes, and a short timeout would kill long full-file generations.
+    Always streams the local model's output live to stderr (via the HTTP path)
+    so the user can SEE the local model working in every iteration, then
+    returns the full accumulated text for the review package. Uses the selected
+    local provider (defaults to the legacy backends.local). gemma4 thinking
+    mode can legitimately take 1-2 minutes, so the provider timeout is applied
+    to every request.
     """
-    lc = cfg["backends"]["local"]
-    base_url = lc["base_url"]
-    api_key = lc.get("api_key") or "lm-studio"
-    model = model_override or lc["model"]
-    timeout_s = lc["timeout_s"]
+    lp = get_local(cfg, name=local_provider)
+    if lp is not None:
+        base_url = lp.base_url
+        api_key = lp.api_key or "lm-studio"
+        model = model_override or lp.model
+        timeout_s = lp.timeout_s
+    else:
+        lc = cfg["backends"]["local"]
+        base_url = lc["base_url"]
+        api_key = lc.get("api_key") or "lm-studio"
+        model = model_override or lc["model"]
+        timeout_s = lc["timeout_s"]
 
     def _gen(req: ModelRequest) -> ModelResponse:
         req.timeout_s = timeout_s
@@ -1156,7 +1235,7 @@ def _run_parallel(agent: HybridAgent, cfg: dict, args: argparse.Namespace,
     analyzer = DependencyAnalyzer(steps)
     groups = analyzer.get_parallel_groups()
     executor = ParallelExecutor(
-        _supervise_gemma_generate(cfg, args.model),
+        _supervise_gemma_generate(cfg, args.model, local_provider=args.local_provider),
         max_workers=args.parallel_workers,
         max_tokens=args.max_tokens or GEMMA_MAX_TOKENS,
     )
@@ -1612,14 +1691,18 @@ def _run_final_verify(cloud, root: str, task: str, cmds, status,
 
 def _select_backend(agent: HybridAgent, cfg: dict, route: str,
                     model_override: str | None):
-    """Return the backend for `route`, applying the local model override.
+    """Return the backend for `route`, applying the local model override and
+    the configured local provider.
 
-    For the local route we construct only the GemmaBackend directly so that a
-    purely-local run never needs DEEPSEEK_API_KEY. For deepseek we build via
+    For the local route we construct only the local backend directly so that a
+    purely-local run never needs an online API key. For deepseek we build via
     agent._backends() (whose key check we have already validated)."""
     if route != "local":
         _, cloud = agent._backends()
         return cloud
+    lp = get_local(cfg, name=agent.local_provider)
+    if lp is not None:
+        return backend_for(lp)
     lc = cfg["backends"]["local"]
     model = model_override or lc["model"]
     return GemmaBackend(
@@ -1788,6 +1871,16 @@ def main() -> int:
                              "review, local implement + verify only), critical (force "
                              "prompt enhancement + full review loop). Default from "
                              "router.supervision in config, else auto")
+    parser.add_argument("--online-provider", default=None,
+                        help="name of the online provider to use (see providers: in "
+                             "config.yml; default: first enabled online provider)")
+    parser.add_argument("--local-provider", default=None,
+                        help="name of the local provider to use (see providers: in "
+                             "config.yml; default: first enabled local provider)")
+    parser.add_argument("--turbo", action="store_true",
+                        help="multi-model mode: fan every online call out to all enabled "
+                             "online providers in parallel and use the best response "
+                             "(multiplies API spend; still capped by the token budget)")
     parser.add_argument("--stats", action="store_true",
                         help="print the 80/20 strategy summary (hybrid-agent/stats.json)")
     parser.add_argument("--evaluate", action="store_true",
@@ -1867,7 +1960,8 @@ def main() -> int:
             print("error: --route-only requires --task", file=sys.stderr)
             return 2
         cfg = _load_cfg(args)
-        agent = HybridAgent(cfg)
+        agent = HybridAgent(cfg, online_provider=args.online_provider,
+                            local_provider=args.local_provider)
         context = args.context or ""
         memory = TaskMemory(memory_root_from_cfg(cfg),
                             embed=memory_embed_callable(cfg)).memory_view(args.task)
@@ -1888,7 +1982,8 @@ def main() -> int:
             _status(f"[hybrid] ⛔ refusal: mode={mode} has no API supervision (only hybrid enables it).")
             print(f"error: --review requires hybrid mode (API supervision). Use MODE=hybrid.", file=sys.stderr)
             return 3
-        agent = HybridAgent(cfg)
+        agent = HybridAgent(cfg, online_provider=args.online_provider,
+                            local_provider=args.local_provider)
         api_key_env = cfg["backends"]["deepseek"]["api_key_env"]
         if not _resolve_api_key(api_key_env):
             print("error: No DeepSeek API key found. Please log in to Kilo or set "
@@ -1944,16 +2039,19 @@ def main() -> int:
             _status(f"[hybrid] ⛔ refusal: mode={mode} has no API supervision (only hybrid enables it).")
             print(f"error: --supervise requires hybrid mode (API supervision). Use MODE=hybrid.", file=sys.stderr)
             return 3
-        agent = HybridAgent(cfg)
+        agent = HybridAgent(cfg, online_provider=args.online_provider,
+                            local_provider=args.local_provider)
         if not _resolve_api_key(cfg["backends"]["deepseek"]["api_key_env"]):
             print("error: --supervise requires a DeepSeek key "
                   "(env DEEPSEEK_API_KEY or Kilo auth.json)", file=sys.stderr)
             return 2
         local, cloud = agent._backends()
-        cloud = _budgeted_cloud(cloud, cfg)
         tracker = ProgressTracker()
         cache = CacheManager(cfg, args)
         cloud = _cached_cloud(cloud, cache)
+        cloud = _budgeted_cloud(cloud, cfg)
+        cloud = (_parallel_cloud(cloud, cfg, args) if args.turbo
+                 else _failover_cloud(cloud, cfg, args))
 
         # Optional context (files/diff) goes into the review package via a builder.
         context = args.context or ""
@@ -2043,7 +2141,7 @@ def main() -> int:
                     task=task_for_gemma,
                     package_builder=_pkg,
                     max_iterations=args.max_iterations,
-                    gemma_generate=_supervise_gemma_generate(cfg, args.model),
+                    gemma_generate=_supervise_gemma_generate(cfg, args.model, local_provider=args.local_provider),
                     status=lambda line: tracker.tick(line),
                     gemma_max_tokens=args.max_tokens or GEMMA_MAX_TOKENS,
                     review=(plan != "local_first"),
@@ -2202,7 +2300,8 @@ def main() -> int:
         return 2
 
     cfg = _load_cfg(args)
-    agent = HybridAgent(cfg)
+    agent = HybridAgent(cfg, online_provider=args.online_provider,
+                            local_provider=args.local_provider)
     context = args.context or ""
     if args.context_scan:
         scanned = _scan_project_context(args.root, args.task)

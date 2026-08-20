@@ -20,6 +20,7 @@ from backends.deepseek import DeepSeekBackend
 from backends.local_gemma import GemmaBackend
 from memory import TaskMemory, TaskRecord, memory_root_from_cfg
 from embed import memory_embed_callable
+from providers import backend_for, get_local, get_online, load_providers
 from router import archetypes
 from router.confidence import MemoryView, score
 from router.threshold import ThresholdController
@@ -66,8 +67,11 @@ DEFAULT_CONFIG = {
 
 
 class HybridAgent:
-    def __init__(self, cfg: dict):
+    def __init__(self, cfg: dict, online_provider: str | None = None,
+                 local_provider: str | None = None):
         self.cfg = cfg
+        self.online_provider = online_provider
+        self.local_provider = local_provider
         r_cfg = cfg["router"]
         self.threshold = ThresholdController(
             threshold=r_cfg["local_threshold"],
@@ -84,18 +88,30 @@ class HybridAgent:
 
     def _backends(self) -> tuple[Backend, Backend]:
         if self._local is None or self._cloud is None:
-            lc = self.cfg["backends"]["local"]
-            dc = self.cfg["backends"]["deepseek"]
-            self._local = GemmaBackend(
-                lc["base_url"], lc["model"],
-                api_key=lc.get("api_key") or "lm-studio",
-                timeout_s=lc["timeout_s"], max_retries=lc["max_retries"],
-            )
-            self._cloud = DeepSeekBackend(
-                dc["api_key_env"], dc["model"],
-                base_url=dc.get("base_url") or "https://api.deepseek.com",
-                timeout_s=dc["timeout_s"], max_retries=dc["max_retries"],
-            )
+            load_providers(self.cfg)  # validates the provider config shape
+            lp = get_local(self.cfg, name=self.local_provider)
+            op = get_online(self.cfg, name=self.online_provider)
+            if lp is None and self.local_provider:
+                lp = get_local(self.cfg)
+            if op is None and self.online_provider:
+                op = get_online(self.cfg)
+            if lp is None or op is None:
+                # No enabled providers: fall back to the legacy backends section.
+                lc = self.cfg["backends"]["local"]
+                dc = self.cfg["backends"]["deepseek"]
+                self._local = GemmaBackend(
+                    lc["base_url"], lc["model"],
+                    api_key=lc.get("api_key") or "lm-studio",
+                    timeout_s=lc["timeout_s"], max_retries=lc["max_retries"],
+                )
+                self._cloud = DeepSeekBackend(
+                    dc["api_key_env"], dc["model"],
+                    base_url=dc.get("base_url") or "https://api.deepseek.com",
+                    timeout_s=dc["timeout_s"], max_retries=dc["max_retries"],
+                )
+            else:
+                self._local = backend_for(lp)
+                self._cloud = backend_for(op)
         return self._local, self._cloud
 
     # --- routing --------------------------------------------------------

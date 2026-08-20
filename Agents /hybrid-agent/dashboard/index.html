@@ -1,0 +1,366 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Hybrid-Agent Dashboard</title>
+<script src="https://cdn.socket.io/4.7.5/socket.io.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+<style>
+:root{--bg:#0d1117;--panel:#161b22;--border:#30363d;--text:#c9d1d9;--muted:#8b949e;--accent:#58a6ff;--green:#238636;--green2:#2ea043;--red:#da3633;--yellow:#d29922}
+*{box-sizing:border-box}
+body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;background:var(--bg);color:var(--text);margin:0;padding:20px}
+.wrap{max-width:1280px;margin:0 auto}
+h1{font-size:22px;margin:0 0 16px}h3{margin:0 0 12px;font-size:15px}
+.card{background:var(--panel);border:1px solid var(--border);border-radius:12px;padding:16px;margin-bottom:16px}
+.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(340px,1fr));gap:16px}
+input,select,textarea{width:100%;padding:8px 10px;background:var(--bg);border:1px solid var(--border);border-radius:6px;color:var(--text);margin:4px 0;font-size:13px}
+button{background:var(--green);color:#fff;border:none;padding:8px 14px;border-radius:6px;cursor:pointer;font-weight:600;font-size:13px}
+button:hover{background:var(--green2)}button.ghost{background:transparent;border:1px solid var(--border);color:var(--text)}
+button.danger{background:var(--red)}button.danger:hover{background:#f85149}button.small{padding:4px 10px;font-size:12px}
+.badge{display:inline-block;padding:2px 8px;border-radius:12px;font-size:11px;font-weight:600}
+.badge.online{background:#1f3a5f;color:#79c0ff}.badge.local{background:#3a2f1f;color:#e3b341}.badge.ok{background:var(--green);color:#fff}.badge.no{background:#3a3a3a;color:#aaa}
+.row{display:flex;gap:10px;align-items:center;flex-wrap:wrap}
+.stat{text-align:center}.stat .v{font-size:26px;font-weight:700;color:var(--accent)}.stat .l{color:var(--muted);font-size:12px}
+.log{background:var(--bg);border:1px solid var(--border);border-radius:6px;padding:8px;max-height:340px;overflow-y:auto;font:11px/1.45 ui-monospace,SFMono-Regular,Menlo,monospace;white-space:pre-wrap}
+.log .info{color:#c9d1d9}.log .error{color:#ff7b72}.log .success{color:#3fb950}
+.progress{background:var(--border);border-radius:10px;height:18px;overflow:hidden}
+.progress>div{height:100%;background:linear-gradient(90deg,var(--green),var(--green2));width:0%;transition:width .3s}
+.charts{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:12px}
+.chart-box{height:180px}
+.msg{padding:8px 12px;border-radius:6px;margin-top:8px;display:none;font-size:13px}
+.msg.ok{display:block;background:#0d4420;border:1px solid var(--green)}
+.msg.err{display:block;background:#442020;border:1px solid var(--red)}
+.prov{border:1px solid var(--border);border-radius:8px;padding:10px;margin-bottom:10px}
+.prov .head{display:flex;justify-content:space-between;align-items:center;margin-bottom:6px}
+.keyrow{display:flex;gap:6px;align-items:center}
+#token-input{max-width:220px}
+</style>
+</head>
+<body>
+<div class="wrap">
+<h1>🤖 Hybrid-Agent Dashboard</h1>
+
+<div class="card">
+  <h3>🔑 Providers &amp; API keys <span style="color:var(--muted);font-weight:400;font-size:12px">(2 online + 2 local · keys stored in Keychain, never exposed)</span></h3>
+  <div class="row" style="margin-bottom:10px">
+    <input id="token-input" placeholder="DASHBOARD_TOKEN (optional)" style="max-width:260px">
+    <button class="ghost small" onclick="saveToken()">Save token</button>
+    <span id="token-hint" style="color:var(--muted);font-size:12px"></span>
+  </div>
+  <div id="providers"></div>
+</div>
+
+<div class="grid">
+  <div class="card">
+    <h3>📊 Stats</h3>
+    <div class="grid" style="grid-template-columns:1fr 1fr">
+      <div class="stat"><div class="v" id="s-tasks">0</div><div class="l">Tasks completed</div></div>
+      <div class="stat"><div class="v" id="s-success">0%</div><div class="l">Approval rate</div></div>
+      <div class="stat"><div class="v" id="s-cost">$0</div><div class="l">Verify cost est.</div></div>
+      <div class="stat"><div class="v" id="s-cache">0%</div><div class="l">Cache hit rate</div></div>
+      <div class="stat"><div class="v" id="s-files">0</div><div class="l">Files generated</div></div>
+      <div class="stat"><div class="v" id="s-trunc">0</div><div class="l">Truncations</div></div>
+    </div>
+    <div class="charts" style="margin-top:12px">
+      <div><h3 style="font-size:13px">Phase timing (s)</h3><canvas class="chart-box" id="c-phases"></canvas></div>
+      <div><h3 style="font-size:13px">Cache</h3><canvas class="chart-box" id="c-cache"></canvas></div>
+      <div><h3 style="font-size:13px">API tokens / day</h3><canvas class="chart-box" id="c-tokens"></canvas></div>
+      <div><h3 style="font-size:13px">Reviews</h3><canvas class="chart-box" id="c-reviews"></canvas></div>
+    </div>
+  </div>
+
+  <div>
+    <div class="card">
+      <h3>📝 Submit task</h3>
+      <textarea id="task" rows="3" placeholder="Describe the coding task…"></textarea>
+      <div class="row">
+        <select id="mode"><option value="hybrid">Hybrid</option><option value="local">Local</option><option value="code">Code (API)</option></select>
+        <select id="online-prov"><option value="">Online: default</option></select>
+        <select id="local-prov"><option value="">Local: default</option></select>
+      </div>
+      <div class="row">
+        <label><input type="checkbox" id="f-enhance"> enhance</label>
+        <label><input type="checkbox" id="f-verify" checked> verify</label>
+        <label><input type="checkbox" id="f-regression"> regression</label>
+        <label><input type="checkbox" id="f-apply"> apply</label>
+        <label><input type="checkbox" id="f-parallel"> parallel</label>
+        <label><input type="checkbox" id="f-cot"> cot</label>
+        <label><input type="checkbox" id="f-turbo"> <b>turbo</b> (multi-AI)</label>
+        <label><input type="checkbox" id="f-scan"> context-scan</label>
+      </div>
+      <div class="row" style="margin-top:8px">
+        <input id="max-iter" type="number" value="3" min="1" max="10" style="max-width:90px" title="max iterations">
+        <button onclick="submitTask()">▶ Run task</button>
+      </div>
+      <div id="task-msg" class="msg"></div>
+    </div>
+
+    <div class="card">
+      <h3>📈 Progress</h3>
+      <div class="progress"><div id="progress-fill"></div></div>
+      <div class="row" style="justify-content:space-between;margin-top:6px">
+        <span id="phase" style="color:var(--muted)">Idle</span><span id="pct">0%</span>
+      </div>
+      <h3 style="margin-top:12px">📋 Queue <button class="ghost small danger" onclick="cancelTask()">Cancel current</button></h3>
+      <div id="queue" style="font-size:12px;color:var(--muted)">Idle</div>
+    </div>
+  </div>
+</div>
+
+<div class="grid">
+  <div class="card">
+    <h3>📜 Live logs <button class="ghost small" style="float:right" onclick="downloadLogs()">Download</button></h3>
+    <div class="row" style="margin-bottom:6px">
+      <button class="ghost small" onclick="setFilter('all')">All</button>
+      <button class="ghost small" onclick="setFilter('info')">Info</button>
+      <button class="ghost small" onclick="setFilter('error')">Errors</button>
+      <button class="ghost small" onclick="setFilter('success')">Success</button>
+    </div>
+    <div class="log" id="logs"></div>
+  </div>
+
+  <div class="card">
+    <h3>🔧 Config <button class="ghost small" style="float:right" onclick="loadConfig()">Reload</button></h3>
+    <textarea id="config" rows="14" spellcheck="false"></textarea>
+    <div class="row" style="margin-top:6px">
+      <button onclick="saveConfig()">Save config (validated)</button>
+      <span id="config-msg" style="color:var(--muted);font-size:12px"></span>
+    </div>
+    <h3 style="margin-top:12px">📄 Fix diff (hybrid-verify/fixes.diff)</h3>
+    <div class="log" id="diff" style="max-height:180px"></div>
+  </div>
+</div>
+</div>
+
+<script>
+let charts = {};
+let token = localStorage.getItem('token') || '';
+let filter = 'all';
+
+function headers(extra) {
+  const h = Object.assign({'Content-Type': 'application/json'}, extra || {});
+  if (token) h['Authorization'] = 'Bearer ' + token;
+  return h;
+}
+function saveToken() {
+  token = document.getElementById('token-input').value.trim();
+  localStorage.setItem('token', token);
+  document.getElementById('token-hint').textContent = token ? 'token saved' : '';
+  location.reload();
+}
+
+// ---- Socket ----
+const socket = io({query: token ? {token} : {}});
+socket.on('connect', () => document.getElementById('token-hint').textContent = 'live');
+socket.on('log', d => { addLog(d.type, d.message); });
+socket.on('progress', d => {
+  document.getElementById('progress-fill').style.width = d.percent + '%';
+  document.getElementById('phase').textContent = d.phase + ' (' + d.elapsed + 's)';
+  document.getElementById('pct').textContent = d.percent + '%';
+});
+socket.on('queue', renderQueue);
+socket.on('done', () => {
+  document.getElementById('phase').textContent = 'Done';
+  setTimeout(() => { document.getElementById('phase').textContent = 'Idle'; }, 4000);
+});
+
+function addLog(type, msg) {
+  const el = document.createElement('div');
+  el.className = type; el.textContent = msg;
+  const box = document.getElementById('logs');
+  box.appendChild(el); box.scrollTop = box.scrollHeight;
+  if (box.children.length > 800) box.firstChild.remove();
+}
+function setFilter(f) {
+  filter = f;
+  const box = document.getElementById('logs');
+  [...box.children].forEach(c => {
+    c.style.display = (filter === 'all' || c.className === filter) ? '' : 'none';
+  });
+}
+
+// ---- Providers ----
+function loadProviders() {
+  fetch('/api/providers', {headers: headers()}).then(r => r.json()).then(renderProviders);
+}
+function renderProviders(list) {
+  const wrap = document.getElementById('providers');
+  const online = list.filter(p => p.kind === 'online');
+  const local = list.filter(p => p.kind === 'local');
+  wrap.innerHTML = '';
+  const both = [...online, ...local];
+  both.forEach(p => {
+    const d = document.createElement('div');
+    d.className = 'prov';
+    d.innerHTML = `
+      <div class="head">
+        <div><span class="badge ${p.kind}">${p.kind}</span> <b>${p.name}</b>
+          <span class="badge ${p.has_key ? 'ok' : 'no'}" id="key-${p.name}">${p.has_key ? 'key ✓ ' + p.key_masked : 'no key'}</span></div>
+        <label style="font-size:12px"><input type="checkbox" id="en-${p.name}" ${p.enabled ? 'checked' : ''} onchange="saveProvider('${p.name}', {enabled: this.checked})"> enabled</label>
+      </div>
+      <div class="row">
+        <input id="url-${p.name}" value="${p.base_url}" placeholder="base URL" style="flex:2">
+        <input id="model-${p.name}" value="${p.model}" placeholder="model" style="flex:2">
+      </div>
+      <div class="row">
+        <input id="k-${p.name}" type="password" placeholder="API key (leave empty to keep)" style="flex:2">
+        <button class="small" onclick="saveProvider('${p.name}', {key: document.getElementById('k-${p.name}').value})">Save key</button>
+        <button class="small ghost" onclick="saveProvider('${p.name}', {url: document.getElementById('url-${p.name}').value, model: document.getElementById('model-${p.name}').value})">Update endpoint</button>
+        <button class="small ghost" onclick="testProvider('${p.name}')">Test</button>
+        <button class="small ghost danger" onclick="deleteKey('${p.name}')">Clear key</button>
+        ${p.kind === 'local' ? `<button class="small ghost" onclick="loadModels('${p.name}')">Load models</button>` : ''}
+      </div>
+    `;
+    wrap.appendChild(d);
+  });
+  // populate task selects
+  const op = document.getElementById('online-prov');
+  const lp = document.getElementById('local-prov');
+  op.innerHTML = '<option value="">Online: default</option>';
+  lp.innerHTML = '<option value="">Local: default</option>';
+  online.forEach(p => { const o = new Option(p.name, p.name); op.appendChild(o); });
+  local.forEach(p => { const o = new Option(p.name, p.name); lp.appendChild(o); });
+}
+function saveProvider(name, body) {
+  fetch('/api/providers', {method: 'POST', headers: headers(), body: JSON.stringify(Object.assign({name}, body))})
+    .then(r => r.json()).then(() => {
+      if (body.key) {
+        showMsg('api-msg', `key saved for ${name}`, 'ok');
+        loadProviders();
+      }
+    });
+}
+function testProvider(name) {
+  const key = document.getElementById('k-' + name).value || undefined;
+  const msg = showMsg('api-msg', `testing ${name}…`);
+  fetch('/api/providers/test', {method: 'POST', headers: headers(), body: JSON.stringify({name, api_key: key})})
+    .then(r => r.json()).then(d => {
+      showMsg('api-msg', d.ok ? `✅ ${name}: ${d.message} (${d.latency_ms}ms)` : `❌ ${name}: ${d.error}`, d.ok ? 'ok' : 'err');
+    });
+}
+function deleteKey(name) {
+  fetch('/api/providers/delete-key', {method: 'POST', headers: headers(), body: JSON.stringify({name})})
+    .then(r => r.json()).then(loadProviders);
+}
+function loadModels(name) {
+  const url = document.getElementById('url-' + name).value;
+  fetch('/api/providers/test', {method: 'POST', headers: headers(), body: JSON.stringify({name})})
+    .then(r => r.json()).then(d => {
+      if (d.ok && d.models) {
+        document.getElementById('model-' + name).value = d.models[0];
+        showMsg('api-msg', `models on ${name}: ${d.models.join(', ')}`, 'ok');
+      } else showMsg('api-msg', 'could not list models: ' + (d.error || 'endpoint down'), 'err');
+    });
+}
+function showMsg(id, text, kind) {
+  const el = document.getElementById('task-msg');
+  el.textContent = text; el.className = 'msg ' + kind;
+  return el;
+}
+
+// ---- Task submission ----
+function submitTask() {
+  const task = document.getElementById('task').value.trim();
+  if (!task) return showMsg('task-msg', 'task text required', 'err');
+  const body = {
+    task, mode: document.getElementById('mode').value,
+    online_provider: document.getElementById('online-prov').value,
+    local_provider: document.getElementById('local-prov').value,
+    enhance: document.getElementById('f-enhance').checked,
+    verify: document.getElementById('f-verify').checked,
+    regression: document.getElementById('f-regression').checked,
+    apply: document.getElementById('f-apply').checked,
+    parallel: document.getElementById('f-parallel').checked,
+    cot: document.getElementById('f-cot').checked,
+    turbo: document.getElementById('f-turbo').checked,
+    context_scan: document.getElementById('f-scan').checked,
+    max_iterations: parseInt(document.getElementById('max-iter').value || '3', 10),
+  };
+  fetch('/api/task', {method: 'POST', headers: headers(), body: JSON.stringify(body)})
+    .then(r => r.json()).then(d => {
+      showMsg('task-msg', d.status === 'ok' ? '🚀 task queued: ' + d.id : '❌ ' + d.error, d.status === 'ok' ? 'ok' : 'err');
+      if (d.status === 'ok') document.getElementById('logs').innerHTML = '';
+    });
+}
+function cancelTask() {
+  fetch('/api/cancel', {method: 'POST', headers: headers()}).then(r => r.json());
+}
+function renderQueue(st) {
+  const el = document.getElementById('queue');
+  const parts = [];
+  if (st.current) parts.push('▶ ' + st.current.id + ': ' + (st.current.task || '').slice(0, 60));
+  st.queued.forEach(q => parts.push('⏳ ' + q.id + ': ' + q.task));
+  if (st.history.length) parts.push('history: ' + st.history.map(h => h.id + ' ' + (h.status || '')).join(' · '));
+  el.textContent = parts.length ? parts.join('\n') : 'Idle';
+}
+
+// ---- Stats & charts ----
+let chartDefs = {};
+function loadStats() {
+  fetch('/api/stats', {headers: headers()}).then(r => r.json()).then(renderStats);
+}
+function renderStats(s) {
+  document.getElementById('s-tasks').textContent = s.tasks_completed;
+  document.getElementById('s-success').textContent = Math.round(s.success_rate * 100) + '%';
+  document.getElementById('s-cost').textContent = '$' + s.verify.estimated_cost_usd.toFixed(4);
+  document.getElementById('s-cache').textContent = Math.round(s.cache.rate * 100) + '%';
+  document.getElementById('s-files').textContent = s.files_generated;
+  document.getElementById('s-trunc').textContent = s.truncation_events;
+  chart('c-phases', 'pie',
+    Object.keys(s.phase_timings), Object.values(s.phase_timings).map(v => v.total_s),
+    ['#58a6ff', '#2ea043', '#d29922', '#f85149']);
+  chart('c-cache', 'doughnut', ['hits', 'misses'], [s.cache.hits, s.cache.misses], ['#2ea043', '#8b949e']);
+  chart('c-tokens', 'bar', s.api_tokens.map(d => d.day), s.api_tokens.map(d => d.tokens), '#58a6ff');
+  chart('c-reviews', 'doughnut', ['approved', 'fix required', 'rejected'],
+    [s.approvals, s.fix_required, s.rejections], ['#2ea043', '#d29922', '#f85149']);
+}
+function chart(id, type, labels, data, color) {
+  const ctx = document.getElementById(id);
+  if (!ctx) return;
+  if (chartDefs[id]) chartDefs[id].destroy();
+  chartDefs[id] = new Chart(ctx, {
+    type,
+    data: {labels, datasets: [{data, backgroundColor: Array.isArray(color) ? color : color}]},
+    options: {responsive: true, maintainAspectRatio: false,
+      plugins: {legend: {position: 'bottom', labels: {color: '#8b949e', boxWidth: 10, font: {size: 10}}}}},
+  });
+}
+
+// ---- Config ----
+function loadConfig() {
+  fetch('/api/config', {headers: headers()}).then(r => r.json()).then(d => {
+    document.getElementById('config').value = d.text;
+  });
+}
+function saveConfig() {
+  fetch('/api/config', {method: 'POST', headers: headers(),
+    body: JSON.stringify({text: document.getElementById('config').value})})
+    .then(r => r.json()).then(d => {
+      document.getElementById('config-msg').textContent =
+        d.status === 'ok' ? 'saved (backup written)' : 'ERROR: ' + d.error;
+    });
+}
+function loadDiff() {
+  fetch('/api/diff', {headers: headers()}).then(r => r.json()).then(d => {
+    document.getElementById('diff').textContent = d.exists ? d.text : '(no fixes.diff yet)';
+  });
+}
+function downloadLogs() {
+  fetch('/api/logs/download', {headers: headers()}).then(r => r.blob()).then(b => {
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(b); a.download = 'hybrid-agent.log'; a.click();
+  });
+}
+
+// ---- Init ----
+document.getElementById('token-input').value = token;
+loadProviders(); loadStats(); loadConfig(); loadDiff();
+setInterval(loadStats, 10000);
+setInterval(loadDiff, 30000);
+document.getElementById('task').addEventListener('keydown', e => {
+  if (e.key === 'Enter' && (e.metaKey || e.ctrlKey)) submitTask();
+});
+</script>
+</body>
+</html>

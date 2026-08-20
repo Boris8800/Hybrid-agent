@@ -12,6 +12,8 @@ The bridge is a self-contained CLI (`ask.py`) that talks directly to two OpenAI-
 - [Modes](#modes)
 - [Requirements](#requirements)
 - [Setup](#setup)
+- [Web dashboard](#web-dashboard)
+- [Providers & multi-model](#providers--multi-model)
 - [Quick start](#quick-start)
 - [CLI reference](#cli-reference)
 - [The supervise loop](#the-supervise-loop)
@@ -94,6 +96,56 @@ python3 -m venv "Agents /hybrid-agent/.venv"
 > automatically re-executes itself with the project venv interpreter (guarded against
 > loops and never fired when the module is imported). A plain `python3 ask.py …` works.
 
+## Web dashboard
+
+A single-user local control panel for the engine:
+
+```bash
+cd "Agents /hybrid-agent"
+./.venv/bin/pip install flask flask-socketio cryptography   # one-time
+./.venv/bin/python web_dashboard.py --port 8660              # -> http://127.0.0.1:8660
+```
+
+- **Providers & API keys** — manage all 2+2 providers: enter/test/delete keys
+  (stored in macOS Keychain, Fernet-encrypted file elsewhere — keys are never
+  returned to the browser, only a masked hint), edit endpoint/model, toggle
+  enabled, and list models loaded on local endpoints.
+- **Submit & queue tasks** — choose mode, provider, and flags (enhance, verify,
+  regression, apply, parallel, cot, context-scan, turbo), queue multiple tasks
+  (one runs at a time), cancel the running task (graceful SIGINT).
+- **Live output** — real-time progress bar (parses `[hybrid] progress` lines),
+  phase/percent/elapsed, filtered log view with download.
+- **Stats & charts** — task counts, approval rate, cache hit rate, verify cost,
+  phase timing pie, cache donut, daily API-token bar, review breakdown.
+- **Config editor** — view/edit `config.yml` with YAML validation and a backup
+  before saving.
+- **Diff viewer** — the latest `hybrid-verify/fixes.diff`.
+- **Auth (optional)** — export `DASHBOARD_TOKEN=…`; API calls require
+  `Authorization: Bearer …`.
+
+## Providers & multi-model
+
+The engine talks to **any OpenAI-compatible endpoint** in either role, with a
+fleet of **2 online + 2 local providers** configured out of the box:
+
+| Kind | Default | Endpoint | Model |
+|------|---------|----------|-------|
+| online | `deepseek` | `api.deepseek.com` | `deepseek-chat` |
+| online | `groq` | `api.groq.com/openai/v1` | `llama-3.3-70b-versatile` |
+| local | `gemma` | `localhost:1234/v1` | `google/gemma-4-12b-qat` |
+| local | `local-2` | `localhost:1234/v1` | (pick any loaded model) |
+
+- **API keys** resolve in order: environment variable → Kilo `auth.json` → the
+  dashboard's encrypted secrets store. Manage them in the web UI.
+- `--online-provider NAME` / `--local-provider NAME` select which provider is
+  primary for a run.
+- **Failover** — if the active online provider fails, the request automatically
+  retries on the next enabled online provider.
+- **`--turbo` (multi-AI)** — fans every online call out to all enabled online
+  providers **in parallel** and returns the longest non-truncated response.
+  Uses many AIs at the same time; multiplies API spend (still capped by
+  `review.daily_token_budget`).
+
 ## Quick start
 
 ```bash
@@ -139,6 +191,8 @@ use plain `python3 ask.py …` (the CLI self-heals into the venv interpreter).
 | `--config PATH` | Optional YAML config override. |
 | `--mode hybrid\|local\|code` | Role enforcement mode (see [Modes](#modes)). |
 | `--router auto\|full\|local_first\|critical` | Supervision-plan override (see [Dynamic supervision routing](#dynamic-supervision-routing)). |
+| `--online-provider NAME` / `--local-provider NAME` | Select which provider is primary (see [Providers & multi-model](#providers--multi-model)). |
+| `--turbo` | Fan every online call out to all enabled online providers in parallel; best response wins. |
 | `--route-only` | Print the routing decision only, without calling any model. |
 | `--models` | List loaded local model ids. |
 
@@ -378,6 +432,7 @@ Unknown keys are ignored by the loader, and every section has a safe default.
 | `cache` | `enabled`, `dir`, `ttl_days`, `max_entries` |
 | `circuit_breaker` | `window_size`, `local_error_ceiling`, `deepseek_error_ceiling`, `cooldown_s` |
 | `memory` | `root`, `max_project_summary_words`, `semantic_similarity`, `embedding_model`, `embedding_threshold` |
+| `providers` | `online`, `local` (lists of `{name, base_url, model, api_key_env, api_key, enabled, timeout_s, max_retries}`) |
 | `roles` | `implementer`, `supervisor` (architecture — do not change) |
 
 **Environment overrides** (roles stay architecture; only models/endpoints change):
@@ -416,7 +471,7 @@ report.
 
 ```bash
 cd "Agents /hybrid-agent"
-./.venv/bin/python -m unittest discover -s tests -v    # 127 tests
+./.venv/bin/python -m unittest discover -s tests -v    # 142 tests
 ```
 
 Coverage includes: the fenced-file parser, the apply overwrite/unsafe-path guards,
@@ -425,6 +480,8 @@ dry-run, the clarify heuristic, `CacheManager` (TTL/cap/disabled), the verdict c
 supervision router (trivial/critical signals, budget pressure, overrides, memory
 similarity), the local-first `review=False` supervise path, token-budget accounting,
 embedding clients and cosine, per-project memory scoping, config-key validation,
+provider registry (2+2, overrides, key resolution), failover + turbo cloud wrappers,
+the encrypted secrets store, the dashboard API (stats/providers/config/auth),
 parallel-verify groups, truncation retries, and parallel step conflict
 detection/serialization.
 
@@ -446,6 +503,9 @@ repo root/
     ├── parallel.py              # Plan parsing, dependency groups, parallel executor
     ├── memory.py                # Persistent task memory (semantic recall, consolidation)
     ├── embed.py                 # Local embeddings client (/v1/embeddings) + cosine
+    ├── providers.py             # Provider registry (2 online + 2 local, failover-ready)
+    ├── web_dashboard.py         # Web control panel (Flask + SocketIO, port 8660)
+    ├── dashboard/               # Dashboard UI + encrypted secrets store
     ├── context.py / scan.py     # Project context scanner
     ├── backends/                # Gemma/DeepSeek clients + circuit breaker
     ├── router/                  # Archetypes, confidence scoring, threshold
