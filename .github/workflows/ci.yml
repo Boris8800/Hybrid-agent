@@ -1,0 +1,45 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ["3.11", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install PyYAML (config/frontmatter loading)
+        run: python -m pip install pyyaml
+
+      - name: Syntax check (hybrid engine)
+        run: python -m py_compile "Agents /hybrid-agent/ask.py" "Agents /hybrid-agent/supervise.py" "Agents /hybrid-agent/agent.py" "Agents /hybrid-agent/memory.py" "Agents /hybrid-agent/parallel.py" "Agents /hybrid-agent/context.py" "Agents /hybrid-agent/router/confidence.py" "Agents /hybrid-agent/router/threshold.py"
+
+      - name: Unit tests
+        working-directory: "Agents /hybrid-agent"
+        run: python -m unittest discover -s tests -v
+
+      - name: Agent frontmatter check
+        run: |
+          python - <<'PY'
+          import glob, sys, yaml
+          bad = 0
+          for f in sorted(glob.glob(".kilo/agent/*.md")):
+              content = open(f).read()
+              if "---" not in content:
+                  print("MISSING FRONTMATTER:", f)
+                  bad += 1
+                  continue
+              yaml.safe_load(content.split("---", 2)[1])
+              print("OK", f)
+          sys.exit(bad)
+          PY

@@ -48,8 +48,9 @@ from memory import TaskMemory, TaskRecord
 # that lacks them, ask.py silently fell back to embedded defaults (10s local
 # timeout, unloaded model id "gemma-4-12b") - the root cause of slow and
 # truncated local generations. Re-exec with the venv interpreter instead.
-# Guarded by env var so the re-exec cannot loop.
-if os.environ.get("HYBRID_REHEALED") != "1":
+# Guarded by env var so the re-exec cannot loop, and by __name__ so importing
+# ask.py from tests / other tools (which must never replace the process) is safe.
+if __name__ == "__main__" and os.environ.get("HYBRID_REHEALED") != "1":
     try:
         import yaml  # noqa: F401
     except ImportError:
@@ -543,6 +544,14 @@ def _load_config_quiet(path: str | None) -> dict:
     if buf.getvalue():
         sys.stderr.write(buf.getvalue())
     return _apply_role_overrides(cfg)
+
+
+def _load_cfg(args: argparse.Namespace) -> dict:
+    """Load config and apply the startup wiring that depends on it
+    (verify-allowlist prefixes)."""
+    cfg = _load_config_quiet(args.config or _default_config_path())
+    _configure_verify_allowlist(cfg)
+    return cfg
 
 
 def _normalize_tokens(tokens) -> dict:
@@ -1129,6 +1138,20 @@ _DANGEROUS_VERIFY_MARKERS = (
     "chmod", "chown", "mkfs", "dd ", "shutdown", "reboot",
 )
 
+# Extra allowlisted prefixes from config review.verify_allowlist. Populated at
+# startup by _configure_verify_allowlist (empty = stock allowlist only).
+_VERIFY_ALLOWLIST_EXTRA: tuple[str, ...] = ()
+
+
+def _configure_verify_allowlist(cfg: dict) -> None:
+    """Extend the verify allowlist with review.verify_allowlist prefixes from
+    config (e.g. ['docker compose build']). Prefixes are lower-cased like the
+    hardcoded ones; the dangerous-marker check still applies to every command."""
+    global _VERIFY_ALLOWLIST_EXTRA
+    extra = (cfg.get("review") or {}).get("verify_allowlist") or []
+    _VERIFY_ALLOWLIST_EXTRA = tuple(
+        str(p).strip().lower() for p in extra if str(p).strip())
+
 
 def _is_safe_verify_cmd(cmd: str) -> bool:
     """Only allowlist verification commands; block destructive/compound shell."""
@@ -1137,7 +1160,7 @@ def _is_safe_verify_cmd(cmd: str) -> bool:
         return False
     if any(m in c for m in _DANGEROUS_VERIFY_MARKERS):
         return False
-    return c.startswith(_SAFE_VERIFY_PREFIXES)
+    return c.startswith(_SAFE_VERIFY_PREFIXES) or c.startswith(_VERIFY_ALLOWLIST_EXTRA)
 
 
 def _truncate_error(text: str, limit: int = _VERIFY_ERROR_CHARS) -> str:
@@ -1537,33 +1560,40 @@ def _parse_fenced_files(text: str) -> list[tuple[str, str]]:
 
 
 _APPLY_LANG = set(_APPLY_EXTENSIONS)
-_CLEAN_PATH = re.compile(r"[\w./-]+\Z")
+_CLEAN_PATH = re.compile(r"[\w./\\:-]+\Z")
+_WIN_DRIVE = re.compile(r"^[A-Za-z]:[\\/]")
 
 
 def _looks_like_path(t: str) -> bool:
-    if "/" in t or "." in t:
-        return t.lower() not in _APPLY_LANG and bool(_CLEAN_PATH.match(t))
+    n = t.replace("\\", "/")
+    if "/" in n or "." in n:
+        return n.lower() not in _APPLY_LANG and bool(_CLEAN_PATH.match(n))
     return False
 
 
 def _clean_path(t: str) -> bool:
-    return bool(_CLEAN_PATH.match(t)) and ("/" in t or "." in t)
+    n = t.replace("\\", "/")
+    return bool(_CLEAN_PATH.match(n)) and ("/" in n or "." in n)
 
 
-def _apply_fenced_files(text: str, root: str = ".") -> tuple[list[tuple[str, int]], list[str]]:
+def _apply_fenced_files(text: str, root: str = ".",
+                        dry_run: bool = False) -> tuple[list[tuple[str, int]], list[str]]:
     """Write path-labeled fenced blocks from `text` under `root`.
 
     Returns (written, skipped): `written` is [(relative_path, bytes_written)],
-    `skipped` is a list of human-readable reasons. Absolute paths and paths
-    escaping `root` via ".." are never written.
-    """
+    `skipped` is a list of human-readable reasons. Absolute paths, Windows
+    drive/UNC paths, and paths escaping `root` via ".." are never written.
+    With dry_run=True nothing touches disk; `written` still lists what would
+    be written."""
     root_abs = os.path.abspath(root)
     written, skipped, seen = [], [], set()
     for rel_path, content in _parse_fenced_files(text):
         clean = rel_path.replace("\\", "/")
-        # Reject absolute paths and any ".." traversal BEFORE normalization.
+        # Reject absolute, Windows drive/UNC, and any ".." traversal paths
+        # BEFORE normalization.
         if clean.startswith("/") or os.path.isabs(clean) \
-                or any(part == ".." for part in clean.split("/")):
+                or any(part == ".." for part in clean.split("/")) \
+                or _WIN_DRIVE.match(clean) or clean.startswith("\\\\"):
             skipped.append(f"{rel_path} (unsafe path)")
             continue
         target = os.path.normpath(os.path.join(root_abs, clean))
@@ -1574,6 +1604,9 @@ def _apply_fenced_files(text: str, root: str = ".") -> tuple[list[tuple[str, int
             skipped.append(f"{rel_path} (duplicate block would overwrite)")
             continue
         seen.add(clean)
+        if dry_run:
+            written.append((os.path.relpath(target, root_abs), len(content.encode("utf-8"))))
+            continue
         os.makedirs(os.path.dirname(target), exist_ok=True)
         with open(target, "w", encoding="utf-8") as fh:
             fh.write(content)
@@ -1623,6 +1656,9 @@ def main() -> int:
     parser.add_argument("--apply", action="store_true",
                         help="with --supervise: write the approved output's path-labeled "
                              "fenced code blocks to disk under --root")
+    parser.add_argument("--apply-dry-run", action="store_true",
+                        help="with --apply: print what would be written without "
+                             "touching the disk")
     parser.add_argument("--root", default=".",
                         help="directory to apply files under (default: current directory)")
     parser.add_argument("--mode", choices=["hybrid", "local", "code"],
@@ -1700,14 +1736,14 @@ def main() -> int:
         return 0
 
     if args.models:
-        cfg = _load_config_quiet(args.config or _default_config_path())
+        cfg = _load_cfg(args)
         return _list_models(cfg["backends"]["local"]["base_url"])
 
     if args.route_only:
         if not args.task:
             print("error: --route-only requires --task", file=sys.stderr)
             return 2
-        cfg = _load_config_quiet(args.config or _default_config_path())
+        cfg = _load_cfg(args)
         agent = HybridAgent(cfg)
         context = args.context or ""
         memory = TaskMemory((cfg.get("memory") or {}).get("root")).memory_view(args.task)
@@ -1722,7 +1758,7 @@ def main() -> int:
         if not args.task or not args.code:
             print("error: --review requires --task and --code", file=sys.stderr)
             return 2
-        cfg = _load_config_quiet(args.config or _default_config_path())
+        cfg = _load_cfg(args)
         mode = _resolve_mode(args)
         if not MODES[mode]["api_supervision"]:
             _status(f"[hybrid] ⛔ refusal: mode={mode} has no API supervision (only hybrid enables it).")
@@ -1778,7 +1814,7 @@ def main() -> int:
         if not args.task:
             print("error: --supervise requires --task", file=sys.stderr)
             return 2
-        cfg = _load_config_quiet(args.config or _default_config_path())
+        cfg = _load_cfg(args)
         mode = _resolve_mode(args)
         if not MODES[mode]["api_supervision"]:
             _status(f"[hybrid] ⛔ refusal: mode={mode} has no API supervision (only hybrid enables it).")
@@ -1888,9 +1924,12 @@ def main() -> int:
         applied: list[tuple[str, int]] = []
         if args.apply and result.reason not in _UNSAFE_REASONS:
             tracker.start_phase("apply")
-            applied, skipped = _apply_fenced_files(result.final_text, args.root)
+            applied, skipped = _apply_fenced_files(result.final_text, args.root,
+                                                   dry_run=args.apply_dry_run)
+            verb = "DRY-RUN" if args.apply_dry_run else "APPLIED"
             for rel, nbytes in applied:
-                _status(f"[hybrid] ✓ APPLIED {rel} ({nbytes} B)")
+                _status(f"[hybrid] {verb} {rel} ({nbytes} B)"
+                        + (" [dry run]" if args.apply_dry_run else ""))
             if skipped:
                 _status(f"[hybrid] ⚠ skipped {len(skipped)} block(s): "
                         f"{', '.join(skipped[:3])}")
@@ -1982,7 +2021,9 @@ def main() -> int:
         else:
             print(_strip_confidence_tag(result.final_text))
             if applied:
-                print(f"\nAPPLIED {len(applied)} file(s) to {os.path.abspath(args.root)}:")
+                verb = "WOULD APPLY" if args.apply_dry_run else "APPLIED"
+                print(f"\n{verb} {len(applied)} file(s) to {os.path.abspath(args.root)}"
+                      + (" (dry run)" if args.apply_dry_run else "") + ":")
                 for rel, nbytes in applied:
                     print(f"  ✓ {rel} ({nbytes} B)")
             if verify_cmds:
@@ -2018,7 +2059,7 @@ def main() -> int:
         print("error: --local and --deepseek are mutually exclusive", file=sys.stderr)
         return 2
 
-    cfg = _load_config_quiet(args.config or _default_config_path())
+    cfg = _load_cfg(args)
     agent = HybridAgent(cfg)
     context = args.context or ""
     if args.context_scan:

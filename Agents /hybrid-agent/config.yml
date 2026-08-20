@@ -51,6 +51,11 @@ review:
   #     - ["npm run build", "npx tsc --noEmit", "npm run lint"]
   #     - ["npm test"]
   verify_groups: []
+  # Extra allowlisted verification command prefixes (case-insensitive), added to
+  # the built-in allowlist. Anything with a dangerous shell marker (rm, sudo, |,
+  # >, &&, ;, ...) is still blocked regardless of this list. Example:
+  #   verify_allowlist: ["docker compose build", "cargo check"]
+  verify_allowlist: []
   # Regression guard: full test suite run AFTER verification passes, to catch
   # fixes that break tests elsewhere. Empty = regression guard disabled.
   # Example: ["npm test", "python -m pytest"]

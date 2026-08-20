@@ -99,6 +99,65 @@ class TestApplyFencedFiles(unittest.TestCase):
             '/etc/hostname\n```txt\nx\n```', root=root)
         self.assertEqual(skipped, ["/etc/hostname (unsafe path)"])
 
+    def test_windows_drive_path_is_blocked(self):
+        root = self._tmp()
+        _, skipped = ask._apply_fenced_files(
+            'C:\\Users\\me\\evil.txt\n```txt\nx\n```', root=root)
+        self.assertEqual(skipped, ["C:\\Users\\me\\evil.txt (unsafe path)"])
+
+    def test_unc_path_is_blocked(self):
+        root = self._tmp()
+        _, skipped = ask._apply_fenced_files(
+            '\\\\server\\share\\evil.txt\n```txt\nx\n```', root=root)
+        self.assertEqual(skipped, ["\\\\server\\share\\evil.txt (unsafe path)"])
+
+    def test_dry_run_does_not_touch_disk(self):
+        root = self._tmp()
+        written, skipped = ask._apply_fenced_files(
+            'a.txt\n```txt\nhello\n```', root=root, dry_run=True)
+        self.assertEqual([rel for rel, _ in written], ["a.txt"])
+        self.assertEqual(skipped, [])
+        self.assertFalse((Path(root) / "a.txt").exists())
+
+    def test_dry_run_still_reports_overwrite_guard(self):
+        root = self._tmp()
+        text = ('a.txt\n```txt\nFIRST\n```\na.txt\n```txt\nSECOND\n```')
+        written, skipped = ask._apply_fenced_files(text, root=root, dry_run=True)
+        self.assertEqual(len(written), 1)
+        self.assertEqual(skipped, ["a.txt (duplicate block would overwrite)"])
+        self.assertFalse((Path(root) / "a.txt").exists())
+
+
+class TestVerifyAllowlist(unittest.TestCase):
+    """Config-driven verify allowlist extends the hardcoded one, never weakens it."""
+
+    def setUp(self):
+        ask._configure_verify_allowlist({"review": {"verify_allowlist": []}})
+
+    def tearDown(self):
+        ask._configure_verify_allowlist({"review": {"verify_allowlist": []}})
+
+    def test_extra_prefix_from_config_is_allowed(self):
+        self.assertFalse(ask._is_safe_verify_cmd("docker compose build"))
+        ask._configure_verify_allowlist(
+            {"review": {"verify_allowlist": ["docker compose build"]}})
+        self.assertTrue(ask._is_safe_verify_cmd("docker compose build"))
+        self.assertTrue(ask._is_safe_verify_cmd("docker compose build --no-cache"))
+
+    def test_stock_prefixes_still_allowed(self):
+        self.assertTrue(ask._is_safe_verify_cmd("npm run build"))
+
+    def test_dangerous_marker_blocks_even_allowlisted_prefix(self):
+        ask._configure_verify_allowlist(
+            {"review": {"verify_allowlist": ["npm run build"]}})
+        self.assertFalse(ask._is_safe_verify_cmd("npm run build && rm -rf /"))
+        self.assertFalse(ask._is_safe_verify_cmd("npm run build > /dev/null"))
+
+    def test_empty_string_and_missing_key(self):
+        ask._configure_verify_allowlist({})
+        self.assertFalse(ask._is_safe_verify_cmd(""))
+        self.assertFalse(ask._is_safe_verify_cmd("rm -rf /"))
+
 
 class TestClarifyHeuristic(unittest.TestCase):
     """FIX 3 regression: 'no questions needed' never aborts as TASK UNCLEAR."""
