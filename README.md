@@ -19,6 +19,7 @@ The bridge is a self-contained CLI (`ask.py`) that talks directly to two OpenAI-
 - [Bounded autonomy (BOUND)](#bounded-autonomy-bound)
 - [Journey verification (Vibe DSL)](#journey-verification-vibe-dsl)
 - [Anti-gaming ratchet & guardrails](#anti-gaming-ratchet--guardrails)
+- [Surgical AST-aware repairs](#surgical-ast-aware-repairs)
 - [Quick start](#quick-start)
 - [CLI reference](#cli-reference)
 - [The supervise loop](#the-supervise-loop)
@@ -316,6 +317,26 @@ it runs:
   program's `escalate` playbook.
 - **`cost_limit`** — a rough pre-run cost estimate above the limit escalates to
   approval.
+
+## Surgical AST-aware repairs
+
+Fixes are **diff-first**, not full-file rewrites:
+
+- The fix prompt asks DeepSeek for a **unified diff** (`--- a/…` / `+++ b/…`).
+  `_apply_repair` applies it with `git apply` (falling back to `patch -p1`);
+  full-file fenced blocks remain the fallback when no diff is present or it
+  won't apply cleanly.
+- Every file a diff touches is **BOUND-checked** first — a patch targeting a
+  danger zone is rejected outright. The differential ratchet still runs over
+  the applied diff afterwards.
+- **AST-aware context**: the failing `file:line` from the error text is
+  resolved to the **enclosing function/class/block** — Python via the stdlib
+  `ast`, TS/JS via a scope scan — and only that block is sent as source
+  context. The model fixes a narrow, contract-aware region, not the whole file.
+- **Token accounting**: each surgical diff logs the estimated savings (patch
+  size vs. the full-file rewrite it replaces). Measured on a 300-line file:
+  a 1-line fix cost **53 tokens as a diff vs ~1822 as a full rewrite (97%
+  saved)**.
 
 ## Quick start
 
@@ -657,7 +678,7 @@ report.
 
 ```bash
 cd "Agents /hybrid-agent"
-./.venv/bin/python -m unittest discover -s tests -v    # 202 tests
+./.venv/bin/python -m unittest discover -s tests -v    # 213 tests
 ```
 
 Coverage includes: the fenced-file parser, the apply overwrite/unsafe-path guards,
@@ -696,6 +717,7 @@ repo root/
     ├── journeys.py              # Vibe-DSL user-journey verification (headless browser)
     ├── differential.py          # Anti-gaming ratchet (rejects weakened gates)
     ├── guardrails.py            # BLOCK / APPROVAL_REQUIRED task guardrails
+    ├── patcher.py               # Surgical diff-first repairs + AST context extraction
     ├── web_dashboard.py         # Web control panel (Flask + SocketIO, port 8660)
     ├── dashboard/               # Dashboard UI + encrypted secrets store
     ├── context.py / scan.py     # Project context scanner

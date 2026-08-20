@@ -230,7 +230,7 @@ class TestJourneyGate(unittest.TestCase):
         def fake_journeys(file, timeout_s=30, screenshots_dir=None):
             return seq.pop(0) if seq else (True, "no more journeys")
 
-        def fake_fix(cloud, task, error_text, cache=None):
+        def fake_fix(cloud, task, error_text, cache=None, root="."):
             calls["fix"] += 1
             return fix_text
 

@@ -121,7 +121,7 @@ class TestProgramPhases(unittest.TestCase):
             err = errors_seq[min(calls["verify"] - 1, len(errors_seq) - 1)]
             return err
 
-        def fake_fix(cloud, task, error_text, cache=None):
+        def fake_fix(cloud, task, error_text, cache=None, root="."):
             calls["fix"] += 1
             return fix_text
 

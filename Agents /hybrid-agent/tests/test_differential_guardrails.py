@@ -114,7 +114,7 @@ class TestDifferentialGate(unittest.TestCase):
         def fake_analyze(root, paths=None):
             return seq.pop(0) if seq else []
 
-        def fake_fix(cloud, task, error_text, cache=None):
+        def fake_fix(cloud, task, error_text, cache=None, root="."):
             calls["fix"] += 1
             return fix_text
 

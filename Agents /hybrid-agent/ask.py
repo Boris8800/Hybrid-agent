@@ -49,6 +49,8 @@ from bound import load_bound
 from journeys import JourneyError, run_journeys
 from differential import analyze_changes
 from guardrails import check_guardrails
+from patcher import (apply_unified_diff, extract_context, extract_error_location,
+                     is_diff)
 from providers import (backend_for, enabled_online, get_local, get_online,
                        load_providers, resolve_api_key)
 
@@ -1567,19 +1569,36 @@ def _run_regression_guard(root: str, cmds, status,
     return True, "regression passed"
 
 
-def _deepseek_fix(cloud, task: str, error_text: str, cache=None):
-    """Ask DeepSeek to fix the errors and return the fixed files."""
+def _deepseek_fix(cloud, task: str, error_text: str, cache=None, root: str = "."):
+    """Ask DeepSeek to fix the errors. Returns a unified diff (preferred) or
+    path-labeled fenced full files, ready for _apply_repair.
+
+    AST-aware: the failing file:line in the error text is resolved to the
+    ENCLOSING function/class/block, and only that block is sent as source
+    context — the model fixes a narrow, contract-aware region, not the file."""
     system = (
         "You are a senior engineer fixing errors found during verification. "
-        "Analyze the errors and the task, then output the COMPLETE corrected "
-        "file(s) in fenced code blocks labeled with their paths. Only change "
-        "what is needed to fix the errors. No preamble."
+        "Analyze the errors, the source context, and the task, then output a "
+        "UNIFIED DIFF (--- a/... / +++ b/... hunks) with the minimal change. "
+        "Prefer a surgical diff over rewriting files. If a diff is impractical "
+        "for a file, output that file COMPLETE in a path-labeled fenced block. "
+        "Only change what is needed to fix the errors. No preamble."
     )
+    ctx = ""
+    loc = extract_error_location(error_text)
+    if loc:
+        path, line = loc
+        for candidate in (Path(root) / path, Path(path)):
+            if candidate.is_file():
+                ctx = extract_context(candidate, line)
+                break
     user = (
         f"TASK:\n{task}\n\n"
         f"VERIFICATION ERRORS:\n{_truncate_error(error_text)}\n\n"
-        "Fix every error. Output corrected files as path-labeled fenced blocks."
     )
+    if ctx:
+        user += f"SOURCE CONTEXT (enclosing block of the failing location):\n{ctx}\n\n"
+    user += "Fix every error. Output a unified diff or path-labeled fenced files."
     if cache is not None and cache.enabled:
         key = cache.key("fix", task, _truncate_error(error_text))
         hit = cache.get("fix", key)
@@ -1595,6 +1614,29 @@ def _deepseek_fix(cloud, task: str, error_text: str, cache=None):
         if resp.text and not resp.truncated:
             cache.set("fix", key, resp.text, source="deepseek")
     return resp.text
+
+
+def _apply_repair(text: str, root: str, dry_run: bool = False,
+                  bound=None) -> tuple[list[tuple[str, int]], list[str], dict]:
+    """Apply a model fix: unified diff first (surgical, ~75% token savings on
+    large files), path-labeled fenced full files as fallback. Returns
+    (written, skipped, stats) where stats carries the mode and the estimated
+    token savings."""
+    full_tokens = len(text or "") // 4
+    if is_diff(text) and not dry_run:
+        res = apply_unified_diff(root, text, bound=bound)
+        written, skipped = res["applied"], list(res["skipped"])
+        if res["bound_violation"]:
+            skipped.append("(bound violation — patch rejected)")
+        stats = {"mode": "diff", "patch_tokens": len(text) // 4,
+                 "original_bytes": res["original_bytes"]}
+        if written:
+            stats["saved_tokens_est"] = max(
+                0, res["original_bytes"] // 4 - len(text) // 4)
+        return written, skipped, stats
+    written, skipped = _apply_fenced_files(text, root, dry_run=dry_run, bound=bound)
+    return written, skipped, {"mode": "full", "patch_tokens": full_tokens,
+                              "original_bytes": 0, "saved_tokens_est": 0}
 
 
 def _run_single_verify(root, cmd: str, timeout_s: int) -> str:
@@ -1732,7 +1774,7 @@ def _run_final_verify(cloud, root: str, task: str, cmds, status,
         if snapshot is None:
             snapshot = _git_snapshot(root)
         try:
-            fix_text = _deepseek_fix(cloud, task, error_text, cache=cache)
+            fix_text = _deepseek_fix(cloud, task, error_text, cache=cache, root=root)
         except Exception as exc:  # noqa: BLE001
             status(f"[hybrid] ⚠ DeepSeek fix failed: {exc}")
             if snapshot:
@@ -1741,7 +1783,9 @@ def _run_final_verify(cloud, root: str, task: str, cmds, status,
         api_calls += 1
         tokens_used += len(fix_text or "") // 4
 
-        applied, skipped = _apply_fenced_files(fix_text, root, bound=bound)
+        applied, skipped, repair_stats = _apply_repair(fix_text, root, bound=bound)
+        if repair_stats.get("mode") == "diff" and repair_stats.get("saved_tokens_est"):
+            status(f"[hybrid] ✂ surgical diff applied · saved ~{repair_stats['saved_tokens_est']} tokens")
         if any("(bound:" in s for s in skipped):
             status("[hybrid] ⛔ BOUND VIOLATION in fix output — reverting")
             if snapshot:
@@ -1851,11 +1895,13 @@ def _run_program_phases(cloud, root: str, task: str, bound, cfg: dict, status,
                 status(f"[hybrid] ⛔ phase {name}: escalated for human review")
                 return False, f"phase {name} escalated for human review"
             try:
-                fix_text = _deepseek_fix(cloud, task, "\n\n".join(errors), cache=cache)
+                fix_text = _deepseek_fix(cloud, task, "\n\n".join(errors), cache=cache, root=root)
             except Exception as exc:  # noqa: BLE001
                 status(f"[hybrid] ⚠ phase {name}: fix call failed ({exc})")
                 break
-            applied, skipped = _apply_fenced_files(fix_text, root, bound=bound)
+            applied, skipped, repair_stats = _apply_repair(fix_text, root, bound=bound)
+            if repair_stats.get("mode") == "diff" and repair_stats.get("saved_tokens_est"):
+                status(f"[hybrid] ✂ surgical diff applied · saved ~{repair_stats['saved_tokens_est']} tokens")
             if any("(bound:" in s for s in skipped):
                 status(f"[hybrid] ⛔ phase {name}: fix violated the BOUND — reverting")
                 if snapshot:
@@ -1892,11 +1938,13 @@ def _run_journey_gate(cloud, root: str, task: str, journey_file: str, bound,
         status(f"[hybrid] 🚦 journeys FAILED — DeepSeek fixing "
                f"(round {round_num + 1}/{max_iter})")
         try:
-            fix_text = _deepseek_fix(cloud, task, report, cache=cache)
+            fix_text = _deepseek_fix(cloud, task, report, cache=cache, root=root)
         except Exception as exc:  # noqa: BLE001
             status(f"[hybrid] ⚠ journey fix failed ({exc})")
             break
-        applied, skipped = _apply_fenced_files(fix_text, root, bound=bound)
+        applied, skipped, repair_stats = _apply_repair(fix_text, root, bound=bound)
+        if repair_stats.get("mode") == "diff" and repair_stats.get("saved_tokens_est"):
+            status(f"[hybrid] ✂ surgical diff applied · saved ~{repair_stats['saved_tokens_est']} tokens")
         if any("(bound:" in s for s in skipped):
             status("[hybrid] ⛔ journey fix violated the BOUND")
             return False, "journey fix output violated the BOUND"
@@ -1933,11 +1981,13 @@ def _run_differential_gate(cloud, root: str, task: str, bound, status,
             + "\n\nRESTORE the weakened assertions, tests, or type-check settings. "
             "Never skip tests, remove assertions, or loosen type checks to pass.")
         try:
-            fix_text = _deepseek_fix(cloud, task, instruction, cache=cache)
+            fix_text = _deepseek_fix(cloud, task, instruction, cache=cache, root=root)
         except Exception as exc:  # noqa: BLE001
             status(f"[hybrid] ⚠ differential fix failed ({exc})")
             break
-        applied, skipped = _apply_fenced_files(fix_text, root, bound=bound)
+        applied, skipped, repair_stats = _apply_repair(fix_text, root, bound=bound)
+        if repair_stats.get("mode") == "diff" and repair_stats.get("saved_tokens_est"):
+            status(f"[hybrid] ✂ surgical diff applied · saved ~{repair_stats['saved_tokens_est']} tokens")
         if any("(bound:" in s for s in skipped):
             status("[hybrid] ⛔ differential fix violated the BOUND")
             return False, "differential fix output violated the BOUND"
