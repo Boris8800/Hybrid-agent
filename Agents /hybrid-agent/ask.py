@@ -31,11 +31,11 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import date, datetime, timedelta
 
 from backends.base import BackendError, ModelRequest, ModelResponse
-from backends.local_gemma import GemmaBackend
+from backends.local_qwen import QwenBackend
 
 from agent import HybridAgent, _load_config, apply_env_overrides
 from backends.deepseek import _resolve_api_key
-from supervise import (GEMMA_MAX_TOKENS, ChainOfThoughtParser, ReviewPackage,
+from supervise import (QWEN_MAX_TOKENS, ChainOfThoughtParser, ReviewPackage,
                        SuperviseResult, Verdict, _enhance_request,
                        _supervisor_request, parse_enhancement, parse_verdict,
                        supervise)
@@ -63,7 +63,7 @@ from providers import (backend_for, enabled_online, get_local, get_online,
 # --- Self-heal: loading config.yml requires PyYAML + openai, which exist only
 # in the project venv (hybrid-agent/.venv). When invoked with a system python3
 # that lacks them, ask.py silently fell back to embedded defaults (10s local
-# timeout, unloaded model id "gemma-4-12b") - the root cause of slow and
+# timeout, unloaded model id "qwen2.5-coder-14b-instruct-mlx") - the root cause of slow and
 # truncated local generations. Re-exec with the venv interpreter instead.
 # Guarded by env var so the re-exec cannot loop, and by __name__ so importing
 # ask.py from tests / other tools (which must never replace the process) is safe.
@@ -286,7 +286,7 @@ class CacheManager:
         except (OSError, ValueError, KeyError):
             return None
 
-    def set(self, kind: str, key: str, text: str, source: str = "gemma") -> None:
+    def set(self, kind: str, key: str, text: str, source: str = "qwen") -> None:
         """Store text (never empty) and prune the oldest entries past the cap."""
         if not self.enabled or not text:
             return
@@ -662,7 +662,7 @@ def _http_generate(base_url: str, api_key: str, model: str, req: ModelRequest,
     Streams generated tokens live to stderr (so the user sees the local model
     working as it writes), while still returning the full text for stdout.
     """
-    from backends.local_gemma import mlx_chat_request, mlx_chat_stream
+    from backends.local_qwen import mlx_chat_request, mlx_chat_stream
     last: Exception | None = None
     for attempt in range(3):
         try:
@@ -695,7 +695,7 @@ def _http_generate(base_url: str, api_key: str, model: str, req: ModelRequest,
                 text=text, raw=res["raw"],
                 token_usage=res["token_usage"],
                 latency_ms=res.get("latency_ms", (time.monotonic() - started) * 1000),
-                backend="local-gemma",
+                backend="local-qwen",
                 truncated=res["truncated"],
             )
         except Exception as exc:  # noqa: BLE001 - retry then surface
@@ -1040,14 +1040,33 @@ def _generate_with_retry(agent: HybridAgent, cfg: dict, args: argparse.Namespace
                 req.system = sys_res.redacted
     cap = LOCAL_MAX_OUTPUT_TOKENS if route == "local" else MAX_OUTPUT_TOKENS
     resp = _generate(agent, cfg, args, route, req, stream=stream)
-    if resp.truncated and resp.text and req.max_tokens < cap:
-        req.max_tokens = min(req.max_tokens * 2, cap)
-        req.timeout_s = int(req.timeout_s * 1.5)
-        _status(f"[hybrid] ⚠ TRUNCATED at {req.max_tokens // 2} tokens - "
-                f"retrying once with {req.max_tokens}")
-        resp = _generate(agent, cfg, args, route, req, stream=stream)
-        if resp.truncated:
-            _status("[hybrid] ⚠ still truncated after retry - output is incomplete, do not apply blindly")
+    if resp.truncated and resp.text:
+        if route == "local":
+            # The local MLX server rejects max_tokens, so a bigger budget is a
+            # no-op; the model is stateless across calls, so recover by feeding
+            # the tail of the cut-off output and asking for a pure continuation.
+            tail = resp.text[-1200:]
+            req.user += (
+                "\n\nA previous attempt was truncated mid-output. It ended with:\n"
+                f"--- TRUNCATED TAIL ---\n{tail}\n--- END ---\n"
+                "Continue EXACTLY from where that output stopped. Do not repeat "
+                "anything already written above. Output only the missing remainder."
+            )
+            req.timeout_s = int(req.timeout_s * 1.5)
+            _status("[hybrid] ⚠ local output TRUNCATED - retrying once with a "
+                    "continuation prompt")
+            resp = _generate(agent, cfg, args, route, req, stream=stream)
+            if resp.truncated:
+                _status("[hybrid] ⚠ still truncated after continuation - "
+                        "output is incomplete, do not apply blindly")
+        elif req.max_tokens < cap:
+            req.max_tokens = min(req.max_tokens * 2, cap)
+            req.timeout_s = int(req.timeout_s * 1.5)
+            _status(f"[hybrid] ⚠ TRUNCATED at {req.max_tokens // 2} tokens - "
+                    f"retrying once with {req.max_tokens}")
+            resp = _generate(agent, cfg, args, route, req, stream=stream)
+            if resp.truncated:
+                _status("[hybrid] ⚠ still truncated after retry - output is incomplete, do not apply blindly")
     if route == "deepseek":
         tok = _normalize_tokens(resp.token_usage)
         StatsTracker().record_tokens(
@@ -1066,14 +1085,14 @@ def _format_tokens(resp: ModelResponse) -> dict:
     return tokens
 
 
-def _supervise_gemma_generate(cfg: dict, model_override: str | None,
+def _supervise_qwen_generate(cfg: dict, model_override: str | None,
                               local_provider: str | None = None):
     """Return a streaming wrapper for the supervise loop's local step.
 
     Always streams the local model's output live to stderr (via the HTTP path)
     so the user can SEE the local model working in every iteration, then
     returns the full accumulated text for the review package. Uses the selected
-    local provider (defaults to the legacy backends.local). gemma4 thinking
+    local provider (defaults to the legacy backends.local). qwen thinking
     mode can legitimately take 1-2 minutes, so the provider timeout is applied
     to every request.
     """
@@ -1225,7 +1244,7 @@ def _enhance_task(agent: HybridAgent, cfg: dict, args: argparse.Namespace,
     ask the user to adjust the prompt (re-enhancing up to MAX_CLARIFY_ROUNDS),
     otherwise we stop and report that clarification is needed.
 
-    Returns (task_for_gemma, enhancement, clar_needed). Raises on generation
+    Returns (task_for_qwen, enhancement, clar_needed). Raises on generation
     failure so the caller handles it.
     """
     current = task
@@ -1287,14 +1306,14 @@ def _enhance_task(agent: HybridAgent, cfg: dict, args: argparse.Namespace,
         current = current + "\n\nUSER CLARIFICATION:\n" + answer
         _status(f"[hybrid] ↻ clarification #{round_num + 1} received — re-enhancing")
 
-    task_for_gemma = (
+    task_for_qwen = (
         enhancement.enhanced_prompt
         if enhancement and enhancement.enhanced
         else current
     )
     if not args.json:
         print("\n--- sending enhanced prompt to local model ---\n")
-    return (task_for_gemma, enhancement, False)
+    return (task_for_qwen, enhancement, False)
 
 
 def _scan_project_context(root: str, task: str = "") -> str:
@@ -1341,9 +1360,9 @@ def _run_parallel(agent: HybridAgent, cfg: dict, args: argparse.Namespace,
     analyzer = DependencyAnalyzer(steps)
     groups = analyzer.get_parallel_groups()
     executor = ParallelExecutor(
-        _supervise_gemma_generate(cfg, args.model, local_provider=args.local_provider),
+        _supervise_qwen_generate(cfg, args.model, local_provider=args.local_provider),
         max_workers=args.parallel_workers,
-        max_tokens=args.max_tokens or GEMMA_MAX_TOKENS,
+        max_tokens=args.max_tokens or QWEN_MAX_TOKENS,
     )
     texts: list[str] = []
     for group in groups:
@@ -2148,7 +2167,7 @@ def _select_backend(agent: HybridAgent, cfg: dict, route: str,
         return backend_for(lp)
     lc = cfg["backends"]["local"]
     model = model_override or lc["model"]
-    return GemmaBackend(
+    return QwenBackend(
         lc["base_url"], model,
         timeout_s=lc["timeout_s"], max_retries=lc["max_retries"],
     )
@@ -2291,7 +2310,7 @@ def main() -> int:
     parser.add_argument("--stream", action="store_true",
                         help="stream the local model's output live to stderr")
     parser.add_argument("--supervise", action="store_true",
-                        help="Gemma-primary / DeepSeek-supervisor loop: Gemma implements, "
+                        help="Qwen-primary / DeepSeek-supervisor loop: Qwen implements, "
                              "DeepSeek reviews a compact package, loop until APPROVED "
                              "(default max 3 iterations)")
     parser.add_argument("--enhance", action="store_true",
@@ -2395,7 +2414,7 @@ def main() -> int:
                         help="scan the project (structure, dependencies, architecture, "
                              "coding standards, code examples) and inject the rendered "
                              "context into the enhancement/supervise flow so DeepSeek "
-                             "and Gemma understand the codebase")
+                             "and Qwen understand the codebase")
     parser.add_argument("--cot", action="store_true",
                         help="chain-of-thought planning: DeepSeek shows TASK "
                              "UNDERSTANDING, CONSTRAINT ANALYSIS, and ALTERNATIVES "
@@ -2620,7 +2639,7 @@ def main() -> int:
 
         # BOUND (Ouro Loop): hard constraints enforced at runtime (danger zones,
         # never_do, iron laws). RECALL gate: the BOUND is re-injected into the
-        # context (enhance + review package) and every Gemma iteration.
+        # context (enhance + review package) and every Qwen iteration.
         bound = None if args.no_bound else load_bound(cfg)
         bound_text = bound.prompt_text() if bound is not None else ""
         # Engineering rules: per-project constitution (.agent/engineering-rules.yml).
@@ -2643,20 +2662,20 @@ def main() -> int:
             _status("[hybrid] 🧱 BOUND active (danger zones, never_do, iron laws)")
             context = (context + "\n\n" + bound_text).strip() if context else bound_text
 
-        # --enhance: DeepSeek enhances the task and plans around Gemma's limits
-        # BEFORE Gemma implements. The improved prompt + reasoning + plan are
+        # --enhance: DeepSeek enhances the task and plans around Qwen's limits
+        # BEFORE Qwen implements. The improved prompt + reasoning + plan are
         # shown (and DeepSeek asks for clarification if the task is unclear),
-        # then the enhanced prompt is what Gemma implements. Critical tasks
+        # then the enhanced prompt is what Qwen implements. Critical tasks
         # force enhancement even without an explicit --enhance.
         enhancement = None
-        task_for_gemma = args.task
+        task_for_qwen = args.task
         do_enhance = args.enhance or plan == "critical"
         if do_enhance:
             if plan == "critical" and not args.enhance:
                 _status("[hybrid] 🧭 critical plan — forcing prompt enhancement")
             tracker.start_phase("enhance")
             try:
-                task_for_gemma, enhancement, clar_needed = _enhance_task(
+                task_for_qwen, enhancement, clar_needed = _enhance_task(
                     agent, cfg, args, args.task, context, cache=cache)
             except BudgetExceeded as exc:
                 _status("[hybrid] ⛔ deepseek (prompt enhancer) skipped: daily token budget exhausted")
@@ -2709,7 +2728,7 @@ def main() -> int:
             return ReviewPackage(
                 task=task,
                 plan=enhancement.plan if enhancement else "",
-                changes=f"Gemma output (iteration {iteration}):\n{code}",
+                changes=f"Qwen output (iteration {iteration}):\n{code}",
                 uncertainties=context,
                 verification="None supplied — caller can pass --context with test/lint results.",
                 diff=_current_diff(args.root),
@@ -2734,17 +2753,17 @@ def main() -> int:
                           file=sys.stderr)
                     return 3
                 result = _run_parallel(
-                    agent, cfg, args, cloud, task_for_gemma, enhancement, context,
+                    agent, cfg, args, cloud, task_for_qwen, enhancement, context,
                     review=(plan != "local_first"))
             else:
                 result = supervise(
                     local, cloud,
-                    task=task_for_gemma,
+                    task=task_for_qwen,
                     package_builder=_pkg,
                     max_iterations=args.max_iterations,
-                    gemma_generate=_supervise_gemma_generate(cfg, args.model, local_provider=args.local_provider),
+                    qwen_generate=_supervise_qwen_generate(cfg, args.model, local_provider=args.local_provider),
                     status=lambda line: tracker.tick(line),
-                    gemma_max_tokens=args.max_tokens or GEMMA_MAX_TOKENS,
+                    qwen_max_tokens=args.max_tokens or QWEN_MAX_TOKENS,
                     review=(plan != "local_first"),
                     terminal_tool=_make_terminal_tool(cfg, args, bound=bound),
                     max_terminal_rounds=args.terminal_rounds,
@@ -3060,7 +3079,7 @@ def main() -> int:
     cache = None if args.no_cache else CacheManager(cfg, args)
 
     # --enhance (standalone, local route): DeepSeek enhances the prompt and plans
-    # around Gemma's limits, shows the improved prompt + reasoning + plan (and
+    # around Qwen's limits, shows the improved prompt + reasoning + plan (and
     # asks for clarification if the task is unclear), then the ENHANCED prompt
     # is what the local model implements.
     if args.enhance:
@@ -3073,7 +3092,7 @@ def main() -> int:
             print("error: --enhance is for the local route; use --local or MODE=hybrid/local.", file=sys.stderr)
             return 3
         try:
-            task_for_gemma, enhancement, clar_needed = _enhance_task(
+            task_for_qwen, enhancement, clar_needed = _enhance_task(
                 agent, cfg, args, args.task, context, cache=cache)
         except BudgetExceeded as exc:
             _status("[hybrid] ⛔ deepseek (prompt enhancer) skipped: daily token budget exhausted")
@@ -3092,7 +3111,7 @@ def main() -> int:
                   "questions.", file=sys.stderr)
             return 4
         if enhancement.enhanced:
-            args.task = task_for_gemma
+            args.task = task_for_qwen
 
     req = _build_request(agent, args, route, context)
     cached_text = None

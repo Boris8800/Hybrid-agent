@@ -38,12 +38,46 @@ def _mlx_body(model: str, system: str, user: str, stream: bool,
     return body
 
 
-def _mlx_result(payload: dict, max_tokens: int) -> dict:
+_LENGTH_REASONS = {
+    "length", "max_tokens", "truncated", "context_length",
+    "context_window", "max_length", "stop_length",
+}
+
+
+def _mlx_result(payload: dict, max_tokens: int, *, saw_end_event: bool = True,
+                stream_eof: bool = False) -> dict:
+    """Normalize an MLX response; detect truncation for ANY loaded local model.
+
+    LM Studio's /api/v1/chat rejects `max_tokens` (so budgets are advisory) and
+    does not always include a finish_reason, so truncation is detected from every
+    available signal, generically — no model name is assumed:
+      - an explicit finish/stop reason field when the server provides one;
+      - output tokens reaching the requested budget (servers that accept it);
+      - a stream that ended without the server's message.end/chat.end event
+        (premature close = output was cut off);
+      - an unbalanced fenced code block, the classic mid-file cut signature.
+    """
     stats = payload.get("stats") or {}
     output = payload.get("output") or []
     text = "".join(item.get("content", "") for item in output
                    if isinstance(item, dict) and item.get("type") == "message")
     used = int(stats.get("total_output_tokens", 0) or 0)
+
+    raw_finish = (payload.get("finish_reason") or payload.get("stop_reason")
+                  or stats.get("finish_reason") or stats.get("stop_reason"))
+    finish = str(raw_finish or "").strip().lower()
+    truncated = bool(finish) and finish in _LENGTH_REASONS
+    if not truncated and max_tokens and used >= max_tokens:
+        truncated = True
+    if not truncated and stream_eof and text:
+        truncated = True
+    if not truncated and text.count("```") % 2 == 1:
+        truncated = True
+    # Diagnostic note so the reason is visible in logs / status lines.
+    reason = "server_finish_reason"
+    if truncated and not finish:
+        reason = ("max_tokens_reached" if max_tokens and used >= max_tokens
+                  else "stream_eof" if stream_eof else "unbalanced_code_fence")
     return {
         "text": text,
         "token_usage": {
@@ -51,7 +85,9 @@ def _mlx_result(payload: dict, max_tokens: int) -> dict:
             "completion_tokens": used,
             "total_tokens": int(stats.get("input_tokens", 0) or 0) + used,
         },
-        "truncated": False,  # no max_tokens sent -> the model stops at its own EOS
+        "truncated": truncated,
+        "truncate_reason": reason if truncated else "",
+        "saw_end_event": saw_end_event,
         "raw": json.dumps(payload) if isinstance(payload, dict) else "",
     }
 
@@ -99,6 +135,7 @@ def mlx_chat_stream(base_url: str, api_key: str, model: str,
                  "Authorization": f"Bearer {api_key}"})
     parts: list[str] = []
     stats: dict = {}
+    saw_end = False
     started = time.monotonic()
     try:
         with urllib.request.urlopen(req, timeout=timeout_s) as resp:
@@ -117,6 +154,7 @@ def mlx_chat_stream(base_url: str, api_key: str, model: str,
                 if etype == "message.delta":
                     parts.append(ev.get("content", "") or "")
                 elif etype in ("chat.end", "message.end"):
+                    saw_end = True
                     stats = ev.get("stats") or stats
     except urllib.error.HTTPError as exc:
         raise BackendError(f"local {model} HTTP {exc.code}: "
@@ -125,16 +163,17 @@ def mlx_chat_stream(base_url: str, api_key: str, model: str,
     except Exception as exc:  # noqa: BLE001
         raise BackendError(f"local {model} stream failed: {exc}", retryable=True)
     result = _mlx_result({"output": [{"type": "message", "content": "".join(parts)}],
-                          "stats": stats}, max_tokens)
+                          "stats": stats}, max_tokens,
+                         saw_end_event=saw_end, stream_eof=not saw_end)
     result["latency_ms"] = (time.monotonic() - started) * 1000
     return result
 
 
-class GemmaBackend(Backend):
-    name = "local-gemma"
+class QwenBackend(Backend):
+    name = "local-qwen"
 
     def __init__(self, base_url: str, model: str, *, api_key: str = "lm-studio",
-                 name: str = "local-gemma", timeout_s: float = 180.0,
+                 name: str = "local-qwen", timeout_s: float = 180.0,
                  max_retries: int = 3, backoff_s: list[float] | None = None,
                  cold_start_wait_s: float = 30.0, exclude_keys: tuple = (),
                  extra_body: dict | None = None):

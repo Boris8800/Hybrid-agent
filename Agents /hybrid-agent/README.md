@@ -1,7 +1,7 @@
 # hybrid-agent
 
 Bridge CLI that lets a coding agent delegate work out-of-band to two external
-models — a local LM Studio model (Gemma) and the DeepSeek cloud API. Gemma
+models — a local LM Studio model (Qwen) and the DeepSeek cloud API. Qwen
 implements, DeepSeek supervises, with routing, prompt enhancement, parallel
 step execution, caching, token budgeting, persistent memory, and a hardened
 file-application engine.

@@ -165,10 +165,10 @@ class TestAuditor(unittest.TestCase):
 
 
 class TestContractThreading(unittest.TestCase):
-    def test_contract_reaches_gemma(self):
+    def test_contract_reaches_qwen(self):
         users = []
 
-        def fake_gemma(req):
+        def fake_qwen(req):
             users.append(req.user)
             return ModelResponse(text="```\napp.ts\nx\n```", backend="local")
 
@@ -179,7 +179,7 @@ class TestContractThreading(unittest.TestCase):
                          "=== OVERALL ASSESSMENT ===\nOK",
                     backend="deepseek")
 
-        supervise(local=None, cloud=_Cloud(), task="t", gemma_generate=fake_gemma,
+        supervise(local=None, cloud=_Cloud(), task="t", qwen_generate=fake_qwen,
                   contract_text="TASK CONTRACT:\nGoal: enforce the minimum price",
                   source_context="RELEVANT SOURCE:\nprice.ts\n", status=lambda line: None)
         self.assertTrue(any("TASK CONTRACT:" in s and "minimum price" in s

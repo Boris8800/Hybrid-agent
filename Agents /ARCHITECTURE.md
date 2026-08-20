@@ -1,17 +1,17 @@
-# Hybrid Coding Agent — Gemma 4 12B (Local) + DeepSeek API (Cloud)
+# Hybrid Coding Agent — Qwen 14B (Local) + DeepSeek API (Cloud)
 
 ## 1. Design Goals & Constraints
 
 | Goal | Target |
 |---|---|
-| Local task containment | 90–95% of all coding tasks handled by Gemma 4 12B (LM Studio) |
+| Local task containment | 90–95% of all coding tasks handled by Qwen 14B (LM Studio) |
 | DeepSeek usage | Only archetype tasks (see §3) + always-on post-edit review |
 | API cost | Minimized — send only summaries/diffs, never full file dumps |
 | Latency | Local ≤ 1–3s typical; DeepSeek only on slow path |
 | Quality | Every code change is reviewed by DeepSeek before acceptance |
 | Maintainability | Modular pipeline with clear interfaces (see §10) |
 
-**Why it works:** Gemma 4 12B is strong at well-specified, mechanical, and
+**Why it works:** Qwen 14B is strong at well-specified, mechanical, and
 localized edits (regenerate a function, fix a lint error, write a test for a
 given shape). DeepSeek is strong at open-ended, multi-step, causality-heavy
 reasoning. The router exploits this split.
@@ -23,7 +23,7 @@ reasoning. The router exploits this split.
 ```mermaid
 flowchart LR
     U[User / IDE] --> R[Router]
-    R -->|confidence ≥ threshold| LO[LM Studio<br/>Gemma 4 12B]
+    R -->|confidence ≥ threshold| LO[LM Studio<br/>Qwen 14B]
     R -->|confidence < threshold / archetype match| DC[DeepSeek API]
     LO --> C[Change Set]
     DC --> C
@@ -124,7 +124,7 @@ Escalate when any of the following occurs:
 2. Local output fails compile / lint / tests.
 3. Reviewer rejects the change (see §6).
 4. Local produces an empty or trivial diff after N retries.
-5. Local self-reports low confidence (Gemma is prompted to emit a `confidence` field; < 0.6 triggers escalation *before* DeepSeek review).
+5. Local self-reports low confidence (Qwen is prompted to emit a `confidence` field; < 0.6 triggers escalation *before* DeepSeek review).
 
 Escalation message to DeepSeek = **original request + evidence of failure** (error message, failing test output, attempted diff), never the full file.
 
@@ -134,7 +134,7 @@ Escalation message to DeepSeek = **original request + evidence of failure** (err
 
 ### 4.1 System prompts
 
-#### Gemma (local) system prompt
+#### Qwen (local) system prompt
 
 ```
 You are a precise senior software engineer operating in a local, low-latency
@@ -370,7 +370,7 @@ sequenceDiagram
     participant RD as Router
     participant CL as Classifier
     participant CS as Confidence
-    participant LM as Gemma (LM Studio)
+    participant LM as Qwen (LM Studio)
     participant RV as Reviewer (DeepSeek)
     participant M as Memory
 
@@ -416,7 +416,7 @@ sequenceDiagram
 
 ```mermaid
 sequenceDiagram
-    participant LM as Gemma
+    participant LM as Qwen
     participant RD as Router
     participant M as Memory
     participant DK as DeepSeek Planner
@@ -452,7 +452,7 @@ hybrid-agent/
 ├── backends/
 │   ├── __init__.py
 │   ├── base.py              # Backend ABC (generate())
-│   ├── local_gemma.py       # LM Studio client, retry/smart-parse (§8.1)
+│   ├── local_qwen.py       # LM Studio client, retry/smart-parse (§8.1)
 │   ├── deepseek.py          # DeepSeek client, JSON-forcing (§8.2)
 │   └── circuit_breaker.py   # rolling error rates (§8.3)
 ├── review/

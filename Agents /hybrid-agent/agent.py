@@ -17,7 +17,7 @@ import time
 from backends.base import Backend, ModelRequest
 from backends.circuit_breaker import CircuitBreaker
 from backends.deepseek import DeepSeekBackend
-from backends.local_gemma import GemmaBackend
+from backends.local_qwen import QwenBackend
 from memory import TaskMemory, TaskRecord, memory_root_from_cfg
 from embed import memory_embed_callable
 from providers import backend_for, get_local, get_online, load_providers
@@ -99,7 +99,7 @@ class HybridAgent:
                 # No enabled providers: fall back to the legacy backends section.
                 lc = self.cfg["backends"]["local"]
                 dc = self.cfg["backends"]["deepseek"]
-                self._local = GemmaBackend(
+                self._local = QwenBackend(
                     lc["base_url"], lc["model"],
                     api_key=lc.get("api_key") or "lm-studio",
                     timeout_s=lc["timeout_s"], max_retries=lc["max_retries"],
@@ -279,7 +279,7 @@ def apply_env_overrides(cfg: dict) -> dict:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Hybrid coding agent (Gemma 4 12B + DeepSeek)")
+    parser = argparse.ArgumentParser(description="Hybrid coding agent (Qwen 14B + DeepSeek)")
     parser.add_argument("--task", required=True, help="coding task description")
     parser.add_argument("--file", help="(optional) primary file affected")
     parser.add_argument("--config", help="optional YAML config override")

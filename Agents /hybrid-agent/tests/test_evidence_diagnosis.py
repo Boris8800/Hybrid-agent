@@ -123,7 +123,7 @@ class TestUnknownLoopInSupervise(unittest.TestCase):
     def test_unknown_collects_evidence_then_approves(self):
         calls = {"cloud": 0}
 
-        def fake_gemma(req):
+        def fake_qwen(req):
             return ModelResponse(text="```\napp.ts\nx\n```", backend="local")
 
         class _Cloud:
@@ -134,14 +134,14 @@ class TestUnknownLoopInSupervise(unittest.TestCase):
                     backend="deepseek")
 
         result = supervise(local=None, cloud=_Cloud(), task="t",
-                           gemma_generate=fake_gemma,
+                           qwen_generate=fake_qwen,
                            evidence_provider=lambda: "npm test -> 47 passed",
                            status=lambda line: None)
         self.assertEqual(result.verdicts[-1].decision, "APPROVED")
         self.assertEqual(calls["cloud"], 2)
 
     def test_unknown_without_evidence_escalates(self):
-        def fake_gemma(req):
+        def fake_qwen(req):
             return ModelResponse(text="```\napp.ts\nx\n```", backend="local")
 
         class _Cloud:
@@ -149,7 +149,7 @@ class TestUnknownLoopInSupervise(unittest.TestCase):
                 return ModelResponse(text=_UNKNOWN_EV, backend="deepseek")
 
         result = supervise(local=None, cloud=_Cloud(), task="t",
-                           gemma_generate=fake_gemma,
+                           qwen_generate=fake_qwen,
                            evidence_provider=lambda: None, status=lambda line: None)
         self.assertEqual(result.reason, "unknown_evidence")
         self.assertEqual(result.verdicts[-1].decision, "UNKNOWN")

@@ -1,6 +1,6 @@
 """Truncation-hardening tests for the hybrid-agent supervise flow.
 
-Covers the guarantee: Gemma emits ALL files in one response, truncation is
+Covers the guarantee: Qwen emits ALL files in one response, truncation is
 retried once with a doubled budget, a truncated DeepSeek fallback is never
 applied, and FIX_REQUIRED -> APPROVED loops work end to end.
 
@@ -18,8 +18,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from backends.base import ModelResponse  # noqa: E402
 from supervise import (  # noqa: E402
-    GEMMA_MAX_TOKENS,
-    GEMMA_MAX_TOKENS_CAP,
+    QWEN_MAX_TOKENS,
+    QWEN_MAX_TOKENS_CAP,
     _cloud_generate_guarded,
     supervise,
 )
@@ -56,7 +56,7 @@ class TruncationRetryTests(unittest.TestCase):
         """Truncated at 8192 -> retried at 16384 -> full output -> APPROVED."""
         calls = []
 
-        def gemma(req):
+        def qwen(req):
             calls.append(req.max_tokens)
             if len(calls) == 1:
                 return ModelResponse(text="partial...", truncated=True)
@@ -64,25 +64,25 @@ class TruncationRetryTests(unittest.TestCase):
 
         cloud = FakeCloud()
         res = supervise(local=object(), cloud=cloud, task="build 10 files",
-                        gemma_generate=gemma, status=lambda l: None)
-        self.assertEqual(calls, [GEMMA_MAX_TOKENS, GEMMA_MAX_TOKENS_CAP])
+                        qwen_generate=qwen, status=lambda l: None)
+        self.assertEqual(calls, [QWEN_MAX_TOKENS, QWEN_MAX_TOKENS_CAP])
         self.assertTrue(res.final_text.startswith("```main.py"))
         self.assertEqual(res.verdicts[0].decision, "APPROVED")
         self.assertFalse(res.escalated)
 
     def test_always_truncated_retries_once_then_escalates(self):
-        """Never truncating-free: exactly 2 Gemma calls, then escalate; the
+        """Never truncating-free: exactly 2 Qwen calls, then escalate; the
         reviewer must never see incomplete code."""
         calls = []
 
-        def gemma(req):
+        def qwen(req):
             calls.append(req.max_tokens)
             return ModelResponse(text="cut...", truncated=True)
 
         cloud = FakeCloud(verdicts=[_approved()])
         res = supervise(local=object(), cloud=cloud, task="big task",
-                        gemma_generate=gemma, status=lambda l: None)
-        self.assertEqual(calls, [GEMMA_MAX_TOKENS, GEMMA_MAX_TOKENS_CAP])
+                        qwen_generate=qwen, status=lambda l: None)
+        self.assertEqual(calls, [QWEN_MAX_TOKENS, QWEN_MAX_TOKENS_CAP])
         self.assertTrue(res.escalated)
         self.assertEqual(res.reason, "local_truncation_escalation")
         self.assertEqual(len(res.verdicts), 0, "reviewer must not see truncated code")
@@ -92,42 +92,42 @@ class TruncationRetryTests(unittest.TestCase):
         single same-budget retry instead of immediate escalation."""
         calls = []
 
-        def gemma(req):
+        def qwen(req):
             calls.append(req.max_tokens)
             if len(calls) == 1:
                 return ModelResponse(text="partial", truncated=True)
             return ModelResponse(text="full", truncated=False)
 
         res = supervise(local=object(), cloud=FakeCloud(), task="t",
-                        gemma_generate=gemma, status=lambda l: None,
-                        gemma_max_tokens=GEMMA_MAX_TOKENS_CAP)
-        self.assertEqual(calls, [GEMMA_MAX_TOKENS_CAP, GEMMA_MAX_TOKENS_CAP])
+                        qwen_generate=qwen, status=lambda l: None,
+                        qwen_max_tokens=QWEN_MAX_TOKENS_CAP)
+        self.assertEqual(calls, [QWEN_MAX_TOKENS_CAP, QWEN_MAX_TOKENS_CAP])
         self.assertEqual(res.final_text, "full")
 
     def test_no_truncation_single_call(self):
         calls = []
         res = supervise(
             local=object(), cloud=FakeCloud(), task="small",
-            gemma_generate=lambda req: (calls.append(1)
+            qwen_generate=lambda req: (calls.append(1)
                                         or ModelResponse(text="```a.py\nx\n```\n")),
             status=lambda l: None)
         self.assertEqual(len(calls), 1)
         self.assertEqual(res.verdicts[0].decision, "APPROVED")
 
     def test_fix_required_loop_then_approved(self):
-        """FIX_REQUIRED feeds fixes back to Gemma, second iteration APPROVED."""
-        gemma_calls = []
+        """FIX_REQUIRED feeds fixes back to Qwen, second iteration APPROVED."""
+        qwen_calls = []
         cloud = FakeCloud(verdicts=[_fix_required(), _approved()])
 
-        def gemma(req):
-            gemma_calls.append(req.max_tokens)
+        def qwen(req):
+            qwen_calls.append(req.max_tokens)
             return ModelResponse(text="```b.py\ncode\n```\n", truncated=False)
 
         res = supervise(local=object(), cloud=cloud, task="iter task",
-                        gemma_generate=gemma, status=lambda l: None)
+                        qwen_generate=qwen, status=lambda l: None)
         self.assertEqual([v.decision for v in res.verdicts], ["FIX_REQUIRED", "APPROVED"])
-        self.assertEqual(len(gemma_calls), 2)
-        self.assertEqual(gemma_calls, [GEMMA_MAX_TOKENS, GEMMA_MAX_TOKENS])
+        self.assertEqual(len(qwen_calls), 2)
+        self.assertEqual(qwen_calls, [QWEN_MAX_TOKENS, QWEN_MAX_TOKENS])
 
 
 class CloudFallbackTruncationTests(unittest.TestCase):
@@ -136,7 +136,7 @@ class CloudFallbackTruncationTests(unittest.TestCase):
         surface as cloud_fallback_truncated, which ask.py refuses to apply."""
         calls = []
 
-        def gemma(req):
+        def qwen(req):
             return ModelResponse(text="cut...", truncated=True)
 
         class AlwaysTruncatedCloud:
@@ -145,7 +145,7 @@ class CloudFallbackTruncationTests(unittest.TestCase):
                 return ModelResponse(text="incomplete", truncated=True)
 
         res = supervise(local=object(), cloud=AlwaysTruncatedCloud(), task="big",
-                        gemma_generate=gemma, status=lambda l: None)
+                        qwen_generate=qwen, status=lambda l: None)
         self.assertTrue(res.escalated)
         self.assertEqual(res.reason, "cloud_fallback_truncated")
         self.assertIn(res.reason, UNSAFE_REASONS, "ask.py must not --apply this")
@@ -162,11 +162,11 @@ class CloudFallbackTruncationTests(unittest.TestCase):
                     return ModelResponse(text="cut", truncated=True)
                 return ModelResponse(text="complete", truncated=False)
 
-        def gemma(req):
+        def qwen(req):
             return ModelResponse(text="cut...", truncated=True)
 
         res = supervise(local=object(), cloud=TruncatedOnceCloud(), task="big",
-                        gemma_generate=gemma, status=lambda l: None)
+                        qwen_generate=qwen, status=lambda l: None)
         self.assertEqual(len(calls), 2, "one retry at same budget")
         self.assertEqual(res.final_text, "complete")
         self.assertEqual(res.reason, "local_truncation_escalation")
@@ -233,18 +233,20 @@ class LocalLimitsAwarenessTests(unittest.TestCase):
         self.assertIn("IMPLEMENTER CONSTRAINTS", req.system)
         self.assertIn(str(LOCAL_CONTEXT_TOKENS), req.system)
         self.assertIn(str(LOCAL_OUTPUT_TOKENS), req.system)
-        self.assertIn("one response", req.system)
+        self.assertIn("NO enforced output cap", req.system)
+        self.assertIn("one-response steps", req.system)
 
-    def test_supervisor_request_notes_local_output_cap(self):
-        from supervise import LOCAL_OUTPUT_TOKENS, ReviewPackage, _supervisor_request
+    def test_supervisor_request_notes_no_local_output_cap(self):
+        from supervise import ReviewPackage, _supervisor_request
         req = _supervisor_request(ReviewPackage(task="t", changes="x"))
-        self.assertIn(str(LOCAL_OUTPUT_TOKENS), req.system)
-        self.assertIn("output cap", req.system)
+        self.assertIn("no engine-imposed output cap", req.system)
+        self.assertIn("context window", req.system)
 
-    def test_gemma_prompt_warns_about_output_cap(self):
-        from supervise import LOCAL_OUTPUT_TOKENS, _gemma_primary_prompt
-        req = _gemma_primary_prompt("task")
-        self.assertIn(str(LOCAL_OUTPUT_TOKENS), req.user)
+    def test_qwen_prompt_has_no_output_cap(self):
+        from supervise import _qwen_primary_prompt
+        req = _qwen_primary_prompt("task")
+        self.assertIn("NO output token cap", req.user)
+        self.assertIn("COMPLETE change", req.user)
         self.assertIn("REMAINING WORK", req.user)
 
 
@@ -357,7 +359,7 @@ class EnhanceTaskClarificationTests(unittest.TestCase):
                 "=== CLARIFYING QUESTIONS ===\nQ1: which file?")
         self.ask._generate_with_retry = fake_gen
         sys.stdin = self._stdin(False)
-        task_for_gemma, enh, clar = self.ask._enhance_task(
+        task_for_qwen, enh, clar = self.ask._enhance_task(
             object(), {}, self._args(), "vague task", "")
         self.assertTrue(clar)
         self.assertIn("Q1: which file?", enh.clarifying_questions)
@@ -374,13 +376,13 @@ class EnhanceTaskClarificationTests(unittest.TestCase):
             return self._resp("=== ENHANCED PROMPT ===\nEnhanced v2\n=== PLAN ===\np")
         self.ask._generate_with_retry = fake_gen
         sys.stdin = self._stdin(True, answers=["use users.py"])
-        task_for_gemma, enh, clar = self.ask._enhance_task(
+        task_for_qwen, enh, clar = self.ask._enhance_task(
             object(), {}, self._args(), "vague task", "")
         self.assertEqual(len(calls), 2, "clarification must trigger a re-enhance")
         self.assertIn("USER CLARIFICATION", calls[1])
         self.assertIn("use users.py", calls[1])
         self.assertFalse(clar)
-        self.assertEqual(task_for_gemma, "Enhanced v2")
+        self.assertEqual(task_for_qwen, "Enhanced v2")
 
     def test_interactive_skip_proceeds_with_enhanced_prompt(self):
         def fake_gen(agent, cfg, args, route, req):
@@ -389,10 +391,10 @@ class EnhanceTaskClarificationTests(unittest.TestCase):
                 "=== CLARIFYING QUESTIONS ===\nQ1: scope?")
         self.ask._generate_with_retry = fake_gen
         sys.stdin = self._stdin(True, answers=[""])
-        task_for_gemma, enh, clar = self.ask._enhance_task(
+        task_for_qwen, enh, clar = self.ask._enhance_task(
             object(), {}, self._args(), "task", "")
         self.assertFalse(clar)
-        self.assertEqual(task_for_gemma, "Enhanced")
+        self.assertEqual(task_for_qwen, "Enhanced")
 
 
 class SelfEvaluationTests(unittest.TestCase):

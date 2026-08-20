@@ -173,10 +173,10 @@ class TestProgramPhases(unittest.TestCase):
 
 
 class TestRecallGate(unittest.TestCase):
-    def test_bound_text_in_every_gemma_prompt(self):
+    def test_bound_text_in_every_qwen_prompt(self):
         systems = []
 
-        def fake_gemma(req):
+        def fake_qwen(req):
             systems.append(req.system)
             if len(systems) == 1:
                 return ModelResponse(text="RUN: npm test\n```\napp.ts\nx\n```", backend="local")
@@ -186,7 +186,7 @@ class TestRecallGate(unittest.TestCase):
             def generate(self, req):
                 return ModelResponse(text=APPROVED_TEXT, backend="deepseek")
 
-        supervise(local=None, cloud=_Cloud(), task="t", gemma_generate=fake_gemma,
+        supervise(local=None, cloud=_Cloud(), task="t", qwen_generate=fake_qwen,
                   terminal_tool=lambda c: "exit 0\nok",
                   bound_text="IRON LAWS — THE BOUND (test)",
                   status=lambda line: None)

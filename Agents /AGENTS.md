@@ -10,14 +10,14 @@ Operational conventions and known pitfalls for this workspace (`/Users/user/Desk
 
 ## Known pitfall: chat degeneration ("garbage output")
 
-LM Studio chat produced `!!!�"""...Side""Side` garbage on `qwen2.5-coder-14b-instruct-mlx`. Root cause (confirmed via `~/.lmstudio/conversations/*.json`): a **gemma-only thinking-mode custom field** (`ext.virtualModel.customField.google.gemma412bQat.enableThinking`) had leaked onto qwen chats, plus no repetition penalty — the model looped on repeated tokens. Fixed 2026-08-20: stripped the gemma field from qwen chats, added `llm.prediction.repeatPenalty: 1.15` + `llm.prediction.temperature: 0.2` to every conversation (backup: `~/.lmstudio/conversations-backup-2026-08-20/`).
+LM Studio chat produced `!!!�"""...Side""Side` garbage on `qwen2.5-coder-14b-instruct-mlx`. Root cause (confirmed via `~/.lmstudio/conversations/*.json`): a stale thinking-mode custom field from the retired 12B model config (`ext.virtualModel.customField.*.enableThinking`) had leaked onto qwen chats, plus no repetition penalty — the model looped on repeated tokens. Fixed 2026-08-20: stripped the foreign field from qwen chats, added `llm.prediction.repeatPenalty: 1.15` + `llm.prediction.temperature: 0.2` to every conversation (backup: `~/.lmstudio/conversations-backup-2026-08-20/`).
 
 **Bridge path:** `ask.py` talks to `/api/v1/chat` and does NOT see LM Studio's per-conversation prediction config, so the chat-side fix does NOT protect bridge generations (that is where the 2026-08-20 `longest_palindrome` garbage `== ((x + y) ** 2, ...` repetition came from). The bridge now sends `request_extra: {repeat_penalty: 1.15}` on the local providers in `config.yml` (`providers.local.*`) — `repeat_penalty` (snake_case) is the only repetition-penalty key the native endpoint accepts (`repetition_penalty`, `repeatPenalty`, `frequency_penalty` are all rejected with `unrecognized_keys`).
 
 Prevention rules:
-- The `enableThinking` custom field belongs ONLY to `google/gemma-4-12b-qat` chats. Never enable it on a qwen (non-thinking) chat — it forces a mismatched thinking prompt template and degrades output.
+- Never set a thinking-mode `enableThinking` custom field on qwen (non-thinking) chats — it forces a mismatched thinking prompt template and degrades output.
 - Keep `llm.prediction.repeatPenalty` ≥ 1.1 in every chat (guards against token-repetition loops).
-- A coding model asked out-of-domain questions (e.g. "why is voice not available") will hallucinate — that is not a server bug. Use gemma for general chat, qwen for code.
+- A coding model asked out-of-domain questions (e.g. "why is voice not available") will hallucinate — that is not a server bug. Use qwen for both general chat and code.
 - Diagnose: `rg -i "error|exception" ~/.lmstudio/server-logs/YYYY-MM/*.log`; empty/garbled local output + a clean isolated `curl` to `/api/v1/chat` means the problem is session/context state, not the model.
 
 ## Known pitfall: Kilo chat crashes the MLX backend (MUST load with `--parallel 1`)

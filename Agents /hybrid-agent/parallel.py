@@ -181,10 +181,10 @@ class DependencyAnalyzer:
 class ParallelExecutor:
     """Execute steps in parallel using a thread pool."""
 
-    def __init__(self, gemma_generate: Callable, max_workers: int = 4,
+    def __init__(self, qwen_generate: Callable, max_workers: int = 4,
                  max_tokens: int = 4096, temperature: float = 0.2,
                  timeout_s: float = 180.0):
-        self.gemma_generate = gemma_generate
+        self.qwen_generate = qwen_generate
         self.max_workers = max_workers
         self.max_tokens = max_tokens
         self.temperature = temperature
@@ -221,7 +221,7 @@ class ParallelExecutor:
         def run_step(index: int, step: Dict) -> Dict:
             try:
                 request = self.build_step_request(step, task, project_context)
-                resp = self.gemma_generate(request)
+                resp = self.qwen_generate(request)
                 text = getattr(resp, 'text', '') or ''
                 return {'step': step.get('name', 'step'), 'id': step.get('id'),
                         'status': 'success', 'text': text}

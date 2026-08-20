@@ -6,6 +6,23 @@ steps: 500
 color: "#2E7D32"
 permission:
   bash: allow
+  read: allow
+  edit: allow
+  write: allow
+  glob: allow
+  grep: allow
+  list: allow
+  task: allow
+  webfetch: allow
+  websearch: allow
+  semantic_search: allow
+  todowrite: allow
+  todoread: allow
+  question: allow
+  skill: allow
+  external_directory: allow
+  kilo_memory_recall: allow
+  kilo_memory_save: allow
 ---
 # Local-Only Coding Agent
 
@@ -33,7 +50,7 @@ There is **no delegation layer** here: you do not need `hybrid-agent/ask.py` to 
 ## Model facts (verified)
 
 - Endpoint: `http://localhost:1234/v1` (LM Studio, OpenAI-compatible chat; embeddings on `/v1/embeddings`, modern chat at `/api/v1`).
-- Loaded model: `qwen2.5-coder-14b-instruct-mlx` — 14B 8-bit MLX, 32768 loaded context, full GPU offload on Apple Silicon. Stronger instruction-following and code generation than the previous gemma-4-12b-qat.
+- Loaded model: `qwen2.5-coder-14b-instruct-mlx` — 14B 8-bit MLX, 32768 loaded context, full GPU offload on Apple Silicon. Stronger instruction-following and code generation than the previous 12B model.
 - Context/output caps enforced by the provider config: 32768 context, 4096 output. Stay well under these — 14B is more capable but still degrades with huge prompts, so KEEP PROMPTS SHORT.
 
 ## Working Style

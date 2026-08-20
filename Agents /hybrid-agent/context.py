@@ -1,6 +1,6 @@
 """Project Context Awareness module for hybrid-agent.
 
-Scans a project and renders a compact prompt so DeepSeek/Gemma understand the
+Scans a project and renders a compact prompt so DeepSeek/Qwen understand the
 codebase (structure, dependencies, architecture, coding standards, code
 examples) before implementing. Self-contained: stdlib only.
 """

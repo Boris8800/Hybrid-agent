@@ -21,7 +21,8 @@ class ModelResponse:
     token_usage: dict = field(default_factory=dict)
     latency_ms: float = 0.0
     backend: str = ""
-    truncated: bool = False       # True when finish_reason == "length" (output cut off)
+    truncated: bool = False       # True when output was cut off mid-generation
+    truncate_reason: str = ""     # why: finish_reason / max_tokens / stream_eof / fence
 
 
 class BackendError(Exception):

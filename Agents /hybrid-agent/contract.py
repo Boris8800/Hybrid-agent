@@ -1,7 +1,7 @@
 """contract.py — the formal Task Contract (machine-readable spine of a task).
 
 DeepSeek converts the user request into a structured contract BEFORE the local
-model implements; every stage (Gemma prompt, review package, verification
+model implements; every stage (Qwen prompt, review package, verification
 gates, final auditor) consumes the SAME contract:
 
   Goal / Must change / Must NOT change / Acceptance criteria /
@@ -47,7 +47,7 @@ class TaskContract:
         return self.risk in ("HIGH", "CRITICAL")
 
     def to_prompt(self) -> str:
-        """Render the contract as prompt text for Gemma / the auditor."""
+        """Render the contract as prompt text for Qwen / the auditor."""
         if not self.complete:
             return ""
         lines = ["TASK CONTRACT:"]

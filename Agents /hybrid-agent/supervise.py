@@ -1,25 +1,25 @@
 """
-Gemma-primary / DeepSeek-supervisor control loop.
+Qwen-primary / DeepSeek-supervisor control loop.
 
 Architecture (vs the router in agent.py):
-  Instead of deciding "which model does the whole task", Gemma (local) is the
+  Instead of deciding "which model does the whole task", Qwen (local) is the
   primary coding agent for almost everything. DeepSeek only intervenes as a
   supervisor/reviewer, and only when the task or verification warrants it.
 
   Flow:
     TASK
-      -> Gemma implements (local backend)
+      -> Qwen implements (local backend)
       -> build a COMPACT review package (not the whole conversation)
       -> optional verification hook
       -> DeepSeek supervises (compact package only)
       -> VERDICT:
            APPROVED      -> done
-           FIX_REQUIRED  -> feed REQUIRED_FIXES back to Gemma, iterate
+           FIX_REQUIRED  -> feed REQUIRED_FIXES back to Qwen, iterate
            REJECTED      -> stop, report alternative approach
       -> loop until APPROVED or max iterations
 
   DeepSeek never rewrites code directly; it returns verdicts + required fixes,
-  and Gemma implements them. API tokens are spent on judgement, not on doing
+  and Qwen implements them. API tokens are spent on judgement, not on doing
   the coding.
 """
 
@@ -227,7 +227,7 @@ def parse_verdict(raw: str) -> Verdict:
 
 
 def required_fixes_summary(verdict: Verdict) -> str:
-    """Build a short, actionable instruction to hand back to Gemma."""
+    """Build a short, actionable instruction to hand back to Qwen."""
     if verdict.approved:
         return ""
     lines = [f"DeepSeek supervisor says: {verdict.decision}"]
@@ -244,17 +244,21 @@ def required_fixes_summary(verdict: Verdict) -> str:
 
 # --- prompts -------------------------------------------------------------
 
-# Output budgets: Gemma must emit the FULL multi-file response in one shot, so
-# the default budget is generous and truncation is retried once with a doubled
-# budget (hard cap GEMMA_MAX_TOKENS_CAP) before any escalation.
-GEMMA_MAX_TOKENS = 8192
-GEMMA_MAX_TOKENS_CAP = 16384
+# Output budgets: the LOCAL model has NO engine-imposed cap. LM Studio's
+# /api/v1/chat rejects max_tokens outright, so the local model generates until
+# its own EOS or the server's context window — these constants are advisory
+# only (kept astronomically large so no retry/escalation path ever treats the
+# local budget as the limiting factor). Truncation (server-side context cutoff)
+# is detected and recovered with a continuation prompt, not a budget bump.
+QWEN_MAX_TOKENS = 1_000_000_000_000_000
+QWEN_MAX_TOKENS_CAP = 2_000_000_000_000_000
 CLOUD_GEN_TOKENS = 8192
 
-# Local model (qwen) constraints — the DeepSeek supervisor plans within these.
-# The local server runs qwen2.5-coder-14b-instruct-mlx with a 32768-token
-# context window; a conservative 4096-token output cap is assumed so plans must
-# split work into steps that fit in ONE local response.
+# Local model constraints — advisory planning guidance for the DeepSeek
+# supervisor (steps sized for one local response), NOT an enforced cap. The
+# local server runs qwen2.5-coder-14b-instruct-mlx with a 32768-token context
+# window; a 4096-token step is a safe planning target because truncation is
+# recovered with a continuation prompt.
 LOCAL_CONTEXT_TOKENS = 32768
 LOCAL_OUTPUT_TOKENS = 4096
 
@@ -266,20 +270,23 @@ def _local_limits_note() -> str:
     for one local response instead of assuming an unlimited model.
     """
     return (
-        "IMPLEMENTER CONSTRAINTS (local Gemma 12B, must be respected): "
-        f"context window {LOCAL_CONTEXT_TOKENS} tokens; hard output cap "
-        f"{LOCAL_OUTPUT_TOKENS} tokens per response (higher budgets still "
-        "truncate); one response = one step; target under ~3500 output tokens "
-        "per step; keep prompt + repo context well under 32768; any task needing "
-        "more output must be split into multiple sequential steps with per-step "
-        "acceptance criteria; truncated output is retried once then escalated."
+        "IMPLEMENTER CONSTRAINTS (local model, must be respected): "
+        f"context window {LOCAL_CONTEXT_TOKENS} tokens; a step of about "
+        f"{LOCAL_OUTPUT_TOKENS} output tokens is a safe planning target "
+        "(there is NO enforced output cap — the engine detects truncation and "
+        "continues the response, so an occasional overflow is recovered, but "
+        "complete one-response steps are preferred); keep prompt + repo "
+        "context well under 32768; any task needing more output must be split "
+        "into multiple sequential steps with per-step acceptance criteria; "
+        "truncated output is continued once then escalated."
     )
 
 
-def _gemma_primary_prompt(task: str, prior_fixes: str = "",
+def _qwen_primary_prompt(task: str, prior_fixes: str = "",
                           terminal_output: str = "", bound_text: str = "",
                           contract_text: str = "", source_context: str = "",
-                          max_tokens: int = GEMMA_MAX_TOKENS) -> ModelRequest:
+                          continuation_from: str = "",
+                          max_tokens: int = QWEN_MAX_TOKENS) -> ModelRequest:
     system = (
         "You are a careful mid-level engineer implementing a change. "
         "Write correct, minimal, well-structured code for the given task. "
@@ -307,10 +314,23 @@ def _gemma_primary_prompt(task: str, prior_fixes: str = "",
             "final code."
         )
     user += (
-        f"\nNOTE: your output is capped at {LOCAL_OUTPUT_TOKENS} tokens. If the "
-        "change cannot fit in one response, implement the first coherent chunk "
-        "and explicitly state what remains in a final 'REMAINING WORK' section."
+        "\nNOTE: you have NO output token cap — output the COMPLETE change in "
+        "this one response. Do not stop early or split the work voluntarily; "
+        "write every file fully. If your response is truncated the engine "
+        "detects it and asks you to continue exactly where you stopped, so "
+        "never abbreviate. Only if the change genuinely cannot fit, end with a "
+        "final 'REMAINING WORK' line listing exactly what is left."
     )
+    if continuation_from:
+        # Truncation recovery: the model is stateless across calls, so feed it
+        # the tail of the cut-off output and demand a pure continuation. Works
+        # for ANY local model regardless of whether max_tokens was honoured.
+        user += (
+            "\n\nA previous attempt was truncated mid-output. It ended with:\n"
+            f"--- TRUNCATED TAIL ---\n{continuation_from}\n--- END ---\n"
+            "Continue EXACTLY from where that output stopped. Do not repeat "
+            "anything already written above. Output only the missing remainder."
+        )
     user += "\nOutput only the code changes, no preamble."
     return ModelRequest(system=system, user=user, max_tokens=max_tokens, temperature=0.2)
 
@@ -353,15 +373,17 @@ def _supervisor_request(pkg: ReviewPackage, verbose: bool = True) -> ModelReques
         "[only if REJECTED]\n\n"
         "Rules: be specific, show the fix not just describe it, be brutal about "
         "correctness and security, be reasonable about style. Do NOT rewrite the "
-        "whole codebase — you are reviewing, Gemma implements.\n\n"
+        "whole codebase — you are reviewing, Qwen implements.\n\n"
         "EVIDENCE RULE: if you return APPROVED you MUST cite the concrete machine "
         "evidence (test names, file:line, command output) under a "
         "'=== EVIDENCE ===' section. If you cannot point to machine evidence for "
         "your verdict, return UNKNOWN instead of guessing.\n\n"
-        "Note: the code under review was produced by a local model with a "
-        f"{LOCAL_OUTPUT_TOKENS}-token output cap and {LOCAL_CONTEXT_TOKENS}-token "
-        "context window. Judge whether the step was appropriately scoped and "
-        "whether truncation or over-sized single responses are likely."
+        "Note: the code under review was produced by a local model with "
+        "no engine-imposed output cap and a "
+        f"{LOCAL_CONTEXT_TOKENS}-token context window (truncation is detected "
+        "and recovered via continuation, not by capping the model). Judge "
+        "whether the step was appropriately scoped and whether responses "
+        "look cut off or over-sized for a single pass."
     )
     user = pkg.to_prompt()
     if verbose:
@@ -376,7 +398,7 @@ class SuperviseResult:
     task: str
     final_text: str = ""
     route: str = "local"
-    reason: str = "gemma_primary"
+    reason: str = "qwen_primary"
     verdicts: list[Verdict] = field(default_factory=list)
     iterations: int = 0
     escalated: bool = False
@@ -389,8 +411,8 @@ def supervise(
     package_builder=None,
     max_iterations: int = 3,
     status: callable = None,
-    gemma_generate: callable = None,
-    gemma_max_tokens: int = GEMMA_MAX_TOKENS,
+    qwen_generate: callable = None,
+    qwen_max_tokens: int = QWEN_MAX_TOKENS,
     review: bool = True,
     review_quality_hint: float = 0.0,
     terminal_tool: callable = None,
@@ -400,13 +422,13 @@ def supervise(
     source_context: str = "",
     evidence_provider: callable = None,
 ) -> SuperviseResult:
-    """Run Gemma-primary / DeepSeek-supervisor on a task.
+    """Run Qwen-primary / DeepSeek-supervisor on a task.
 
-    `package_builder(task, gemma_output, iteration) -> ReviewPackage` lets the
+    `package_builder(task, qwen_output, iteration) -> ReviewPackage` lets the
     caller supply verification (test/lint/build results, git diff, etc.).
 
-    `gemma_generate(request) -> ModelResponse` overrides how Gemma is invoked.
-    Pass a streaming wrapper here so the caller can stream Gemma's output live
+    `qwen_generate(request) -> ModelResponse` overrides how Qwen is invoked.
+    Pass a streaming wrapper here so the caller can stream Qwen's output live
     (always showing the local model working). Defaults to `local.generate`.
 
     `terminal_tool(command) -> output` executes 'RUN: <command>' blocks the
@@ -414,13 +436,13 @@ def supervise(
     None disables the terminal tool.
 
     With `review=False` the DeepSeek review is skipped entirely (local-first
-    routing): one Gemma pass, then a synthetic APPROVED verdict so the
+    routing): one Qwen pass, then a synthetic APPROVED verdict so the
     caller's apply/stats tail works unchanged. Zero API spend.
     """
     if status is None:
         status = lambda line: None  # noqa: E731
-    if gemma_generate is None:
-        gemma_generate = lambda req: local.generate(req)  # noqa: E731
+    if qwen_generate is None:
+        qwen_generate = lambda req: local.generate(req)  # noqa: E731
 
     result = SuperviseResult(task=task)
     current = task
@@ -429,13 +451,13 @@ def supervise(
     for iteration in range(1, max_iterations + 1):
         result.iterations = iteration
 
-        # 1. Gemma implements (streaming so the user sees it working).
-        status(f"[supervise] iter {iteration}: Gemma working...")
+        # 1. Qwen implements (streaming so the user sees it working).
+        status(f"[supervise] iter {iteration}: Qwen working...")
         try:
-            resp: ModelResponse = gemma_generate(
-                _gemma_primary_prompt(current, prior_fixes, bound_text=bound_text,
+            resp: ModelResponse = qwen_generate(
+                _qwen_primary_prompt(current, prior_fixes, bound_text=bound_text,
                     contract_text=contract_text, source_context=source_context,
-                    max_tokens=gemma_max_tokens)
+                    max_tokens=qwen_max_tokens)
             )
         except Exception as exc:  # noqa: BLE001
             status(f"[supervise] local failed ({exc}); escalating to DeepSeek")
@@ -446,29 +468,32 @@ def supervise(
             return result
 
         # Truncated local output must never reach the reviewer or be applied
-        # as if complete. Retry ONCE with a doubled budget (long multi-file
-        # generations routinely need more than a single budget); only escalate
-        # when the retry is still cut off.
+        # as if complete. Retry ONCE with a continuation prompt (the local MLX
+        # server rejects max_tokens, so a bigger budget is a no-op; the model
+        # is stateless across calls, so we feed it the tail and ask it to pick
+        # up exactly where it stopped). Only escalate when the continuation is
+        # still cut off or yields nothing new.
         if getattr(resp, "truncated", False):
-            retry_budget = min(gemma_max_tokens * 2, GEMMA_MAX_TOKENS_CAP)
-            if retry_budget >= gemma_max_tokens:
-                status(f"[supervise] iter {iteration}: Gemma output TRUNCATED at "
-                       f"{gemma_max_tokens} tokens - retrying once with {retry_budget}")
-                try:
-                    resp = gemma_generate(
-                        _gemma_primary_prompt(current, prior_fixes, bound_text=bound_text,
-                    contract_text=contract_text, source_context=source_context,
-                    max_tokens=retry_budget)
-                    )
-                except Exception as exc:  # noqa: BLE001
-                    status(f"[supervise] local retry failed ({exc}); escalating to DeepSeek")
-                    text, still_truncated = _cloud_generate_guarded(cloud, task, status, use_plan=False)
-                    result.final_text = text
-                    result.escalated = True
-                    result.reason = "cloud_fallback_truncated" if still_truncated else "local_truncation_escalation"
-                    return result
+            tail = (resp.text or "")[-1200:]
+            retry_budget = min(qwen_max_tokens * 2, QWEN_MAX_TOKENS_CAP)
+            status(f"[supervise] iter {iteration}: local output TRUNCATED "
+                   f"({getattr(resp, 'truncate_reason', 'no-reason')}) - "
+                   f"retrying once with a continuation prompt")
+            try:
+                resp = qwen_generate(
+                    _qwen_primary_prompt(current, prior_fixes, bound_text=bound_text,
+                contract_text=contract_text, source_context=source_context,
+                continuation_from=tail, max_tokens=retry_budget)
+                )
+            except Exception as exc:  # noqa: BLE001
+                status(f"[supervise] local retry failed ({exc}); escalating to DeepSeek")
+                text, still_truncated = _cloud_generate_guarded(cloud, task, status, use_plan=False)
+                result.final_text = text
+                result.escalated = True
+                result.reason = "cloud_fallback_truncated" if still_truncated else "local_truncation_escalation"
+                return result
             if getattr(resp, "truncated", False):
-                status("[supervise] Gemma still TRUNCATED after retry; escalating to DeepSeek")
+                status("[supervise] Qwen still TRUNCATED after retry; escalating to DeepSeek")
                 text, still_truncated = _cloud_generate_guarded(cloud, task, status, use_plan=False)
                 result.final_text = text
                 result.escalated = True
@@ -491,16 +516,16 @@ def supervise(
             outputs = [f"$ {cmd}\n{terminal_tool(cmd)}" for cmd in cmds]
             terminal_feedback = "\n\n".join(outputs)
             try:
-                resp = gemma_generate(_gemma_primary_prompt(
+                resp = qwen_generate(_qwen_primary_prompt(
                     current, prior_fixes, terminal_output=terminal_feedback,
                     bound_text=bound_text, contract_text=contract_text,
-                    source_context=source_context, max_tokens=gemma_max_tokens))
+                    source_context=source_context, max_tokens=qwen_max_tokens))
             except Exception as exc:  # noqa: BLE001 - keep the last good output
                 status(f"[supervise] terminal re-generate failed ({exc}); continuing")
                 break
             code = resp.text
 
-        # Local-first routing: skip the DeepSeek review entirely. One Gemma
+        # Local-first routing: skip the DeepSeek review entirely. One Qwen
         # pass plus a synthetic APPROVED verdict keeps the apply/stats tail
         # unchanged. review_quality_hint carries the router confidence (0-10).
         if not review:
@@ -569,7 +594,7 @@ def supervise(
             result.reason = "cloud_fallback_truncated" if still_truncated else "deepseek_fallback_rejected"
             return result
 
-        # FIX_REQUIRED: feed fixes back to Gemma.
+        # FIX_REQUIRED: feed fixes back to Qwen.
         prior_fixes = required_fixes_summary(verdict)
         status(f"[supervise] iter {iteration}: FIX_REQUIRED — {len(verdict.issues)} issue(s), looping")
         current = task
@@ -586,7 +611,7 @@ def supervise(
 def _default_package(task: str, code: str, iteration: int = 0) -> ReviewPackage:
     return ReviewPackage(
         task=task,
-        changes=f"Gemma output (iteration {iteration}):\n{code}",
+        changes=f"Qwen output (iteration {iteration}):\n{code}",
         uncertainties="None provided — caller can enrich this package with tests/diff.",
     )
 

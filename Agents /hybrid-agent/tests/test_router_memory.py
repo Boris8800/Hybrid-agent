@@ -195,10 +195,10 @@ class TestConsolidation(unittest.TestCase):
 
 class TestLocalFirstSupervise(unittest.TestCase):
     def test_review_false_skips_deepseek(self):
-        calls = {"gemma": 0, "cloud": 0}
+        calls = {"qwen": 0, "cloud": 0}
 
-        def fake_gemma(req):
-            calls["gemma"] += 1
+        def fake_qwen(req):
+            calls["qwen"] += 1
             return ModelResponse(text="```\nfile.py\nprint('ok')\n```",
                                  backend="local")
 
@@ -209,8 +209,8 @@ class TestLocalFirstSupervise(unittest.TestCase):
 
         result = supervise(
             local=None, cloud=_FakeCloud(), task="rename a variable",
-            gemma_generate=fake_gemma, review=False, status=lambda line: None)
-        self.assertEqual(calls["gemma"], 1)
+            qwen_generate=fake_qwen, review=False, status=lambda line: None)
+        self.assertEqual(calls["qwen"], 1)
         self.assertEqual(calls["cloud"], 0)
         self.assertEqual(result.reason, "router_local_skip_review")
         self.assertEqual(result.verdicts[0].decision, "APPROVED")
@@ -219,7 +219,7 @@ class TestLocalFirstSupervise(unittest.TestCase):
     def test_review_hint_becomes_quality_score(self):
         result = supervise(
             local=None, cloud=object(), task="t",
-            gemma_generate=lambda req: ModelResponse(text="ok", backend="local"),
+            qwen_generate=lambda req: ModelResponse(text="ok", backend="local"),
             review=False, review_quality_hint=8.5, status=lambda line: None)
         self.assertEqual(result.verdicts[0].quality_score, 8.5)
 

@@ -1,6 +1,6 @@
 # hybrid-agent
 
-A production-grade hybrid coding agent bridge: **Gemma (local) implements, DeepSeek (cloud) supervises**, with a routing layer, prompt enhancement, parallel step execution, cache, token budgeting, persistent memory, and a hardened file-application engine.
+A production-grade hybrid coding agent bridge: **Qwen (local) implements, DeepSeek (cloud) supervises**, with a routing layer, prompt enhancement, parallel step execution, cache, token budgeting, persistent memory, and a hardened file-application engine.
 
 The bridge is a self-contained CLI (`ask.py`) that talks directly to two OpenAI-compatible endpoints — a local LM Studio model and the DeepSeek cloud API. It does **not** use the Kilo provider system, so it can run standalone or be driven by an orchestrator.
 
@@ -45,12 +45,12 @@ The bridge is a self-contained CLI (`ask.py`) that talks directly to two OpenAI-
 
 ```
                 ┌─────────────────────────────────────────────────────────┐
- TASK ─────────▶│  supervise loop (Gemma-primary / DeepSeek-supervisor)   │
+ TASK ─────────▶│  supervise loop (Qwen-primary / DeepSeek-supervisor)   │
                 │                                                         │
                 │  optional: DeepSeek ENHANCE + clarify + plan (--enhance)│
-                │  Gemma implements  ──▶  compact review package          │
+                │  Qwen implements  ──▶  compact review package          │
                 │  DeepSeek verdict:  APPROVED / FIX_REQUIRED / REJECTED  │
-                │  FIX_REQUIRED ──▶ fixes fed back to Gemma, iterate      │
+                │  FIX_REQUIRED ──▶ fixes fed back to Qwen, iterate      │
                 │                                                         │
                 │  optional: --apply  writes path-labeled fenced blocks   │
                 │  optional: --verify runs build/tests until clean        │
@@ -71,7 +71,7 @@ Enforced roles, not soft hints (controlled by `--mode`, `$MODE`, default `hybrid
 
 | Mode | Implementer | API supervision | Typical use |
 |------|-------------|-----------------|-------------|
-| `hybrid` | local | ✅ | Full Gemma-primary / DeepSeek-supervisor loop |
+| `hybrid` | local | ✅ | Full Qwen-primary / DeepSeek-supervisor loop |
 | `local` | local | ❌ | Purely local, no API key needed |
 | `code` | API | ❌ | API implements directly, no supervision |
 
@@ -140,7 +140,7 @@ fleet of **2 online + 2 local providers** configured out of the box:
 |------|---------|----------|-------|
 | online | `deepseek` | `api.deepseek.com` | `deepseek-chat` |
 | online | `groq` | `api.groq.com/openai/v1` | `llama-3.3-70b-versatile` |
-| local | `gemma` | `localhost:1234/api/v1` | `qwen2.5-coder-14b-instruct-mlx` |
+| local | `qwen` | `localhost:1234/api/v1` | `qwen2.5-coder-14b-instruct-mlx` |
 | local | `local-2` | `localhost:1234/api/v1` | (pick any loaded model) |
 
 - **API keys** resolve in order: environment variable → Kilo `auth.json` → the
@@ -183,7 +183,7 @@ python3 ask.py --supervise --enhance --task "fix the checkout bug" \
 
 ## Terminal tool (RUN:)
 
-The models get a **real terminal tool** in the supervise loop: Gemma can emit
+The models get a **real terminal tool** in the supervise loop: Qwen can emit
 `RUN: <command>` lines in its output, the engine executes them, and the output
 is fed back for another iteration (up to `--terminal-rounds`, default 3).
 
@@ -226,7 +226,7 @@ can run unattended without breaking things.
 - `--no-bound` is the user-level escape hatch — the agent has no path to it.
 
 **RECALL gate** — the BOUND is re-injected into the enhance context, the review
-package, and **every** Gemma iteration, so the models can't "forget" it as the
+package, and **every** Qwen iteration, so the models can't "forget" it as the
 conversation grows.
 
 **Program phases** (`program:` in config.yml) — structured Build → Verify →
@@ -409,7 +409,7 @@ $PY $ASK --local --task "Add input validation to validate_email" --stream
 # Single-shot DeepSeek
 $PY $ASK --deepseek --task "Draft a migration plan for auth to refresh tokens"
 
-# Full supervise loop (Gemma implements, DeepSeek reviews)
+# Full supervise loop (Qwen implements, DeepSeek reviews)
 $PY $ASK --supervise --task "<task>" --max-iterations 4
 
 # Supervise + DeepSeek prompt enhancement + apply files to disk
@@ -448,12 +448,12 @@ use plain `python3 ask.py …` (the CLI self-heals into the venv interpreter).
 
 | Flag | Description |
 |------|-------------|
-| `--supervise` | Gemma-primary / DeepSeek-supervisor loop until APPROVED (default max 3 iterations). |
+| `--supervise` | Qwen-primary / DeepSeek-supervisor loop until APPROVED (default max 3 iterations). |
 | `--max-iterations N` | Max supervise iterations (default 3). |
 | `--review` | Single-shot DeepSeek supervisor review of `--code` (uses `review/supervisor.md`). |
 | `--code TEXT` | Code/output to review (required with `--review`). |
 | `--system TEXT` | Override the system prompt. |
-| `--enhance` | DeepSeek enhances the prompt, plans around Gemma's limits, and asks clarifying questions before Gemma implements. |
+| `--enhance` | DeepSeek enhances the prompt, plans around Qwen's limits, and asks clarifying questions before Qwen implements. |
 | `--cot` | Chain-of-thought planning: TASK UNDERSTANDING / CONSTRAINT ANALYSIS / ALTERNATIVES before the plan. |
 | `--parallel` | With `--supervise --enhance`: split the plan into steps and run independent steps in parallel on the local model. |
 | `--parallel-workers N` | Max parallel workers per batch (default 4). |
@@ -500,15 +500,15 @@ use plain `python3 ask.py …` (the CLI self-heals into the venv interpreter).
 
 ## The supervise loop
 
-1. **Gemma implements** the task (streamed live). Truncated output is retried once at
+1. **Qwen implements** the task (streamed live). Truncated output is retried once at
    double budget; if still cut off, the run escalates to DeepSeek rather than
    pretending the output is complete.
-2. **A compact review package** is built — task, plan, Gemma output, uncertainties,
+2. **A compact review package** is built — task, plan, Qwen output, uncertainties,
    a **live git diff** (via `review/diff_builder.py`), and any verification context.
    DeepSeek never sees the whole conversation, only this package.
 3. **DeepSeek returns a verdict**: `APPROVED`, `FIX_REQUIRED`, or `REJECTED`, with a
    quality score, issues, and exact fixes.
-4. **FIX_REQUIRED** feeds the fixes back to Gemma and loops; **REJECTED** falls back
+4. **FIX_REQUIRED** feeds the fixes back to Qwen and loops; **REJECTED** falls back
    to a DeepSeek implementation; **APPROVED** finishes and (with `--apply`) writes
    files to disk.
 5. The outcome (route, verdict, quality) is recorded to **persistent task memory**
@@ -525,7 +525,7 @@ the per-task "autonomy schedule":
 | Level | Behavior |
 |-------|----------|
 | `full` | Current behavior: DeepSeek reviews every iteration. |
-| `local_first` | **Skip the DeepSeek review entirely** — one Gemma pass, then apply/verify. Zero API spend (unless `--verify` finds errors DeepSeek must fix). |
+| `local_first` | **Skip the DeepSeek review entirely** — one Qwen pass, then apply/verify. Zero API spend (unless `--verify` finds errors DeepSeek must fix). |
 | `critical` | Force prompt enhancement + the full review loop, even without `--enhance`. |
 
 `_plan_supervision` picks a level by precedence:
@@ -542,15 +542,15 @@ the per-task "autonomy schedule":
 
 ## Prompt enhancement
 
-`--enhance` sends the raw task to DeepSeek **before** Gemma implements:
+`--enhance` sends the raw task to DeepSeek **before** Qwen implements:
 
-- returns an **enhanced prompt**, **reasoning**, and a **plan** sized to Gemma's
+- returns an **enhanced prompt**, **reasoning**, and a **plan** sized to Qwen's
   context/output limits;
 - if the task is ambiguous, asks **clarifying questions** — interactively it waits for
   answers; non-interactively it exits with code `4` (`TASK UNCLEAR`) so you can re-run
   with a clearer `--task`. A section that says "no questions needed" is treated as clear.
 - `--cot` adds explicit TASK UNDERSTANDING / CONSTRAINT ANALYSIS / ALTERNATIVES
-  sections so you can verify the reasoning before Gemma implements.
+  sections so you can verify the reasoning before Qwen implements.
 
 ## Parallel execution
 
@@ -765,7 +765,7 @@ repo root/
 └── Agents /hybrid-agent/
     ├── ask.py                   # Bridge CLI (routing, supervise, verify, apply, cache)
     ├── agent.py                 # HybridAgent: backends, router, adaptive threshold
-    ├── supervise.py             # Gemma-primary / DeepSeek-supervisor control loop
+    ├── supervise.py             # Qwen-primary / DeepSeek-supervisor control loop
     ├── parallel.py              # Plan parsing, dependency groups, parallel executor
     ├── memory.py                # Persistent task memory (semantic recall, consolidation)
     ├── embed.py                 # Local embeddings client (/v1/embeddings) + cosine
@@ -785,7 +785,7 @@ repo root/
     ├── web_dashboard.py         # Web control panel (Flask + SocketIO, port 8660)
     ├── dashboard/               # Dashboard UI + encrypted secrets store
     ├── context.py / scan.py     # Project context scanner
-    ├── backends/                # Gemma/DeepSeek clients + circuit breaker
+    ├── backends/                # Qwen/DeepSeek clients + circuit breaker
     ├── router/                  # Archetypes, confidence scoring, threshold
     ├── review/                  # diff_builder + supervisor.md (review protocol)
     ├── tests/                   # 95 unit tests

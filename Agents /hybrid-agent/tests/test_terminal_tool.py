@@ -36,14 +36,14 @@ class TestExtractRunBlocks(unittest.TestCase):
 
 
 class TestSuperviseTerminalLoop(unittest.TestCase):
-    def _run(self, gemma_outputs, max_rounds=3):
-        gemma_calls = []
+    def _run(self, qwen_outputs, max_rounds=3):
+        qwen_calls = []
         term_calls = []
         pkgs = []
 
-        def fake_gemma(req):
-            gemma_calls.append(req)
-            text = gemma_outputs[min(len(gemma_calls) - 1, len(gemma_outputs) - 1)]
+        def fake_qwen(req):
+            qwen_calls.append(req)
+            text = qwen_outputs[min(len(qwen_calls) - 1, len(qwen_outputs) - 1)]
             return ModelResponse(text=text, backend="local")
 
         def fake_terminal(cmd):
@@ -56,19 +56,19 @@ class TestSuperviseTerminalLoop(unittest.TestCase):
 
         result = supervise(
             local=None, cloud=_Cloud(), task="fix the build",
-            gemma_generate=fake_gemma, terminal_tool=fake_terminal,
+            qwen_generate=fake_qwen, terminal_tool=fake_terminal,
             max_terminal_rounds=max_rounds, status=lambda line: None,
             package_builder=lambda t, c, i: ReviewPackage(
                 task=t, changes=f"iter {i}:\n{c}", verification=""),
         )
-        return result, gemma_calls, term_calls
+        return result, qwen_calls, term_calls
 
     def test_runs_tool_then_review(self):
-        result, gemma_calls, term_calls = self._run([
+        result, qwen_calls, term_calls = self._run([
             "RUN: npm run build\n```\nfile.py\nx=1\n```",
             "```\nfile.py\nx=1\n```",   # no more RUN -> review proceeds
         ])
-        self.assertEqual(len(gemma_calls), 2)
+        self.assertEqual(len(qwen_calls), 2)
         self.assertEqual(term_calls, ["npm run build"])
         self.assertEqual(result.verdicts[0].decision, "APPROVED")
 
@@ -79,38 +79,38 @@ class TestSuperviseTerminalLoop(unittest.TestCase):
             pkgs.append(p)
             return p
         term_calls = []
-        def fake_gemma(req):
-            if not hasattr(fake_gemma, "n"):
-                fake_gemma.n = 1
+        def fake_qwen(req):
+            if not hasattr(fake_qwen, "n"):
+                fake_qwen.n = 1
                 return ModelResponse(text="RUN: pytest\n```\nfile.py\nx\n```", backend="local")
             return ModelResponse(text="```\nfile.py\nx\n```", backend="local")
         class _Cloud:
             def generate(self, req):
                 return ModelResponse(text=APPROVED_TEXT, backend="deepseek")
-        supervise(local=None, cloud=_Cloud(), task="t", gemma_generate=fake_gemma,
+        supervise(local=None, cloud=_Cloud(), task="t", qwen_generate=fake_qwen,
                   terminal_tool=lambda c: term_calls.append(c) or "exit 0\n1 passed",
                   status=lambda line: None, package_builder=builder)
         self.assertIn("TERMINAL SESSION", pkgs[0].verification)
         self.assertIn("exit 0", pkgs[0].verification)
 
     def test_max_rounds_limits_tool_calls(self):
-        # Gemma keeps requesting commands; the loop must stop at max rounds.
-        result, gemma_calls, term_calls = self._run(
+        # Qwen keeps requesting commands; the loop must stop at max rounds.
+        result, qwen_calls, term_calls = self._run(
             ["RUN: pytest\n```\nfile.py\nx\n```"], max_rounds=2)
         self.assertEqual(len(term_calls), 2)      # capped
-        self.assertEqual(len(gemma_calls), 3)     # initial + 2 re-generations
+        self.assertEqual(len(qwen_calls), 3)     # initial + 2 re-generations
         self.assertEqual(result.verdicts[0].decision, "APPROVED")
 
     def test_no_tool_no_extra_calls(self):
-        gemma_calls = []
+        qwen_calls = []
         class _Cloud:
             def generate(self, req):
                 return ModelResponse(text=APPROVED_TEXT, backend="deepseek")
         supervise(local=None, cloud=_Cloud(), task="t",
-                  gemma_generate=lambda req: gemma_calls.append(req) or ModelResponse(
+                  qwen_generate=lambda req: qwen_calls.append(req) or ModelResponse(
                       text="RUN: npm test\n```\nf\n```", backend="local"),
                   terminal_tool=None, status=lambda line: None)
-        self.assertEqual(len(gemma_calls), 1)  # RUN ignored without the tool
+        self.assertEqual(len(qwen_calls), 1)  # RUN ignored without the tool
 
 
 class TestTerminalToolFactory(unittest.TestCase):

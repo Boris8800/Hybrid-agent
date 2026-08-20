@@ -4,7 +4,7 @@ Supports ANY OpenAI-compatible endpoint in either role, with 2 online + 2 local
 providers configured out of the box:
 
   online: deepseek (default), groq
-  local:  gemma (default), local-2
+  local:  qwen (default), local-2
 
 Providers are configured under the `providers:` section of config.yml; when
 that section is absent the legacy `backends:` section still defines the primary
@@ -22,7 +22,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from backends.deepseek import DeepSeekBackend
-from backends.local_gemma import GemmaBackend
+from backends.local_qwen import QwenBackend
 
 DEFAULT_ONLINE = [
     {"name": "deepseek", "base_url": "https://api.deepseek.com",
@@ -31,7 +31,7 @@ DEFAULT_ONLINE = [
      "model": "llama-3.3-70b-versatile", "api_key_env": "GROQ_API_KEY"},
 ]
 DEFAULT_LOCAL = [
-    {"name": "gemma", "base_url": "http://localhost:1234/api/v1",
+    {"name": "qwen", "base_url": "http://localhost:1234/api/v1",
      "model": "qwen2.5-coder-14b-instruct-mlx", "api_key": "lm-studio"},
     {"name": "local-2", "base_url": "http://localhost:1234/api/v1",
      "model": "qwen2.5-coder-14b-instruct-mlx", "api_key": "lm-studio"},
@@ -127,7 +127,7 @@ def load_providers(cfg: dict) -> dict[str, list[Provider]]:
     ]
     local = [
         _provider(
-            name="gemma", kind="local",
+            name="qwen", kind="local",
             base_url=str(lc.get("base_url", "http://localhost:1234/v1")),
             model=str(lc.get("model", "qwen2.5-coder-14b-instruct-mlx")),
             api_key=str(lc.get("api_key", "lm-studio")),
@@ -236,7 +236,7 @@ def backend_for(p: Provider):
         return DeepSeekBackend(
             api_key_env=p.api_key_env or "DEEPSEEK_API_KEY", model=p.model,
             base_url=p.base_url, timeout_s=p.timeout_s, max_retries=p.max_retries)
-    return GemmaBackend(
+    return QwenBackend(
         base_url=p.base_url, model=p.model, api_key=p.api_key or "lm-studio",
         timeout_s=p.timeout_s, max_retries=p.max_retries,
         exclude_keys=tuple(p.request_exclude), extra_body=p.request_extra)

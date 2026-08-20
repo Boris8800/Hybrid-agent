@@ -576,7 +576,7 @@ def main() -> int:
 
     app, socketio = create_app(root=args.root)
     print(f"🤖 hybrid-agent dashboard: http://{args.host}:{args.port}")
-    print(f"   providers: 2 online (deepseek, groq) + 2 local (gemma, local-2)")
+    print(f"   providers: 2 online (deepseek, groq) + 2 local (qwen, local-2)")
     if TOKEN:
         print("   auth: DASHBOARD_TOKEN is set — include it as Authorization: Bearer")
     socketio.run(app, host=args.host, port=args.port, debug=False,

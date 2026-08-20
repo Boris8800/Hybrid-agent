@@ -37,7 +37,7 @@ PROVIDER_CFG = {
              "model": "llama-3.3-70b-versatile", "api_key_env": "GROQ_API_KEY", "enabled": True},
         ],
         "local": [
-            {"name": "gemma", "base_url": "http://localhost:1234/api/v1",
+            {"name": "qwen", "base_url": "http://localhost:1234/api/v1",
              "model": "qwen2.5-coder-14b-instruct-mlx", "api_key": "lm-studio", "enabled": True},
             {"name": "local-2", "base_url": "http://localhost:1234/api/v1",
              "model": "qwen2.5-coder-14b-instruct-mlx", "api_key": "lm-studio", "enabled": True},
@@ -50,7 +50,7 @@ class TestProviderRegistry(unittest.TestCase):
     def test_defaults_are_two_online_and_two_local(self):
         prov = load_providers(PROVIDER_CFG)
         self.assertEqual([p.name for p in prov["online"]], ["deepseek", "groq"])
-        self.assertEqual([p.name for p in prov["local"]], ["gemma", "local-2"])
+        self.assertEqual([p.name for p in prov["local"]], ["qwen", "local-2"])
         self.assertEqual(len(prov["online"]), 2)
         self.assertEqual(len(prov["local"]), 2)
 
@@ -73,7 +73,7 @@ class TestProviderRegistry(unittest.TestCase):
         self.assertIsNone(get_online(cfg, name="a"))  # disabled -> not selectable
         self.assertEqual(get_online(cfg, name="b").name, "b")
         self.assertIsNone(get_online(cfg, name="missing"))
-        self.assertEqual(get_local(cfg).name, "gemma")  # empty local slot -> default
+        self.assertEqual(get_local(cfg).name, "qwen")  # empty local slot -> default
         self.assertEqual([p.name for p in enabled_online(cfg)], ["b"])
 
     def test_resolve_api_key_env_wins(self):
@@ -274,18 +274,18 @@ class TestEnhanceProceed(unittest.TestCase):
                                            types.SimpleNamespace(isatty=lambda: False)), \
                 unittest.mock.patch.object(ask, "_generate_with_retry",
                                            return_value=fake_resp):
-            task_for_gemma, enhancement, clar_needed = ask._enhance_task(
+            task_for_qwen, enhancement, clar_needed = ask._enhance_task(
                 types.SimpleNamespace(), cfg, args, "check the web", "", cache=None)
-        return task_for_gemma, clar_needed
+        return task_for_qwen, clar_needed
 
     def test_aborts_when_not_proceeding(self):
         _, clar_needed = self._run(proceed=False)
         self.assertTrue(clar_needed)
 
     def test_proceeds_with_enhanced_prompt(self):
-        task_for_gemma, clar_needed = self._run(proceed=True)
+        task_for_qwen, clar_needed = self._run(proceed=True)
         self.assertFalse(clar_needed)
-        self.assertIn("Do the thing.", task_for_gemma)
+        self.assertIn("Do the thing.", task_for_qwen)
 
 
     def test_local_providers_exclude_max_tokens_by_default(self):

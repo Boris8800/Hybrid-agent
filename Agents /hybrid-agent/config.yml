@@ -210,7 +210,7 @@ providers:
       api_key_env: "GROQ_API_KEY"
       enabled: true
   local:
-    - name: gemma
+    - name: qwen
       base_url: "http://localhost:1234/api/v1"
       model: "qwen2.5-coder-14b-instruct-mlx"
       api_key: "lm-studio"
