@@ -726,6 +726,72 @@ def _budgeted_cloud(cloud, cfg: dict):
     return _BudgetedCloud()
 
 
+def _cached_cloud(cloud, cache, kind: str = "review"):
+    """Wrap the DeepSeek backend so an identical review request short-circuits
+    the API. The key is sha256(system + user), so a hit is only possible when
+    the EXACT same review package was seen before — the cached verdict is then
+    deterministic. Only non-truncated, non-empty responses are stored. No-op
+    when the cache is disabled."""
+    if cache is None or not getattr(cache, "enabled", False):
+        return cloud
+
+    def generate(self, req):
+        key = cache.key(kind, req.system, req.user)
+        hit = cache.get(kind, key)
+        if hit is not None:
+            cache.record(True)
+            _status(f"[hybrid] 🗃 cache HIT {kind} {key[:8]}")
+            return ModelResponse(text=hit, backend="cache", latency_ms=0.0)
+        resp = cloud.generate(req)
+        cache.record(False)
+        if resp.text and not resp.truncated:
+            cache.set(kind, key, resp.text, source="deepseek")
+        return resp
+
+    return type("_CachedCloud", (), {"generate": generate})()
+
+
+def _detect_step_conflicts(steps: list[dict]) -> set[str]:
+    """Plan-declared files claimed by more than one step in the same batch."""
+    claims: dict[str, list] = {}
+    for step in steps:
+        for f in step.get("files", []) or []:
+            claims.setdefault(f, []).append(step.get("id"))
+    return {f for f, ids in claims.items() if len(ids) > 1}
+
+
+def _plan_group_runs(group: list[dict]):
+    """Split one parallel batch into (parallel_steps, serialized_steps).
+
+    Steps whose plan-declared Files: overlap another step's in the same batch
+    cannot run concurrently (divergent edits to one file would clobber each
+    other), so they are serialized in ascending step-id order. Returns the
+    non-conflicted steps for the parallel pool and the conflicted steps to run
+    one at a time."""
+    conflicts = _detect_step_conflicts(group)
+    if not conflicts:
+        return list(group), []
+    conf_steps = [s for s in group if set(s.get("files", []) or []) & conflicts]
+    ok_steps = [s for s in group if s not in conf_steps]
+    return ok_steps, sorted(conf_steps, key=lambda s: s.get("id", 0))
+
+
+def _warn_output_overlaps(results: list[dict]) -> None:
+    """Warn when two steps in the same batch emitted blocks for the same file
+    even though the plan's Files: list did not declare it. The --apply guard
+    keeps the first block; the user should know the later one was dropped."""
+    seen: dict[str, list] = {}
+    for r in results:
+        if not r or r.get("status") != "success":
+            continue
+        for path, _ in _parse_fenced_files(r.get("text") or ""):
+            seen.setdefault(path, []).append(r.get("id"))
+    for path, ids in seen.items():
+        if len(ids) > 1:
+            _status(f"[hybrid] ⚠ post-hoc conflict: '{path}' written by steps "
+                    f"{ids} — apply keeps the first block")
+
+
 def _generate_with_retry(agent: HybridAgent, cfg: dict, args: argparse.Namespace,
                          route: str, req: ModelRequest,
                          stream: bool = False) -> ModelResponse:
@@ -982,13 +1048,26 @@ def _run_parallel(agent: HybridAgent, cfg: dict, args: argparse.Namespace,
     for group in groups:
         if len(group) > 1:
             _status(f"[hybrid] ⚡ Running {len(group)} steps in parallel...")
-        results = executor.execute_parallel(group, task, context)
+        ok_steps, conf_steps = _plan_group_runs(group)
+        if conf_steps:
+            _status("[hybrid] ⚠ file conflict in this batch — serializing "
+                    f"steps {[s.get('id') for s in conf_steps]} (their Files: overlap)")
+        results: list[dict] = []
+        if ok_steps:
+            results.extend(executor.execute_parallel(ok_steps, task, context))
+        for step in conf_steps:
+            _status(f"[hybrid] 🔒 step {step.get('id')} serialized (file conflict)")
+            results.extend(executor.execute_parallel([step], task, context))
+        if conf_steps:
+            by_id = {r.get("id"): r for r in results if r.get("id") is not None}
+            results = [by_id.get(s.get("id")) for s in group]
         _status(f"[hybrid] 📝 {summarize(results)}")
         for r in results:
             if r["status"] == "success":
                 texts.append(r["text"])
             else:
                 _status(f"[hybrid] ⚠ step {r['id']} failed: {r['error']}")
+        _warn_output_overlaps(results)
     final_text = "\n\n".join(t for t in texts if t)
 
     _status("[hybrid] ▶ deepseek reviewing parallel output ...")
@@ -1714,6 +1793,7 @@ def main() -> int:
         cloud = _budgeted_cloud(cloud, cfg)
         tracker = ProgressTracker()
         cache = CacheManager(cfg, args)
+        cloud = _cached_cloud(cloud, cache)
 
         # Optional context (files/diff) goes into the review package via a builder.
         context = args.context or ""
