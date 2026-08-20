@@ -18,6 +18,7 @@ The bridge is a self-contained CLI (`ask.py`) that talks directly to two OpenAI-
 - [Terminal tool (RUN:)](#terminal-tool-run)
 - [Bounded autonomy (BOUND)](#bounded-autonomy-bound)
 - [Journey verification (Vibe DSL)](#journey-verification-vibe-dsl)
+- [Anti-gaming ratchet & guardrails](#anti-gaming-ratchet--guardrails)
 - [Quick start](#quick-start)
 - [CLI reference](#cli-reference)
 - [The supervise loop](#the-supervise-loop)
@@ -287,6 +288,34 @@ Step types: `visit`, `see_text`, `see_element`, `click`, `fill`,
 - Standalone: `./.venv/bin/python journeys.py --file journeys.yml`.
 - Without Playwright/PyYAML installed the runner reports a clear message
   instead of crashing: `./.venv/bin/pip install playwright pyyaml && ./.venv/bin/python -m playwright install chromium`.
+
+## Anti-gaming ratchet & guardrails
+
+**Anti-gaming ratchet (Modonome pattern)** — after the agent's changes are
+applied, a differential gate inspects the working-tree diff and **rejects any
+change that weakens a gate**:
+
+- test files: added `it.skip(` / `.only(` / `@pytest.mark.skip` / `xit(` /
+  `skip: true` → flagged; assertion lines removed without replacement → flagged;
+- `tsconfig*.json`: strict checks flipped off (`"strict": false`,
+  `"skipLibCheck": true`, …) → flagged;
+- guard/config files (`config.yml`, `.github/`, jest/vitest/eslint configs,
+  `journeys.yml`): any modification → flagged as needing owner review.
+
+On violations, DeepSeek is instructed to **RESTORE the gate, never weaken it**,
+re-applies (BOUND-enforced), and re-checks — bounded by `--verify-max`. The run
+is only "green" when the diff is clean.
+
+**Structured guardrails** (`guardrails:` in config.yml) gate the task *before*
+it runs:
+
+- **`block`** — content patterns that reject the task outright (exit 2), e.g.
+  `drop table`.
+- **`approval_required`** — content patterns that escalate to a human: y/N
+  prompt interactively, **exit code 7** non-interactively. Composes with the
+  program's `escalate` playbook.
+- **`cost_limit`** — a rough pre-run cost estimate above the limit escalates to
+  approval.
 
 ## Quick start
 
@@ -588,6 +617,7 @@ Unknown keys are ignored by the loader, and every section has a safe default.
 | `bound` | `danger_zones`, `never_do`, `iron_laws` |
 | `program` | `phases` (list of `{name, gate | journeys, max_fix_rounds, on_fail}`) |
 | `journey` | `file`, `browser`, `timeout_s`, `screenshots_dir` |
+| `guardrails` | `block`, `approval_required`, `cost_limit` |
 | `roles` | `implementer`, `supervisor` (architecture — do not change) |
 
 **Environment overrides** (roles stay architecture; only models/endpoints change):
@@ -620,13 +650,14 @@ report.
 | `3` | Mode violation or generation failure (no verdict / truncated fallback). |
 | `4` | TASK UNCLEAR — clarifying questions were raised non-interactively. |
 | `6` | Daily DeepSeek token budget exhausted. |
+| `7` | GUARDRAIL APPROVAL_REQUIRED — the task needs human approval. |
 | `130` | Interrupted (Ctrl-C). |
 
 ## Testing & CI
 
 ```bash
 cd "Agents /hybrid-agent"
-./.venv/bin/python -m unittest discover -s tests -v    # 190 tests
+./.venv/bin/python -m unittest discover -s tests -v    # 202 tests
 ```
 
 Coverage includes: the fenced-file parser, the apply overwrite/unsafe-path guards,
@@ -663,6 +694,8 @@ repo root/
     ├── gitops.py                # git pull / push / deploy helpers
     ├── bound.py                 # BOUND: danger zones, never_do, iron laws (Ouro Loop)
     ├── journeys.py              # Vibe-DSL user-journey verification (headless browser)
+    ├── differential.py          # Anti-gaming ratchet (rejects weakened gates)
+    ├── guardrails.py            # BLOCK / APPROVAL_REQUIRED task guardrails
     ├── web_dashboard.py         # Web control panel (Flask + SocketIO, port 8660)
     ├── dashboard/               # Dashboard UI + encrypted secrets store
     ├── context.py / scan.py     # Project context scanner

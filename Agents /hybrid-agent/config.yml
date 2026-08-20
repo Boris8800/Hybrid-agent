@@ -151,6 +151,21 @@ journey:
   timeout_s: 30
   screenshots_dir: "hybrid-verify/screenshots"
 
+# Structured task guardrails (checked BEFORE a task runs):
+#   block             -> task rejected outright (exit 2)
+#   approval_required -> escalate to a human (exit 7 non-interactive)
+#   cost_limit        -> estimated cost above this -> approval_required
+guardrails:
+  block:
+    - "drop table"
+    - "truncate table"
+    - "drop database"
+  approval_required:
+    - "delete from users"
+    - "api_key"
+    - "migration"
+  cost_limit: 1000.0
+
 memory:
   root: "./memory"
   max_project_summary_words: 200

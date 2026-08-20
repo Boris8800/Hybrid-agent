@@ -47,6 +47,8 @@ from embed import memory_embed_callable
 from gitops import git_pull, git_push, run_deploy
 from bound import load_bound
 from journeys import JourneyError, run_journeys
+from differential import analyze_changes
+from guardrails import check_guardrails
 from providers import (backend_for, enabled_online, get_local, get_online,
                        load_providers, resolve_api_key)
 
@@ -589,6 +591,7 @@ _KNOWN_CONFIG_KEYS = {
     "bound": {"danger_zones", "never_do", "iron_laws"},
     "program": {"phases"},
     "journey": {"file", "browser", "timeout_s", "screenshots_dir"},
+    "guardrails": {"block", "approval_required", "cost_limit"},
     "roles": {"implementer", "supervisor"},
 }
 
@@ -1910,6 +1913,42 @@ def _run_journey_gate(cloud, root: str, task: str, journey_file: str, bound,
     return False, report
 
 
+def _run_differential_gate(cloud, root: str, task: str, bound, status,
+                           cache=None, max_iter: int = 2) -> tuple[bool, str]:
+    """Anti-gaming ratchet: reject diffs that weaken a gate (skipped tests,
+    removed assertions, loosened type checks, guard-config edits). On
+    violations, DeepSeek is instructed to RESTORE the gate (never weaken it),
+    re-apply, and re-check — bounded by max_iter. Returns (ok, report)."""
+    for round_num in range(max_iter + 1):
+        violations = analyze_changes(root)
+        if not violations:
+            return True, ""
+        if round_num >= max_iter:
+            return False, "differential gate: " + "; ".join(violations[:5])
+        status(f"[hybrid] 🧷 differential gate: {len(violations)} violation(s) — "
+               f"DeepSeek restoring the gate (round {round_num + 1}/{max_iter})")
+        instruction = (
+            "DIFFERENTIAL GATE VIOLATIONS (the diff weakens a verification gate):\n"
+            + "\n".join(violations[:10])
+            + "\n\nRESTORE the weakened assertions, tests, or type-check settings. "
+            "Never skip tests, remove assertions, or loosen type checks to pass.")
+        try:
+            fix_text = _deepseek_fix(cloud, task, instruction, cache=cache)
+        except Exception as exc:  # noqa: BLE001
+            status(f"[hybrid] ⚠ differential fix failed ({exc})")
+            break
+        applied, skipped = _apply_fenced_files(fix_text, root, bound=bound)
+        if any("(bound:" in s for s in skipped):
+            status("[hybrid] ⛔ differential fix violated the BOUND")
+            return False, "differential fix output violated the BOUND"
+        for rel, nbytes in applied:
+            status(f"[hybrid] ✓ gate restored {rel} ({nbytes} B)")
+        if not applied:
+            status("[hybrid] ⚠ differential fix returned no files")
+            break
+    return False, "differential gate: violations remain"
+
+
 def _select_backend(agent: HybridAgent, cfg: dict, route: str,
                     model_override: str | None):
     """Return the backend for `route`, applying the local model override and
@@ -2314,6 +2353,23 @@ def main() -> int:
             print("error: --supervise requires --task", file=sys.stderr)
             return 2
         cfg = _load_cfg(args)
+        # Guardrails: BLOCK rejects the task outright (exit 2); APPROVAL_REQUIRED
+        # escalates to a human (exit 7 non-interactive, y/N interactive).
+        g_decision, g_reason = check_guardrails(args.task, cfg)
+        if g_decision == "block":
+            _status("[hybrid] ⛔ GUARDRAIL BLOCKED: " + g_reason)
+            print(f"GUARDRAIL_BLOCKED: {g_reason}", file=sys.stderr)
+            return 2
+        if g_decision == "approval_required":
+            if sys.stdin.isatty():
+                print("⚠ " + g_reason)
+                print("Proceed anyway? [y/N] ", end="", flush=True)
+                if input().strip().lower() != "y":
+                    print("GUARDRAIL_APPROVAL_REQUIRED", file=sys.stderr)
+                    return 7
+            else:
+                print(f"GUARDRAIL_APPROVAL_REQUIRED: {g_reason}", file=sys.stderr)
+                return 7
         mode = _resolve_mode(args)
         if not MODES[mode]["api_supervision"]:
             _status(f"[hybrid] ⛔ refusal: mode={mode} has no API supervision (only hybrid enables it).")
@@ -2562,6 +2618,17 @@ def main() -> int:
                 timeout_s=jtimeout, max_iter=args.verify_max)
             if journey_report:
                 verify_report = journey_report
+        # Anti-gaming ratchet (Modonome): reject diffs that weaken a gate —
+        # skipped tests, removed assertions, loosened type checks, guard-config
+        # edits. DeepSeek is told to RESTORE the gate, never weaken it.
+        if applied and not args.apply_dry_run and verified:
+            _status("[hybrid] 🧷 differential gate: checking the diff ...")
+            verified, diff_report = _run_differential_gate(
+                cloud, args.root, args.task, bound,
+                lambda line: tracker.tick(line), cache=cache,
+                max_iter=args.verify_max)
+            if diff_report:
+                verify_report = diff_report
         if verify_stats:
             stats.record_verify(verify_stats)
         stats.record_phases(tracker.phases())
