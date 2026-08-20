@@ -11,16 +11,27 @@ recent `max_records` entries are kept to bound file size.
 from __future__ import annotations
 
 import json
+import os
 import re
+import subprocess
 import time
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from datetime import datetime
 from pathlib import Path
 
+from embed import DEFAULT_SIMILARITY_THRESHOLD, cosine
 from router.confidence import MemoryView
 
 MAX_RECORDS = 200
 _WORD_RE = re.compile(r"[A-Za-z0-9_]+")
+
+
+def _atomic_write(path: Path, text: str) -> None:
+    """Write a file atomically (temp + os.replace) so concurrent sessions can
+    never observe or leave a torn file behind."""
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(text, encoding="utf-8")
+    os.replace(tmp, path)
 
 # Domain keywords used by the consolidation pass to bucket task history.
 _DOMAIN_KEYWORDS = {
@@ -51,6 +62,7 @@ class TaskRecord:
     route: str
     verdict: str          # "APPROVED" | "FIX_REQUIRED" | "REJECTED" | fallback reason
     quality: float = 0.0
+    embedding: list = field(default_factory=list)  # local semantic vector, if any
 
     @property
     def ok(self) -> bool:
@@ -60,11 +72,20 @@ class TaskRecord:
 class TaskMemory:
     """Persistent record of completed tasks; read side for the router."""
 
-    def __init__(self, root: str | None = None, max_records: int = MAX_RECORDS):
-        self.root = Path(root) if root else Path(__file__).resolve().parent / "memory"
+    def __init__(self, root: str | None = None, max_records: int = MAX_RECORDS,
+                 embed=None, embed_threshold: float = DEFAULT_SIMILARITY_THRESHOLD):
+        # Relative roots resolve against the script dir (like CacheManager) so
+        # a bare "./memory" or "memory/<project>" is location-independent.
+        if root is None:
+            self.root = Path(__file__).resolve().parent / "memory"
+        else:
+            p = Path(root)
+            self.root = p if p.is_absolute() else Path(__file__).resolve().parent / p
         self.path = self.root / "tasks.json"
         self.insights_path = self.root / "insights.json"
         self.max_records = max_records
+        self.embed = embed          # embed([texts]) -> list[vectors] | None
+        self.embed_threshold = embed_threshold
 
     def _load(self) -> list[dict]:
         if not self.path.is_file():
@@ -78,7 +99,7 @@ class TaskMemory:
     def _save(self, records: list[dict]) -> None:
         try:
             self.root.mkdir(parents=True, exist_ok=True)
-            self.path.write_text(json.dumps(records, indent=2), encoding="utf-8")
+            _atomic_write(self.path, json.dumps(records, indent=2))
         except OSError:
             pass
 
@@ -106,7 +127,12 @@ class TaskMemory:
         return [records[i] for i in keep_idx]
 
     def record(self, rec: TaskRecord) -> None:
-        """Append one outcome and evict the lowest-value entries past the cap."""
+        """Append one outcome (embedding computed when available) and evict the
+        lowest-value entries past the cap."""
+        if not rec.embedding and self.embed is not None and rec.task:
+            vec = self.embed([rec.task])
+            if vec:
+                rec.embedding = vec[0]
         records = self._load()
         records.append(asdict(rec))
         self._save(self._evict(records))
@@ -114,16 +140,27 @@ class TaskMemory:
     def memory_view(self, task: str) -> MemoryView:
         """Build a MemoryView for `task` from real history.
 
-        similar_task_success_rate is the fraction of APPROVED records among
-        tasks sharing at least one trigram with `task` (0.0 when there is no
-        matching history). seen_ngrams is the union of every recorded task's
-        trigrams, so novelty has something real to compare against.
+        Similarity is trigram overlap PLUS, when embeddings are available,
+        cosine similarity of the current task against each record's stored
+        embedding (threshold-controlled) — so paraphrased tasks are recalled
+        correctly instead of scoring 0. similar_task_success_rate is the
+        fraction of APPROVED records among similar tasks.
         """
         records = self._load()
         if not records:
             return MemoryView(seen_ngrams=frozenset())
         current = _ngrams(task)
         similar = [r for r in records if current & _ngrams(r.get("task", ""))]
+        if self.embed is not None and task:
+            vec = self.embed([task])
+            cur_vec = vec[0] if vec else None
+            if cur_vec:
+                for r in records:
+                    rv = r.get("embedding")
+                    if (isinstance(rv, list) and len(rv) == len(cur_vec) and rv
+                            and cosine(cur_vec, rv) >= self.embed_threshold
+                            and r not in similar):
+                        similar.append(r)
         rate = 0.0
         if similar:
             rate = sum(1 for r in similar if r.get("verdict") == "APPROVED") / len(similar)
@@ -182,8 +219,7 @@ class TaskMemory:
         }
         try:
             self.root.mkdir(parents=True, exist_ok=True)
-            self.insights_path.write_text(json.dumps(insights, indent=2),
-                                          encoding="utf-8")
+            _atomic_write(self.insights_path, json.dumps(insights, indent=2))
         except OSError:
             pass
         return insights
@@ -220,3 +256,20 @@ class TaskMemory:
         lines.append("Use this history to judge task difficulty and local-model "
                      "reliability; do not mention this block in your output.")
         return "\n".join(lines)
+
+
+def memory_root_from_cfg(cfg: dict, cwd: str = ".") -> str | None:
+    """Resolve the memory root: an explicit memory.root in config wins;
+    otherwise auto-scope per project (git top-level name, else cwd basename) so
+    learning is project-relevant and never bleeds across repos."""
+    configured = (cfg.get("memory") or {}).get("root")
+    if configured:
+        return configured
+    try:
+        proc = subprocess.run(["git", "rev-parse", "--show-toplevel"], cwd=cwd,
+                              capture_output=True, text=True, timeout=10)
+        toplevel = proc.stdout.strip() if proc.returncode == 0 else ""
+        name = Path(toplevel).name if toplevel else Path(cwd).resolve().name
+    except Exception:  # noqa: BLE001 - fall back to the cwd name
+        name = Path(cwd).resolve().name
+    return f"memory/{name or 'default'}"

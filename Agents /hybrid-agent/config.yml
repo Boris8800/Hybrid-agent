@@ -84,6 +84,12 @@ circuit_breaker:
 memory:
   root: "./memory"
   max_project_summary_words: 200
+  # Semantic memory: local embeddings (LM Studio /v1/embeddings) make similar-task
+  # recall resilient to paraphrasing ("fix the login bug" ~ "resolve auth issue").
+  # Falls back to word-trigrams on any failure or when the endpoint is down.
+  semantic_similarity: true
+  embedding_model: "text-embedding-nomic-embed-text-v1.5"
+  embedding_threshold: 0.60
 
 # Roles are architecture (permanent); model names are configuration.
 # The implementer is the local backend; the supervisor is the API backend.

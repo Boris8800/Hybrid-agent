@@ -18,7 +18,8 @@ from backends.base import Backend, ModelRequest
 from backends.circuit_breaker import CircuitBreaker
 from backends.deepseek import DeepSeekBackend
 from backends.local_gemma import GemmaBackend
-from memory import TaskMemory, TaskRecord
+from memory import TaskMemory, TaskRecord, memory_root_from_cfg
+from embed import memory_embed_callable
 from router import archetypes
 from router.confidence import MemoryView, score
 from router.threshold import ThresholdController
@@ -119,7 +120,8 @@ class HybridAgent:
     def run(self, task: str, context_chars: int = 2000,
             memory: MemoryView | None = None) -> dict:
         memory = memory or TaskMemory(
-            (self.cfg.get("memory") or {}).get("root")).memory_view(task)
+            memory_root_from_cfg(self.cfg),
+            embed=memory_embed_callable(self.cfg)).memory_view(task)
         route, reason = self.route(task, context_chars, memory)
         local, cloud = self._backends()
 
@@ -160,7 +162,8 @@ class HybridAgent:
         # Persistent memory event so the router's confidence/novelty signals
         # reflect real history (memory.py keeps only recent records).
         try:
-            TaskMemory((self.cfg.get("memory") or {}).get("root")).record(TaskRecord(
+            TaskMemory(memory_root_from_cfg(self.cfg),
+                       embed=memory_embed_callable(self.cfg)).record(TaskRecord(
                 task=task, ts=time.time(), route=result["route"],
                 verdict="APPROVED" if local_ok else result["reason"],
             ))

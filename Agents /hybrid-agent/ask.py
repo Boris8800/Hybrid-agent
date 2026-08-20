@@ -42,7 +42,8 @@ from supervise import (GEMMA_MAX_TOKENS, ChainOfThoughtParser, ReviewPackage,
 from context import ProjectContext
 from parallel import (DependencyAnalyzer, ParallelExecutor, parse_plan_steps,
                       summarize)
-from memory import TaskMemory, TaskRecord
+from memory import TaskMemory, TaskRecord, memory_root_from_cfg
+from embed import memory_embed_callable
 
 # --- Self-heal: loading config.yml requires PyYAML + openai, which exist only
 # in the project venv (hybrid-agent/.venv). When invoked with a system python3
@@ -220,6 +221,14 @@ class ProgressTracker:
         return self._phases
 
 
+def _atomic_write(path: pathlib.Path, text: str) -> None:
+    """Write a file atomically (temp + os.replace) so concurrent sessions can
+    never observe or leave a torn file behind."""
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(text, encoding="utf-8")
+    os.replace(tmp, path)
+
+
 class CacheManager:
     """Response cache for the hybrid bridge (enhance / generate / fix kinds).
 
@@ -266,7 +275,7 @@ class CacheManager:
             kind_dir = self.dir / kind
             kind_dir.mkdir(parents=True, exist_ok=True)
             payload = {"text": text, "source": source, "ts": datetime.now().isoformat()}
-            (kind_dir / f"{key}.json").write_text(json.dumps(payload))
+            _atomic_write(kind_dir / f"{key}.json", json.dumps(payload))
             entries = sorted(kind_dir.glob("*.json"), key=lambda p: p.stat().st_mtime)
             while len(entries) > self.max_entries:
                 entries[0].unlink()
@@ -326,7 +335,7 @@ class StatsTracker:
 
     def _save(self) -> None:
         try:
-            self.path.write_text(json.dumps(self.stats, indent=2), encoding="utf-8")
+            _atomic_write(self.path, json.dumps(self.stats, indent=2))
         except OSError:
             pass
 
@@ -549,10 +558,47 @@ def _load_config_quiet(path: str | None) -> dict:
 
 def _load_cfg(args: argparse.Namespace) -> dict:
     """Load config and apply the startup wiring that depends on it
-    (verify-allowlist prefixes)."""
+    (verify-allowlist prefixes, config-key validation)."""
     cfg = _load_config_quiet(args.config or _default_config_path())
     _configure_verify_allowlist(cfg)
+    _warn_unknown_config(cfg)
     return cfg
+
+
+# Every config key the engine understands. Anything else is a typo.
+_KNOWN_CONFIG_KEYS = {
+    "router": {"local_threshold", "threshold_min", "threshold_max",
+               "target_local_rate", "alpha", "supervision", "weights"},
+    "backends": {"local", "deepseek"},
+    "review": {"max_local_retries", "max_depth_tokens", "max_failure_summary_words",
+               "daily_token_budget", "verify", "verify_timeout", "verify_groups",
+               "verify_allowlist", "regression", "regression_timeout"},
+    "cache": {"enabled", "dir", "ttl_days", "max_entries"},
+    "circuit_breaker": {"window_size", "local_error_ceiling",
+                        "deepseek_error_ceiling", "cooldown_s"},
+    "memory": {"root", "max_project_summary_words", "semantic_similarity",
+               "embedding_model", "embedding_threshold"},
+    "roles": {"implementer", "supervisor"},
+}
+
+
+def _warn_unknown_config(cfg: dict) -> None:
+    """Warn (stderr) about config keys the engine does not recognize, so typos
+    like 'daily_toke_budget' are caught instead of silently ignored."""
+    try:
+        for key in cfg:
+            if key not in _KNOWN_CONFIG_KEYS:
+                print(f"warning: unknown config key '{key}' (typo? ignored by the engine)",
+                      file=sys.stderr)
+        for section, known in _KNOWN_CONFIG_KEYS.items():
+            sub = cfg.get(section)
+            if isinstance(sub, dict):
+                for key in sub:
+                    if key not in known:
+                        print(f"warning: unknown config key '{section}.{key}' (typo? ignored)",
+                              file=sys.stderr)
+    except Exception:  # noqa: BLE001 - validation must never break startup
+        pass
 
 
 def _normalize_tokens(tokens) -> dict:
@@ -1823,7 +1869,8 @@ def main() -> int:
         cfg = _load_cfg(args)
         agent = HybridAgent(cfg)
         context = args.context or ""
-        memory = TaskMemory((cfg.get("memory") or {}).get("root")).memory_view(args.task)
+        memory = TaskMemory(memory_root_from_cfg(cfg),
+                            embed=memory_embed_callable(cfg)).memory_view(args.task)
         route, reason = agent.route(
             args.task, context_chars=len(args.task) + len(context),
             memory=memory,
@@ -1917,7 +1964,7 @@ def main() -> int:
 
         # Persistent task memory: router signal + consolidated insights injected
         # into the enhance/package context so both models learn from history.
-        mem = TaskMemory((cfg.get("memory") or {}).get("root"))
+        mem = TaskMemory(memory_root_from_cfg(cfg), embed=memory_embed_callable(cfg))
         memory = mem.memory_view(args.task)
         plan, plan_reason = _plan_supervision(
             agent, cfg, args, args.task, context, memory)
@@ -2045,7 +2092,7 @@ def main() -> int:
 
         # Persistent task memory for the router's confidence/threshold learning.
         try:
-            TaskMemory((cfg.get("memory") or {}).get("root")).record(TaskRecord(
+            mem.record(TaskRecord(
                 task=args.task,
                 ts=time.time(),
                 route=result.route,

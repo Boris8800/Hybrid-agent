@@ -328,19 +328,26 @@ fixes, enhancement, and single-shot calls — and actual usage is persisted to
 
 `memory.py` persists one outcome per completed task in `memory/tasks.json`:
 
-- **Scored eviction** — instead of a naive FIFO cut, entries past the cap are
-  evicted by a score combining **recency and task frequency** (0.7/0.3), so
-  frequently-recurring and recent tasks survive while one-shot stale ones are
-  forgotten.
-- **Consolidation pass** — with ≥ 10 records, `consolidate()` synthesizes the
-  history into high-level insights (overall and recent approval rates, trend
-  direction, strongest task domains) and caches them to `memory/insights.json`.
-  `insights_text()` lazily refreshes stale insights and injects a compact
-  summary into the enhancement/review context, so both models learn from
-  history. Local-only — no model calls are involved.
-- **MemoryView** — `similar_task_success_rate` is the share of APPROVED tasks
-  sharing a trigram with the current task; novelty is computed against genuinely
-  seen n-grams.
+- **Semantic similarity** — every task is embedded via the local LM Studio
+  `/v1/embeddings` endpoint (768-dim, free, offline). Similar-task recall is
+  **cosine-based** (threshold `memory.embedding_threshold`, default 0.60,
+  calibrated on the real model), so paraphrased tasks like "fix the login bug"
+  and "resolve the authentication issue" are matched correctly — something
+  word-trigram matching could not do. When the embedding endpoint is down or
+  disabled, the engine transparently falls back to trigrams.
+- **Per-project scoping** — memory auto-scopes to `memory/<project>/` (from the
+  git top-level name), so learning never bleeds across repositories; an explicit
+  `memory.root` in config overrides this.
+- **Scored eviction** — entries past the cap are evicted by recency + task
+  frequency (0.7/0.3) instead of FIFO.
+- **Consolidation pass** — with ≥ 10 records, `consolidate()` synthesizes
+  approval rates, trend direction, and strongest task domains into
+  `memory/insights.json`; `insights_text()` injects a compact summary into the
+  enhancement/review context. Local-only.
+- **Atomic writes** — all memory, stats, and cache files are written via
+  temp + `os.replace`, so concurrent Agent Manager sessions can never tear them.
+- **MemoryView** — `similar_task_success_rate` (semantic + trigram) and `seen_ngrams`
+  feed the confidence scorer and the supervision plan.
 
 The **adaptive threshold** (`router/threshold.py`) is updated from real outcomes
 only once a 50-sample observation window exists (`maybe_update`), and circuit
@@ -370,7 +377,7 @@ Unknown keys are ignored by the loader, and every section has a safe default.
 | `review` | `verify`, `verify_timeout`, `verify_groups`, `verify_allowlist`, `regression`, `regression_timeout`, `daily_token_budget`, `max_depth_tokens`, `max_failure_summary_words` |
 | `cache` | `enabled`, `dir`, `ttl_days`, `max_entries` |
 | `circuit_breaker` | `window_size`, `local_error_ceiling`, `deepseek_error_ceiling`, `cooldown_s` |
-| `memory` | `root`, `max_project_summary_words` |
+| `memory` | `root`, `max_project_summary_words`, `semantic_similarity`, `embedding_model`, `embedding_threshold` |
 | `roles` | `implementer`, `supervisor` (architecture — do not change) |
 
 **Environment overrides** (roles stay architecture; only models/endpoints change):
@@ -409,15 +416,17 @@ report.
 
 ```bash
 cd "Agents /hybrid-agent"
-./.venv/bin/python -m unittest discover -s tests -v    # 112 tests
+./.venv/bin/python -m unittest discover -s tests -v    # 127 tests
 ```
 
 Coverage includes: the fenced-file parser, the apply overwrite/unsafe-path guards,
 dry-run, the clarify heuristic, `CacheManager` (TTL/cap/disabled), the verdict cache,
-`TaskMemory` (scored eviction, consolidation, insights), the supervision router
-(trivial/critical signals, budget pressure, overrides, memory similarity), the
-local-first `review=False` supervise path, token-budget accounting, parallel-verify
-groups, truncation retries, and parallel step conflict detection/serialization.
+`TaskMemory` (semantic recall, scored eviction, consolidation, insights), the
+supervision router (trivial/critical signals, budget pressure, overrides, memory
+similarity), the local-first `review=False` supervise path, token-budget accounting,
+embedding clients and cosine, per-project memory scoping, config-key validation,
+parallel-verify groups, truncation retries, and parallel step conflict
+detection/serialization.
 
 `.github/workflows/ci.yml` runs the full suite on Python 3.11 and 3.12 for every push and
 pull request, plus a syntax check of every engine module and the `.kilo/agent/*.md`
@@ -435,7 +444,8 @@ repo root/
     ├── agent.py                 # HybridAgent: backends, router, adaptive threshold
     ├── supervise.py             # Gemma-primary / DeepSeek-supervisor control loop
     ├── parallel.py              # Plan parsing, dependency groups, parallel executor
-    ├── memory.py                # Persistent task memory (router learning)
+    ├── memory.py                # Persistent task memory (semantic recall, consolidation)
+    ├── embed.py                 # Local embeddings client (/v1/embeddings) + cosine
     ├── context.py / scan.py     # Project context scanner
     ├── backends/                # Gemma/DeepSeek clients + circuit breaker
     ├── router/                  # Archetypes, confidence scoring, threshold
