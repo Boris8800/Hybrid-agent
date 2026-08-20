@@ -216,6 +216,12 @@ providers:
       api_key: "lm-studio"
       timeout_s: 180
       max_retries: 3
+      # request_extra is merged into the /api/v1/chat body. repeat_penalty
+      # (snake_case, verified accepted) guards against the token-repetition
+      # degeneration the chat UI already fixes via repeatPenalty 1.15 — the
+      # bridge path previously had NO repetition penalty at all.
+      request_extra:
+        repeat_penalty: 1.15
       enabled: true
     - name: local-2
       base_url: "http://localhost:1234/api/v1"
@@ -223,6 +229,8 @@ providers:
       api_key: "lm-studio"
       timeout_s: 180
       max_retries: 3
+      request_extra:
+        repeat_penalty: 1.15
       enabled: true
 
 # Roles are architecture (permanent); model names are configuration.
