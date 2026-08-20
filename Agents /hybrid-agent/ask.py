@@ -53,6 +53,10 @@ from patcher import (apply_unified_diff, extract_context, extract_error_location
                      is_diff)
 from contract import parse_contract
 from dependencies import build_dependency_context
+from scanner import redact_cloud, redact_text
+from rules import load_engineering_rules
+from learned_rules import LearnedRules
+from dependency_gate import run_dependency_gate
 from providers import (backend_for, enabled_online, get_local, get_online,
                        load_providers, resolve_api_key)
 
@@ -141,6 +145,10 @@ def _status(line: str) -> None:
     the user/agent immediately (before the model call finishes)."""
     sys.stderr.write(line + "\n")
     sys.stderr.flush()
+
+
+import scanner as _scanner_mod  # noqa: E402 - wire the redaction wrapper's status
+_scanner_mod._status = _status
 
 
 def _model_label(cfg: dict, route: str, model_override: str | None) -> str:
@@ -596,6 +604,8 @@ _KNOWN_CONFIG_KEYS = {
     "program": {"phases"},
     "journey": {"file", "browser", "timeout_s", "screenshots_dir"},
     "guardrails": {"block", "approval_required", "cost_limit"},
+    "secrets_scan": {"mode", "types"},
+    "dependency_gate": {"allow", "audit"},
     "roles": {"implementer", "supervisor"},
 }
 
@@ -983,6 +993,24 @@ def _generate_with_retry(agent: HybridAgent, cfg: dict, args: argparse.Namespace
                 raise BudgetExceeded(
                     f"daily DeepSeek token budget exhausted ({used}/{budget}). "
                     "Raise review.daily_token_budget or retry tomorrow.")
+        # Secrets/PII redaction: this path uses the raw backend, so redact here
+        # (the supervise loop's wrapped cloud redacts separately — both are
+        # idempotent, so double redaction is harmless).
+        sc = cfg.get("secrets_scan") or {}
+        if sc.get("mode", "redact") != "off":
+            user_res = redact_text(req.user, sc.get("types"))
+            sys_res = redact_text(req.system, sc.get("types"))
+            findings = user_res.findings + sys_res.findings
+            if findings:
+                kinds = ", ".join(f"{f['type']}x{f['count']}" for f in findings)
+                if sc.get("mode") == "block":
+                    raise RuntimeError(
+                        "secrets_scan=block: secret/PII detected in outbound "
+                        f"request ({kinds}) — refusing to send")
+                _status(f"[hybrid] 🔒 redacted {len(findings)} secret/PII finding(s) "
+                        f"before cloud send: {kinds}")
+                req.user = user_res.redacted
+                req.system = sys_res.redacted
     cap = LOCAL_MAX_OUTPUT_TOKENS if route == "local" else MAX_OUTPUT_TOKENS
     resp = _generate(agent, cfg, args, route, req, stream=stream)
     if resp.truncated and resp.text and req.max_tokens < cap:
@@ -1686,7 +1714,7 @@ def _run_final_verify(cloud, root: str, task: str, cmds, status,
                       regression_timeout: int = 600,
                       cache=None,
                       parallel=False, parallel_workers=4,
-                      verify_groups=None, bound=None) -> tuple[bool, str]:
+                      verify_groups=None, bound=None, rules=None) -> tuple[bool, str]:
     """Final error-check stage: run verification commands and, on errors, have
     DeepSeek fix them (applied to disk) until clean or max_iter exhausted.
 
@@ -1796,6 +1824,8 @@ def _run_final_verify(cloud, root: str, task: str, cmds, status,
                          "estimated_cost_usd": round(tokens_used * 0.000002, 5),
                          "status": "FAILED", "files": list(fixed_files)})
     status("[hybrid] ⛔ verification still failing after max attempts")
+    if rules is not None:
+        rules.record_failure(task, error_text, fixed_files)
     return False, error_text
 
 
@@ -1900,7 +1930,7 @@ def _run_program_phases(cloud, root: str, task: str, bound, cfg: dict, status,
 
 def _run_journey_gate(cloud, root: str, task: str, journey_file: str, bound,
                       status, cache=None, timeout_s: int = 30,
-                      max_iter: int = 2) -> tuple[bool, str]:
+                      max_iter: int = 2, rules=None) -> tuple[bool, str]:
     """Run the journeys.yml user journeys headlessly; on failure DeepSeek fixes
     the code (surgical patches, BOUND-enforced) and the journeys re-run until
     green or max_iter exhausted. The journeys file itself is never modified
@@ -1937,6 +1967,8 @@ def _run_journey_gate(cloud, root: str, task: str, journey_file: str, bound,
             screenshots_dir=str(pathlib.Path(root) / "hybrid-verify" / "screenshots"))
         if ok:
             return True, report
+    if rules is not None:
+        rules.record_failure(task, report, [])
     return False, report
 
 
@@ -2275,6 +2307,17 @@ def main() -> int:
                              "default: the primary online provider")
     parser.add_argument("--no-audit", action="store_true",
                         help="skip the adversarial final auditor pass")
+    parser.add_argument("--secrets-scan", choices=["off", "redact", "block"],
+                        default=None,
+                        help="override secrets_scan mode: redact (default) masks "
+                             "secrets/PII before any cloud request, block refuses "
+                             "to send, off disables scanning")
+    parser.add_argument("--allow-dep", action="append", default=[],
+                        help="pre-approve a dependency for the dependency gate "
+                             "(repeatable)")
+    parser.add_argument("--dep-audit", action="store_true",
+                        help="look up new dependencies' license/description from "
+                             "the npm/PyPI registry (best-effort)")
     parser.add_argument("--stats", action="store_true",
                         help="print the 80/20 strategy summary (hybrid-agent/stats.json)")
     parser.add_argument("--evaluate", action="store_true",
@@ -2478,6 +2521,10 @@ def main() -> int:
         cloud = _budgeted_cloud(cloud, cfg)
         cloud = (_parallel_cloud(cloud, cfg, args) if args.turbo
                  else _failover_cloud(cloud, cfg, args))
+        if args.secrets_scan:
+            cfg = {**cfg, "secrets_scan": {**(cfg.get("secrets_scan") or {}),
+                                           "mode": args.secrets_scan}}
+        cloud = redact_cloud(cloud, cfg)  # OUTERMOST: no raw secrets ever leave
 
         # --pull: refresh the baseline before the agent works (best-effort).
         if args.pull:
@@ -2509,6 +2556,18 @@ def main() -> int:
         # context (enhance + review package) and every Gemma iteration.
         bound = None if args.no_bound else load_bound(cfg)
         bound_text = bound.prompt_text() if bound is not None else ""
+        # Engineering rules: per-project constitution (.agent/engineering-rules.yml).
+        eng = load_engineering_rules(args.root)
+        eng_text = eng.prompt_text()
+        if eng_text:
+            _status("[hybrid] 📜 engineering rules loaded")
+            bound_text = (bound_text + "\n\n" + eng_text) if bound_text else eng_text
+        # Learned rules from past failures in this project.
+        learned = LearnedRules(memory_root_from_cfg(cfg))
+        learned_text = learned.prompt_text()
+        if learned_text:
+            _status("[hybrid] 🧠 learned rules: past-failure patterns applied")
+            context = (context + "\n\n" + learned_text).strip() if context else learned_text
         if bound_text:
             _status("[hybrid] 🧱 BOUND active (danger zones, never_do, iron laws)")
             context = (context + "\n\n" + bound_text).strip() if context else bound_text
@@ -2564,11 +2623,15 @@ def main() -> int:
             if (pathlib.Path(args.root) / jf).is_file():
                 args.journeys = jf
                 _status(f"[hybrid] 🚦 contract requires browser journey — enabling {jf}")
-        if contract.files:
-            dep_ctx = build_dependency_context(args.root, contract.files)
+        if contract.files or learned.suggested_files():
+            involved = list(contract.files)
+            for f in learned.suggested_files():
+                if f not in involved:
+                    involved.append(f)
+            dep_ctx = build_dependency_context(args.root, involved)
             if dep_ctx:
                 _status(f"[hybrid] 🕸 dependency-aware context: {len(dep_ctx)} chars "
-                        f"for {len(contract.files)} file(s)")
+                        f"for {len(involved)} file(s)")
                 context = (context + "\n\n" + dep_ctx).strip() if context else dep_ctx
 
         def _pkg(task: str, code: str, iteration: int) -> ReviewPackage:
@@ -2722,7 +2785,7 @@ def main() -> int:
                     verify_stats=verify_stats, regression_cmds=regression_cmds,
                     regression_timeout=regression_timeout, cache=cache,
                     parallel=args.verify_parallel, parallel_workers=args.verify_workers,
-                    verify_groups=verify_groups, bound=bound)
+                    verify_groups=verify_groups, bound=bound, rules=learned)
             tracker.end_phase()
         # Journey verification (Vibe DSL): headless user journeys run as a gate
         # after the build/test gates. Fails -> DeepSeek fixes -> re-run.
@@ -2732,7 +2795,7 @@ def main() -> int:
             verified, journey_report = _run_journey_gate(
                 cloud, args.root, args.task, args.journeys, bound,
                 lambda line: tracker.tick(line), cache=cache,
-                timeout_s=jtimeout, max_iter=args.verify_max)
+                timeout_s=jtimeout, max_iter=args.verify_max, rules=learned)
             if journey_report:
                 verify_report = journey_report
         # Anti-gaming ratchet (Modonome): reject diffs that weaken a gate —
@@ -2746,6 +2809,15 @@ def main() -> int:
                 max_iter=args.verify_max)
             if diff_report:
                 verify_report = diff_report
+        # Dependency gate: new packages in manifests need approval.
+        if applied and not args.apply_dry_run and verified:
+            _status("[hybrid] ⚙ dependency gate: checking manifests ...")
+            dep_ok, dep_report, dep_deps = run_dependency_gate(
+                args.root, eng, lambda line: tracker.tick(line),
+                allow_deps=args.allow_dep, audit=args.dep_audit)
+            if not dep_ok:
+                verified = False
+                verify_report = dep_report
         # Adversarial final auditor: an independent pass whose ONLY job is to
         # prove the implementation wrong (contract + diff + tests). Optionally
         # on a DIFFERENT provider for true model independence.
@@ -2754,7 +2826,7 @@ def main() -> int:
             if args.auditor_provider:
                 ap = get_online(cfg, name=args.auditor_provider)
                 if ap is not None and resolve_api_key(ap):
-                    auditor = _budgeted_cloud(backend_for(ap), cfg)
+                    auditor = redact_cloud(_budgeted_cloud(backend_for(ap), cfg), cfg)
                     _status(f"[hybrid] 🛡 auditor provider: {ap.name}")
                 else:
                     _status(f"[hybrid] ⚠ auditor provider '{args.auditor_provider}' "

@@ -22,7 +22,7 @@ jobs:
         run: python -m pip install pyyaml flask flask-socketio cryptography
 
       - name: Syntax check (hybrid engine)
-        run: python -m py_compile "Agents /hybrid-agent/ask.py" "Agents /hybrid-agent/supervise.py" "Agents /hybrid-agent/agent.py" "Agents /hybrid-agent/memory.py" "Agents /hybrid-agent/parallel.py" "Agents /hybrid-agent/context.py" "Agents /hybrid-agent/providers.py" "Agents /hybrid-agent/gitops.py" "Agents /hybrid-agent/bound.py" "Agents /hybrid-agent/journeys.py" "Agents /hybrid-agent/differential.py" "Agents /hybrid-agent/guardrails.py" "Agents /hybrid-agent/patcher.py" "Agents /hybrid-agent/web_dashboard.py" "Agents /hybrid-agent/dashboard/secrets.py" "Agents /hybrid-agent/router/confidence.py" "Agents /hybrid-agent/router/threshold.py"
+        run: python -m py_compile "Agents /hybrid-agent/ask.py" "Agents /hybrid-agent/supervise.py" "Agents /hybrid-agent/agent.py" "Agents /hybrid-agent/memory.py" "Agents /hybrid-agent/parallel.py" "Agents /hybrid-agent/context.py" "Agents /hybrid-agent/providers.py" "Agents /hybrid-agent/gitops.py" "Agents /hybrid-agent/bound.py" "Agents /hybrid-agent/journeys.py" "Agents /hybrid-agent/differential.py" "Agents /hybrid-agent/guardrails.py" "Agents /hybrid-agent/patcher.py" "Agents /hybrid-agent/contract.py" "Agents /hybrid-agent/dependencies.py" "Agents /hybrid-agent/scanner.py" "Agents /hybrid-agent/rules.py" "Agents /hybrid-agent/learned_rules.py" "Agents /hybrid-agent/dependency_gate.py" "Agents /hybrid-agent/web_dashboard.py" "Agents /hybrid-agent/dashboard/secrets.py" "Agents /hybrid-agent/router/confidence.py" "Agents /hybrid-agent/router/threshold.py"
 
       - name: Unit tests
         working-directory: "Agents /hybrid-agent"

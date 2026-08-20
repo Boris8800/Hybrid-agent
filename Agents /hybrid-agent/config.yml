@@ -165,6 +165,22 @@ guardrails:
     - "migration"
   cost_limit: 1000.0
 
+# Secrets / PII scanning for OUTBOUND cloud traffic (the BOUND protects what
+# gets WRITTEN; this protects what LEAVES the machine). Every request to the
+# API models is scanned and redacted before transmission.
+#   mode: redact (mask secrets with <REDACTED:type>) | block (refuse to send) | off
+secrets_scan:
+  mode: "redact"
+  types: ["stripe", "api_key", "aws_key", "github_token", "jwt",
+          "private_key", "conn_string", "email", "phone"]
+
+# New-dependency protection: when the applied diff adds a package to a manifest,
+# the run stops pending approval (pre-approve via dependency_gate.allow or
+# --allow-dep; engineering rules' blocked_dependencies are rejected outright).
+dependency_gate:
+  allow: []
+  audit: false      # look up license/description from npm/PyPI (best-effort)
+
 memory:
   root: "./memory"
   max_project_summary_words: 200

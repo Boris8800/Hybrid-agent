@@ -20,6 +20,7 @@ The bridge is a self-contained CLI (`ask.py`) that talks directly to two OpenAI-
 - [Journey verification (Vibe DSL)](#journey-verification-vibe-dsl)
 - [Anti-gaming ratchet & guardrails](#anti-gaming-ratchet--guardrails)
 - [Surgical AST-aware repairs](#surgical-ast-aware-repairs)
+- [Trust & learning layer](#trust--learning-layer)
 - [Quick start](#quick-start)
 - [CLI reference](#cli-reference)
 - [The supervise loop](#the-supervise-loop)
@@ -338,6 +339,35 @@ Fixes are **diff-first**, not full-file rewrites:
   a 1-line fix cost **53 tokens as a diff vs ~1822 as a full rewrite (97%
   saved)**.
 
+## Trust & learning layer
+
+Four systems that make the engine safer and smarter over time:
+
+**Secrets/PII scanning** — the BOUND protects what gets *written*; this
+protects what *leaves the machine*. Every request to the API models is scanned
+and redacted before transmission: API keys, AWS keys, GitHub tokens, JWTs,
+private keys, Stripe keys, connection strings, emails, phones.
+
+- `secrets_scan.mode`: `redact` (default, `<REDACTED:type>`) · `block` (refuse
+  to send, exit) · `off`. `--secrets-scan` overrides per run.
+
+**Engineering rules** — a per-project constitution at
+`.agent/engineering-rules.yml` (architecture facts, rules, dependency policies)
+injected alongside the BOUND and consulted by the dependency gate.
+
+**Learning from failures** — when the same (domain, error-category) keeps
+failing, the engine records what the successful fixes actually touched and
+emits a reusable rule into `memory/<project>/rules.json` — e.g. *"for backend
+API tasks with missing-module failures: always include service + test in the
+dependency context."* Rules are injected into the next task's context and
+extend the dependency graph retrieval.
+
+**Dependency gate** — when the applied diff adds a package to a manifest
+(`package.json`, `requirements.txt`, `pyproject.toml`, `go.mod`, `Cargo.toml`),
+the run stops pending approval. Engineering-rule blocklists reject outright;
+`dependency_gate.allow` / `--allow-dep` pre-approve; `--dep-audit` looks up
+license/description from npm/PyPI.
+
 ## Quick start
 
 ```bash
@@ -639,6 +669,8 @@ Unknown keys are ignored by the loader, and every section has a safe default.
 | `program` | `phases` (list of `{name, gate | journeys, max_fix_rounds, on_fail}`) |
 | `journey` | `file`, `browser`, `timeout_s`, `screenshots_dir` |
 | `guardrails` | `block`, `approval_required`, `cost_limit` |
+| `secrets_scan` | `mode` (redact/block/off), `types` |
+| `dependency_gate` | `allow`, `audit` |
 | `roles` | `implementer`, `supervisor` (architecture — do not change) |
 
 **Environment overrides** (roles stay architecture; only models/endpoints change):
@@ -678,7 +710,7 @@ report.
 
 ```bash
 cd "Agents /hybrid-agent"
-./.venv/bin/python -m unittest discover -s tests -v    # 213 tests
+./.venv/bin/python -m unittest discover -s tests -v    # 242 tests
 ```
 
 Coverage includes: the fenced-file parser, the apply overwrite/unsafe-path guards,
@@ -718,6 +750,12 @@ repo root/
     ├── differential.py          # Anti-gaming ratchet (rejects weakened gates)
     ├── guardrails.py            # BLOCK / APPROVAL_REQUIRED task guardrails
     ├── patcher.py               # Surgical diff-first repairs + AST context extraction
+    ├── contract.py              # Task Contract + acceptance cases
+    ├── dependencies.py          # Dependency-aware context retrieval
+    ├── scanner.py               # Secrets/PII redaction for outbound traffic
+    ├── rules.py                 # .agent/engineering-rules.yml loader
+    ├── learned_rules.py         # Failure-rule learner (procedural memory)
+    ├── dependency_gate.py       # New-dependency approval gate
     ├── web_dashboard.py         # Web control panel (Flask + SocketIO, port 8660)
     ├── dashboard/               # Dashboard UI + encrypted secrets store
     ├── context.py / scan.py     # Project context scanner
