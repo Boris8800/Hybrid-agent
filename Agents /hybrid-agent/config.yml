@@ -24,9 +24,10 @@ backends:
     base_url: "http://localhost:1234/api/v1"   # MLX-style chat API (POST {base}/chat)
     api_key: "lm-studio"
     model: "qwen2.5-coder-14b-instruct-mlx"
-    # MLX inference is slow (~10-15 tok/s): keep a generous timeout so slow-but-
-    # working generations are never killed and re-run.
-    timeout_s: 180
+    # MLX inference is slow (~10-15 tok/s): a 4096-token step takes ~270-400s,
+    # so a too-short timeout kills long-but-working generations mid-stream
+    # (they surface as truncation/escalation). Keep it generous.
+    timeout_s: 600
     max_retries: 3
     backoff_s: [0.5, 1.0, 2.0]
     cold_start_wait_s: 30
@@ -70,6 +71,16 @@ review:
   # Terminal tool (supervise loop): per-command timeout for 'RUN: <command>'
   # blocks the model emits. Commands are still allowlist-gated.
   terminal_timeout: 120
+  # Context Safety Controller (CSC): hard budgets that stop the local model
+  # from ever reaching an unusable context state. Every prompt is measured
+  # against the SAFE INPUT budget (discovered window - output reserve - safety
+  # margin) BEFORE the model is called. Zones: GREEN <70% proceed, YELLOW
+  # 70-85% compact source/tool context, ORANGE 85-95% aggressive compaction,
+  # RED >95% the local model is NOT called and the task escalates. Tool output
+  # is summarized before re-injection so big logs never flood the window.
+  context_safety:
+    output_reserve_tokens: 12000   # space the model needs for its response
+    safety_margin_tokens: 2000     # hard headroom below the window
 
 cache:
   enabled: true
@@ -214,8 +225,18 @@ providers:
       base_url: "http://localhost:1234/api/v1"
       model: "qwen2.5-coder-14b-instruct-mlx"
       api_key: "lm-studio"
-      timeout_s: 180
+      timeout_s: 600
       max_retries: 3
+      # Loaded context window in tokens. FALLBACK ONLY — at runtime the engine
+      # queries LM Studio /api/v1/models and uses the ACTUALLY LOADED window
+      # (loaded_instances[].config.context_length), so models loaded with -c
+      # 65536 or 131072 are guarded and planned for their real window. This
+      # value is used only when discovery fails (server down / model not
+      # loaded). Keep it as the expected load for this model (reload-local.sh:
+      # -c 32768). A window LARGER than the loaded window means cutoffs go
+      # undetected; smaller means false "truncated" flags on long complete
+      # outputs — but discovery overrides both when the server answers.
+      context_window: 32768
       # request_extra is merged into the /api/v1/chat body. repeat_penalty
       # (snake_case, verified accepted) guards against the token-repetition
       # degeneration the chat UI already fixes via repeatPenalty 1.15 — the
@@ -227,8 +248,10 @@ providers:
       base_url: "http://localhost:1234/api/v1"
       model: "qwen2.5-coder-14b-instruct-mlx"
       api_key: "lm-studio"
-      timeout_s: 180
+      timeout_s: 600
       max_retries: 3
+      # Fallback window; runtime discovery overrides (see the qwen provider).
+      context_window: 32768
       request_extra:
         repeat_penalty: 1.15
       enabled: true

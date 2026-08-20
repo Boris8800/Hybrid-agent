@@ -103,6 +103,7 @@ class HybridAgent:
                     lc["base_url"], lc["model"],
                     api_key=lc.get("api_key") or "lm-studio",
                     timeout_s=lc["timeout_s"], max_retries=lc["max_retries"],
+                    context_window=self._discover_window(lc),
                 )
                 self._cloud = DeepSeekBackend(
                     dc["api_key_env"], dc["model"],
@@ -113,6 +114,19 @@ class HybridAgent:
                 self._local = backend_for(lp)
                 self._cloud = backend_for(op)
         return self._local, self._cloud
+
+    @staticmethod
+    def _discover_window(lc: dict) -> int:
+        """Best-effort: the local model's ACTUALLY LOADED context window, so
+        truncation detection works for any model/load. Falls back to the
+        backend default when the server is unreachable."""
+        try:
+            from backends.local_qwen import discover_context_window
+            return discover_context_window(
+                lc["base_url"], api_key=lc.get("api_key") or "lm-studio",
+                model=lc["model"])
+        except Exception:  # noqa: BLE001 - discovery is best-effort
+            return 0
 
     # --- routing --------------------------------------------------------
     def route(self, task: str, context_chars: int, memory: MemoryView) -> tuple[str, str]:

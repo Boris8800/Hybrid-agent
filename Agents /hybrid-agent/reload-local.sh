@@ -11,7 +11,12 @@
 set -euo pipefail
 
 MODEL="${LOCAL_MODEL:-qwen2.5-coder-14b-instruct-mlx}"
-CTX="${LOCAL_CONTEXT:-16384}"
+# Full native context window (config.json max_position_embeddings = 32768).
+# The engine plans steps for a 32768-token window (supervise.py
+# LOCAL_CONTEXT_TOKENS) and detects server-side truncation at this boundary, so
+# the model MUST be loaded with the same window — a smaller load (e.g. 16384)
+# makes the server cut off multi-file coding output mid-generation.
+CTX="${LOCAL_CONTEXT:-32768}"
 
 echo "[local] unloading ${MODEL} (if loaded)..."
 lms unload "${MODEL}" >/dev/null 2>&1 || true

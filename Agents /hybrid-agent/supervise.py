@@ -29,6 +29,20 @@ import re
 from dataclasses import dataclass, field
 
 from backends.base import Backend, ModelRequest, ModelResponse
+from context_safety import (
+    DEFAULT_OUTPUT_RESERVE_TOKENS,
+    DEFAULT_SAFETY_MARGIN_TOKENS,
+    assess_zone,
+    classify_output,
+    compact_text,
+    context_telemetry,
+    dynamic_output_reserve,
+    estimate_tokens,
+    safe_input_budget,
+    summarize_terminal_output,
+    supervisor_context_block,
+    task_required_output,
+)
 
 
 @dataclass
@@ -255,30 +269,43 @@ QWEN_MAX_TOKENS_CAP = 2_000_000_000_000_000
 CLOUD_GEN_TOKENS = 8192
 
 # Local model constraints — advisory planning guidance for the DeepSeek
-# supervisor (steps sized for one local response), NOT an enforced cap. The
-# local server runs qwen2.5-coder-14b-instruct-mlx with a 32768-token context
-# window; a 4096-token step is a safe planning target because truncation is
-# recovered with a continuation prompt.
+# supervisor (steps sized for one local response), NOT an enforced cap.
+# DEFAULT values apply when the real window cannot be discovered; ask.py
+# overrides these with the ACTUAL loaded window (via LM Studio /api/v1/models
+# `loaded_instances[].config.context_length`) so planning always matches the
+# server, whatever local model is loaded.
 LOCAL_CONTEXT_TOKENS = 32768
 LOCAL_OUTPUT_TOKENS = 4096
 
 
-def _local_limits_note() -> str:
+def _local_limits_note(context_window: int = LOCAL_CONTEXT_TOKENS,
+                       output_tokens: int = LOCAL_OUTPUT_TOKENS,
+                       output_reserve_tokens: int = DEFAULT_OUTPUT_RESERVE_TOKENS,
+                       safety_margin_tokens: int = DEFAULT_SAFETY_MARGIN_TOKENS) -> str:
     """Compact, factual description of the implementer's constraints.
 
     Injected into the DeepSeek plan request so the supervisor sizes every step
     for one local response instead of assuming an unlimited model.
+    `context_window` must be the ACTUALLY LOADED window of the local model —
+    a smaller window than planned means server-side mid-generation cutoffs.
+    Includes the SAFE INPUT budget (window - output reserve - safety margin):
+    the real usable space the supervisor must plan within.
     """
+    safe_input = safe_input_budget(context_window, output_reserve_tokens,
+                                   safety_margin_tokens)
     return (
         "IMPLEMENTER CONSTRAINTS (local model, must be respected): "
-        f"context window {LOCAL_CONTEXT_TOKENS} tokens; a step of about "
-        f"{LOCAL_OUTPUT_TOKENS} output tokens is a safe planning target "
-        "(there is NO enforced output cap — the engine detects truncation and "
-        "continues the response, so an occasional overflow is recovered, but "
-        "complete one-response steps are preferred); keep prompt + repo "
-        "context well under 32768; any task needing more output must be split "
-        "into multiple sequential steps with per-step acceptance criteria; "
-        "truncated output is continued once then escalated."
+        f"context window {context_window} tokens; SAFE INPUT BUDGET "
+        f"{safe_input} tokens (window - {output_reserve_tokens} output reserve "
+        f"- {safety_margin_tokens} safety margin — never fill the window); "
+        f"a step of about {output_tokens} output tokens is a safe planning "
+        "target (there is NO enforced output cap — the engine detects "
+        "truncation and continues the response, so an occasional overflow is "
+        "recovered, but complete one-response steps are preferred); keep "
+        f"prompt + repo context well under {safe_input}; any task needing "
+        "more output must be split into multiple sequential steps with "
+        "per-step acceptance criteria; truncated output is continued once "
+        "then escalated."
     )
 
 
@@ -286,34 +313,46 @@ def _qwen_primary_prompt(task: str, prior_fixes: str = "",
                           terminal_output: str = "", bound_text: str = "",
                           contract_text: str = "", source_context: str = "",
                           continuation_from: str = "",
-                          max_tokens: int = QWEN_MAX_TOKENS) -> ModelRequest:
+                          max_tokens: int = QWEN_MAX_TOKENS,
+                          context_window: int = LOCAL_CONTEXT_TOKENS,
+                          output_reserve_tokens: int = DEFAULT_OUTPUT_RESERVE_TOKENS,
+                          safety_margin_tokens: int = DEFAULT_SAFETY_MARGIN_TOKENS) -> ModelRequest:
     system = (
         "You are a careful mid-level engineer implementing a change. "
         "Write correct, minimal, well-structured code for the given task. "
-        "Output the complete updated file(s) in fenced code blocks labeled with paths. "
+        "Output the complete updated file(s) in fenced code blocks labeled with "
+        "their file paths, e.g. ```utils.py / ```src/main.ts / ```README.md — "
+        "NEVER a bare language tag like ```python or ```markdown, because the "
+        "engine uses the fence label to know where to write each file. "
         "You have a terminal tool: to inspect or verify, emit a line like "
         "'RUN: npm run build' and you will receive the command output in the "
         "next turn. Use it to confirm your changes work."
     )
     if bound_text:
         system += "\n\n" + bound_text  # RECALL gate: the BOUND re-injected every iteration
-    user = f"TASK:\n{task}\n"
-    if contract_text:
-        user += f"\n{contract_text}\n"  # the formal Task Contract (same one every stage uses)
-    if prior_fixes:
-        user += f"\nA senior reviewer previously asked you to fix these issues. Apply ALL of them now:\n{prior_fixes}\n"
-    if source_context:
-        user += (f"\nRELEVANT SOURCE (dependency-aware context for the files "
-                 f"involved):\n{source_context}\n")
-    if terminal_output:
-        user += (
-            f"\nTERMINAL SESSION (output of the commands you asked to run):\n"
-            f"{terminal_output}\n"
-            "Use this output to fix your changes. You may emit more "
-            "'RUN: <command>' lines to inspect or verify, then output the "
-            "final code."
-        )
-    user += (
+
+    # Context Safety Controller: compute the hard input budget (window minus
+    # output reserve minus safety margin) and compact OPTIONAL sections to fit.
+    # NEVER let the assembled prompt fill the window — the model needs room to
+    # produce its response.
+    #
+    # PROTECTED CORE (invariants, NEVER dropped or compacted):
+    #   - TASK (current task requirements)
+    #   - BOUND text (constraints + security requirements)
+    #   - CONTRACT (files being modified, acceptance criteria)
+    #   - prior_fixes (supervisor instructions)
+    #   - the NOTE/tail (engine protocol)
+    # COMPACTABLE (bulk context, trimmed in order of least value):
+    #   - source context (biggest chunk) -> terminal output (summarized)
+    # If even the protected core exceeds the safe input budget, the prompt is
+    # returned INTACT and the preflight RED zone escalates — the task is never
+    # truncated by the compactor.
+    sys_tokens = estimate_tokens(system)
+
+    # Fixed trailing text (NOTE + continuation tail) is measured FIRST so the
+    # compaction below reserves room for it — otherwise the final NOTE would
+    # silently overflow the budget after the sections were sized.
+    note = (
         "\nNOTE: you have NO output token cap — output the COMPLETE change in "
         "this one response. Do not stop early or split the work voluntarily; "
         "write every file fully. If your response is truncated the engine "
@@ -321,18 +360,94 @@ def _qwen_primary_prompt(task: str, prior_fixes: str = "",
         "never abbreviate. Only if the change genuinely cannot fit, end with a "
         "final 'REMAINING WORK' line listing exactly what is left."
     )
+    tail = "\nOutput only the code changes, no preamble."
     if continuation_from:
         # Truncation recovery: the model is stateless across calls, so feed it
         # the tail of the cut-off output and demand a pure continuation. Works
         # for ANY local model regardless of whether max_tokens was honoured.
-        user += (
+        note = note.replace(
+            "\nNOTE: you have NO output token cap — output the COMPLETE change in "
+            "this one response. Do not stop early or split the work voluntarily; "
+            "write every file fully.",
+            "\nNOTE: continue the response you were writing. Output only the "
+            "missing remainder.")
+        tail += (
             "\n\nA previous attempt was truncated mid-output. It ended with:\n"
             f"--- TRUNCATED TAIL ---\n{continuation_from}\n--- END ---\n"
             "Continue EXACTLY from where that output stopped. Do not repeat "
             "anything already written above. Output only the missing remainder."
         )
-    user += "\nOutput only the code changes, no preamble."
-    return ModelRequest(system=system, user=user, max_tokens=max_tokens, temperature=0.2)
+    fixed_overhead = estimate_tokens(note) + estimate_tokens(tail)
+    user_budget = max(0, safe_input_budget(context_window, output_reserve_tokens,
+                                           safety_margin_tokens) - sys_tokens)
+
+    def _fits(user_text: str) -> bool:
+        return estimate_tokens(user_text) + fixed_overhead <= user_budget
+
+    # PROTECTED CORE — never compacted (task, contract, bound, fixes).
+    core = f"TASK:\n{task}\n"
+    if contract_text:
+        core += f"\n{contract_text}\n"  # the formal Task Contract (same one every stage uses)
+    if prior_fixes:
+        core += f"\nA senior reviewer previously asked you to fix these issues. Apply ALL of them now:\n{prior_fixes}\n"
+    user = core
+
+    # COMPACTABLE sections — trimmed in order of least value, never the core.
+    compacted = []
+    src = ""
+    if source_context and not continuation_from:
+        # Dependency-aware context is only useful when starting fresh. On a
+        # truncation-continuation retry the prompt is already near the context
+        # window (that is why it was cut off), so re-injecting the source
+        # context would push the continuation over the edge again and guarantee
+        # a second truncation. The tail alone anchors the model.
+        src = (f"\nRELEVANT SOURCE (dependency-aware context for the files "
+               f"involved):\n{source_context}\n")
+        if not _fits(user + src):
+            # Compact the biggest chunk first: source context. Leave slack
+            # (the marker + label add a few tokens beyond max_tokens).
+            src = (f"\nRELEVANT SOURCE (dependency-aware context, compacted):\n"
+                   f"{compact_text(source_context, max(256, user_budget - estimate_tokens(user) - fixed_overhead - 32))}\n")
+            compacted.append("source")
+        user += src
+    if terminal_output:
+        term = (
+            f"\nTERMINAL SESSION (output of the commands you asked to run):\n"
+            f"{terminal_output}\n"
+            "Use this output to fix your changes. You may emit more "
+            "'RUN: <command>' lines to inspect or verify, then output the "
+            "final code."
+        )
+        if not _fits(user + term):
+            # Summarize/compact tool output so it never floods the window.
+            summary = summarize_terminal_output(terminal_output)
+            term = (
+                f"\nTERMINAL SESSION (SUMMARIZED output — full text kept "
+                f"separately):\n{summary}\n"
+                "Use this output to fix your changes. You may emit more "
+                "'RUN: <command>' lines to inspect or verify, then output the "
+                "final code."
+            )
+            compacted.append("terminal")
+        user += term
+    user += note + tail
+
+    # Hard cap: if even the PROTECTED CORE (without any compactable section)
+    # exceeds the budget, return it intact — the preflight RED zone must
+    # escalate rather than truncate the task/constraints. This preserves the
+    # invariant: compaction NEVER removes task requirements, BOUND, contract,
+    # supervisor fixes, or the engine protocol.
+    if estimate_tokens(user) > user_budget and src:
+        user = core + note + tail
+        compacted.append("source-dropped")
+    req = ModelRequest(system=system, user=user, max_tokens=max_tokens, temperature=0.2)
+    req.metadata["context_safety"] = {
+        "compaction": ",".join(compacted) if compacted else "none",
+        "input_tokens": estimate_tokens(system) + estimate_tokens(user),
+        "safe_budget": max(0, safe_input_budget(context_window, output_reserve_tokens,
+                                                safety_margin_tokens)),
+    }
+    return req
 
 
 # Terminal tool: model-emitted "RUN: <command>" lines, executed by the engine.
@@ -349,7 +464,14 @@ def _extract_run_blocks(text: str) -> list[str]:
     return cmds
 
 
-def _supervisor_request(pkg: ReviewPackage, verbose: bool = True) -> ModelRequest:
+def _supervisor_request(pkg: ReviewPackage, verbose: bool = True,
+                        context_window: int = LOCAL_CONTEXT_TOKENS,
+                        local_model: str = "local model",
+                        output_reserve_tokens: int = DEFAULT_OUTPUT_RESERVE_TOKENS,
+                        safety_margin_tokens: int = DEFAULT_SAFETY_MARGIN_TOKENS,
+                        step: int = 1, step_total: int = 1,
+                        tools: str = "terminal, filesystem, tests",
+                        zone: str = "GREEN") -> ModelRequest:
     system = (
         "You are a CRITICAL senior code reviewer supervising a mid-level engineer. "
         "You receive a compact review package (task, plan, files, changes, "
@@ -380,10 +502,13 @@ def _supervisor_request(pkg: ReviewPackage, verbose: bool = True) -> ModelReques
         "your verdict, return UNKNOWN instead of guessing.\n\n"
         "Note: the code under review was produced by a local model with "
         "no engine-imposed output cap and a "
-        f"{LOCAL_CONTEXT_TOKENS}-token context window (truncation is detected "
+        f"{context_window}-token context window (truncation is detected "
         "and recovered via continuation, not by capping the model). Judge "
         "whether the step was appropriately scoped and whether responses "
-        "look cut off or over-sized for a single pass."
+        "look cut off or over-sized for a single pass.\n\n"
+        + supervisor_context_block(
+            local_model, context_window, output_reserve_tokens,
+            safety_margin_tokens, step, step_total, tools, zone)
     )
     user = pkg.to_prompt()
     if verbose:
@@ -421,6 +546,18 @@ def supervise(
     contract_text: str = "",
     source_context: str = "",
     evidence_provider: callable = None,
+    context_window: int = LOCAL_CONTEXT_TOKENS,
+    output_reserve_tokens: int = DEFAULT_OUTPUT_RESERVE_TOKENS,
+    safety_margin_tokens: int = DEFAULT_SAFETY_MARGIN_TOKENS,
+    local_model: str = "local model",
+    tools: str = "terminal, filesystem, tests",
+    model_max_output: int = 0,
+    contract_files: list | None = None,
+    max_recovery_retries: int = 1,
+    telemetry: callable = None,
+    architecture: str = "",
+    vision: bool = False,
+    tool_use: bool = False,
 ) -> SuperviseResult:
     """Run Qwen-primary / DeepSeek-supervisor on a task.
 
@@ -438,6 +575,27 @@ def supervise(
     With `review=False` the DeepSeek review is skipped entirely (local-first
     routing): one Qwen pass, then a synthetic APPROVED verdict so the
     caller's apply/stats tail works unchanged. Zero API spend.
+
+    CONTEXT SAFETY: before EVERY local-model call the prompt is measured
+    against the safe input budget (context_window - output_reserve_tokens -
+    safety_margin_tokens) and preflighted into a zone. GREEN proceeds;
+    YELLOW/ORANGE trigger compaction (source context and terminal output are
+    the first sections dropped/summarized); RED means the prompt cannot be
+    made safe — the local model is NOT called and the task escalates to
+    DeepSeek instead of guaranteeing a truncated generation.
+
+    DYNAMIC OUTPUT RESERVE: when `model_max_output` (per-model cap) and/or
+    `contract_files` (task need) are supplied, the effective reserve becomes
+    min(configured, model_max_output, task_required_output) so a tiny task
+    does not sacrifice 12k tokens of context.
+
+    RETRY BUDGET: recovery loops (continuation after truncated output) are
+    hard-capped at `max_recovery_retries` per iteration (default 1: one
+    continuation, then supervisor escalation) — a pathological model cannot
+    burn unbounded time/tokens recovering.
+
+    `telemetry(line)` receives one structured context_telemetry() string after
+    each local-model call (and on RED) for logs/dashboard.
     """
     if status is None:
         status = lambda line: None  # noqa: E731
@@ -447,63 +605,152 @@ def supervise(
     result = SuperviseResult(task=task)
     current = task
     prior_fixes = ""
+    # Dynamic output reserve: never waste context on a reserve bigger than the
+    # model can produce or the task needs.
+    eff_reserve = dynamic_output_reserve(
+        output_reserve_tokens,
+        model_max_output=model_max_output,
+        task_required_output=task_required_output(task, contract_files))
+    safe_budget = safe_input_budget(context_window, eff_reserve,
+                                    safety_margin_tokens)
+    zone = "GREEN"
+
+    def _telemetry(**kw) -> None:
+        if telemetry is not None:
+            try:
+                telemetry(context_telemetry(
+                    model=local_model, window=context_window,
+                    safe_input=safe_budget, output_reserve=eff_reserve,
+                    step=iteration, step_total=max_iterations,
+                    max_output=model_max_output,
+                    architecture=architecture, vision=vision, tool_use=tool_use,
+                    **kw))
+            except Exception:  # noqa: BLE001 - telemetry must never break runs
+                pass
+
+    def _preflight(req: ModelRequest, tag: str) -> ModelRequest:
+        """Context Safety Controller: measure + preflight before calling Qwen.
+        YELLOW/ORANGE compact in place (already done by the prompt builder);
+        RED is caught by the caller, which must NOT call the model."""
+        nonlocal zone
+        used = estimate_tokens(req.system) + estimate_tokens(req.user)
+        zone = assess_zone(used, safe_budget)
+        status(f"[supervise] iter {iteration}: context {zone} "
+               f"({used}/{safe_budget} tokens) {tag}")
+        return req
+
+    def _safe_reason(still_truncated: bool, base: str) -> str:
+        return "cloud_fallback_truncated" if still_truncated else base
 
     for iteration in range(1, max_iterations + 1):
         result.iterations = iteration
 
-        # 1. Qwen implements (streaming so the user sees it working).
-        status(f"[supervise] iter {iteration}: Qwen working...")
-        try:
-            resp: ModelResponse = qwen_generate(
-                _qwen_primary_prompt(current, prior_fixes, bound_text=bound_text,
-                    contract_text=contract_text, source_context=source_context,
-                    max_tokens=qwen_max_tokens)
-            )
-        except Exception as exc:  # noqa: BLE001
-            status(f"[supervise] local failed ({exc}); escalating to DeepSeek")
-            text, still_truncated = _cloud_generate_guarded(cloud, task, status, use_plan=True)
+        # 1. CONTEXT SAFETY CONTROLLER: build + preflight the payload BEFORE
+        #    calling Qwen. The prompt builder already compacts to the safe
+        #    input budget; RED here means even the compacted task cannot fit.
+        req = _qwen_primary_prompt(
+            current, prior_fixes, bound_text=bound_text,
+            contract_text=contract_text, source_context=source_context,
+            max_tokens=qwen_max_tokens, context_window=context_window,
+            output_reserve_tokens=eff_reserve,
+            safety_margin_tokens=safety_margin_tokens)
+        _preflight(req, "-> Qwen")
+
+        if zone == "RED":
+            status(f"[supervise] iter {iteration}: ⛔ context RED — the task "
+                   f"cannot fit the local model's safe budget ({safe_budget} "
+                   f"tokens); NOT calling Qwen; escalating to DeepSeek")
+            _telemetry(input_tokens=estimate_tokens(req.system) + estimate_tokens(req.user),
+                       compaction="red", status="RED_ESCALATION")
+            text, still_truncated = _cloud_generate_guarded(
+                cloud, task, status, use_plan=True, context_window=context_window,
+                output_reserve_tokens=eff_reserve,
+                safety_margin_tokens=safety_margin_tokens)
             result.final_text = text
             result.escalated = True
-            result.reason = "cloud_fallback_truncated" if still_truncated else "local_failure_escalation"
+            result.reason = _safe_reason(still_truncated, "local_context_red_escalation")
             return result
 
-        # Truncated local output must never reach the reviewer or be applied
-        # as if complete. Retry ONCE with a continuation prompt (the local MLX
-        # server rejects max_tokens, so a bigger budget is a no-op; the model
-        # is stateless across calls, so we feed it the tail and ask it to pick
-        # up exactly where it stopped). Only escalate when the continuation is
-        # still cut off or yields nothing new.
-        if getattr(resp, "truncated", False):
+        try:
+            resp: ModelResponse = qwen_generate(req)
+        except Exception as exc:  # noqa: BLE001
+            status(f"[supervise] local failed ({exc}); escalating to DeepSeek")
+            _telemetry(input_tokens=estimate_tokens(req.system) + estimate_tokens(req.user),
+                       compaction="none", status="MODEL_ERROR")
+            text, still_truncated = _cloud_generate_guarded(cloud, task, status, use_plan=True,
+                                  context_window=context_window,
+                                  output_reserve_tokens=eff_reserve,
+                                  safety_margin_tokens=safety_margin_tokens)
+            result.final_text = text
+            result.escalated = True
+            result.reason = _safe_reason(still_truncated, "local_failure_escalation")
+            return result
+
+        # Distinguish WHY the local output is incomplete (never silently treat
+        # a cutoff as success): OUTPUT_LIMIT_REACHED (model hit its own stop
+        # budget), CONTEXT_LIMIT_REACHED (server window cutoff), TIMEOUT
+        # (stream died), COMPLETED (clean).
+        out_state = classify_output(resp)
+        recovery_retries = 0
+        while out_state != "COMPLETED" and recovery_retries < max_recovery_retries:
+            # RETRY BUDGET: hard cap on continuation recovery loops — a
+            # pathological model cannot burn unbounded time/tokens retrying.
+            recovery_retries += 1
             tail = (resp.text or "")[-1200:]
             retry_budget = min(qwen_max_tokens * 2, QWEN_MAX_TOKENS_CAP)
-            status(f"[supervise] iter {iteration}: local output TRUNCATED "
+            status(f"[supervise] iter {iteration}: local output {out_state} "
                    f"({getattr(resp, 'truncate_reason', 'no-reason')}) - "
-                   f"retrying once with a continuation prompt")
+                   f"retry {recovery_retries}/{max_recovery_retries} with a "
+                   f"continuation prompt")
             try:
-                resp = qwen_generate(
-                    _qwen_primary_prompt(current, prior_fixes, bound_text=bound_text,
-                contract_text=contract_text, source_context=source_context,
-                continuation_from=tail, max_tokens=retry_budget)
-                )
+                resp = qwen_generate(_qwen_primary_prompt(
+                    current, prior_fixes, bound_text=bound_text,
+                    contract_text=contract_text, source_context=source_context,
+                    continuation_from=tail, max_tokens=retry_budget,
+                    context_window=context_window,
+                    output_reserve_tokens=eff_reserve,
+                    safety_margin_tokens=safety_margin_tokens))
             except Exception as exc:  # noqa: BLE001
                 status(f"[supervise] local retry failed ({exc}); escalating to DeepSeek")
-                text, still_truncated = _cloud_generate_guarded(cloud, task, status, use_plan=False)
+                _telemetry(input_tokens=estimate_tokens(req.system) + estimate_tokens(req.user),
+                           compaction="none", status="MODEL_ERROR")
+                text, still_truncated = _cloud_generate_guarded(cloud, task, status, use_plan=False,
+                                  context_window=context_window,
+                                  output_reserve_tokens=eff_reserve,
+                                  safety_margin_tokens=safety_margin_tokens)
                 result.final_text = text
                 result.escalated = True
-                result.reason = "cloud_fallback_truncated" if still_truncated else "local_truncation_escalation"
+                result.reason = _safe_reason(still_truncated, "local_truncation_escalation")
                 return result
-            if getattr(resp, "truncated", False):
-                status("[supervise] Qwen still TRUNCATED after retry; escalating to DeepSeek")
-                text, still_truncated = _cloud_generate_guarded(cloud, task, status, use_plan=False)
-                result.final_text = text
-                result.escalated = True
-                result.reason = "cloud_fallback_truncated" if still_truncated else "local_truncation_escalation"
-                return result
+            out_state = classify_output(resp)
+        if out_state != "COMPLETED":
+            status(f"[supervise] Qwen still {out_state} after "
+                   f"{recovery_retries}/{max_recovery_retries} retries "
+                   "(retry budget exhausted); escalating to DeepSeek")
+            _telemetry(input_tokens=estimate_tokens(req.system) + estimate_tokens(req.user),
+                       compaction="none", status=out_state)
+            text, still_truncated = _cloud_generate_guarded(cloud, task, status, use_plan=False,
+                              context_window=context_window,
+                              output_reserve_tokens=eff_reserve,
+                              safety_margin_tokens=safety_margin_tokens)
+            result.final_text = text
+            result.escalated = True
+            result.reason = _safe_reason(still_truncated, "local_truncation_escalation")
+            return result
+        # Telemetry: one structured line per completed local call.
+        compaction = (req.metadata.get("context_safety") or {}).get("compaction", "none")
+        _telemetry(
+            input_tokens=estimate_tokens(req.system) + estimate_tokens(req.user),
+            compaction=compaction,
+            output_tokens=len(resp.text or "") // 4,
+            status="COMPLETED")
         code = resp.text
 
         # Terminal tool: execute the 'RUN: <command>' blocks the model emitted
         # and feed the output back so it can iterate against a real shell
-        # (inspect errors, run checks, then emit the final code).
+        # (inspect errors, run checks, then emit the final code). Tool output
+        # is summarized by the prompt builder so a 20k-token log never floods
+        # the local model's window (full text stays in the review package).
         terminal_feedback = ""
         terminal_rounds = 0
         while terminal_tool is not None and max_terminal_rounds > 0:
@@ -519,7 +766,10 @@ def supervise(
                 resp = qwen_generate(_qwen_primary_prompt(
                     current, prior_fixes, terminal_output=terminal_feedback,
                     bound_text=bound_text, contract_text=contract_text,
-                    source_context=source_context, max_tokens=qwen_max_tokens))
+                    source_context=source_context, max_tokens=qwen_max_tokens,
+                    context_window=context_window,
+                    output_reserve_tokens=eff_reserve,
+                    safety_margin_tokens=safety_margin_tokens))
             except Exception as exc:  # noqa: BLE001 - keep the last good output
                 status(f"[supervise] terminal re-generate failed ({exc}); continuing")
                 break
@@ -546,10 +796,18 @@ def supervise(
             pkg.verification = ((pkg.verification + "\n\n" if pkg.verification else "")
                                 + "TERMINAL SESSION:\n" + terminal_feedback)
 
-        # 3. DeepSeek supervises.
+        # 3. DeepSeek supervises — with the LOCAL MODEL CONTEXT block so it
+        #    plans/reviews within the real safe input budget, current step,
+        #    available tools, and the observed context zone.
         status(f"[supervise] iter {iteration}: DeepSeek supervising...")
         try:
-            review_resp = cloud.generate(_supervisor_request(pkg))
+            review_resp = cloud.generate(
+                _supervisor_request(
+                    pkg, context_window=context_window, local_model=local_model,
+                    output_reserve_tokens=eff_reserve,
+                    safety_margin_tokens=safety_margin_tokens,
+                    step=iteration, step_total=max_iterations,
+                    tools=tools, zone=zone))
         except Exception as exc:  # noqa: BLE001
             status(f"[supervise] review failed ({exc}); applying without review")
             result.final_text = code
@@ -567,7 +825,13 @@ def supervise(
                 pkg.verification = ((pkg.verification + "\n\n" if pkg.verification else "")
                                     + "MACHINE EVIDENCE:\n" + evidence[:3000])
                 try:
-                    review_resp = cloud.generate(_supervisor_request(pkg))
+                    review_resp = cloud.generate(
+                        _supervisor_request(
+                            pkg, context_window=context_window, local_model=local_model,
+                            output_reserve_tokens=eff_reserve,
+                            safety_margin_tokens=safety_margin_tokens,
+                            step=iteration, step_total=max_iterations,
+                            tools=tools, zone=zone))
                 except Exception as exc:  # noqa: BLE001
                     status(f"[supervise] evidence re-review failed ({exc})")
                     evidence = None
@@ -588,7 +852,10 @@ def supervise(
             return result
         if verdict.rejected:
             status(f"[supervise] iter {iteration}: REJECTED (score {verdict.quality_score:.1f}/10) — falling back to DeepSeek")
-            text, still_truncated = _cloud_generate_guarded(cloud, task, status, use_plan=False)
+            text, still_truncated = _cloud_generate_guarded(cloud, task, status, use_plan=False,
+                                  context_window=context_window,
+                                  output_reserve_tokens=eff_reserve,
+                                  safety_margin_tokens=safety_margin_tokens)
             result.final_text = text
             result.escalated = True
             result.reason = "cloud_fallback_truncated" if still_truncated else "deepseek_fallback_rejected"
@@ -601,7 +868,10 @@ def supervise(
 
     # Retries exhausted with FIX_REQUIRED: fall back to DeepSeek (80/20 fallback).
     status(f"[supervise] max iterations ({max_iterations}) reached; falling back to DeepSeek")
-    text, still_truncated = _cloud_generate_guarded(cloud, task, status, use_plan=False)
+    text, still_truncated = _cloud_generate_guarded(cloud, task, status, use_plan=False,
+                                  context_window=context_window,
+                                  output_reserve_tokens=eff_reserve,
+                                  safety_margin_tokens=safety_margin_tokens)
     result.final_text = text
     result.escalated = True
     result.reason = "cloud_fallback_truncated" if still_truncated else f"deepseek_fallback_max_iterations_{max_iterations}"
@@ -617,14 +887,20 @@ def _default_package(task: str, code: str, iteration: int = 0) -> ReviewPackage:
 
 
 def _cloud_generate_guarded(cloud: Backend, task: str, status: callable,
-                            use_plan: bool) -> tuple[str, bool]:
+                            use_plan: bool,
+                            context_window: int = LOCAL_CONTEXT_TOKENS,
+                            output_reserve_tokens: int = DEFAULT_OUTPUT_RESERVE_TOKENS,
+                            safety_margin_tokens: int = DEFAULT_SAFETY_MARGIN_TOKENS) -> tuple[str, bool]:
     """Generate the DeepSeek fallback, retrying ONCE at the same budget when the
     output is truncated (the API caps output at 8192, so the budget cannot grow).
 
     Returns (text, still_truncated). When still_truncated is True the caller
     must NOT let the output be applied as if complete.
     """
-    request = _cloud_plan_request(task) if use_plan else _cloud_generate_request(task)
+    request = (_cloud_plan_request(task, context_window=context_window,
+                                   output_reserve_tokens=output_reserve_tokens,
+                                   safety_margin_tokens=safety_margin_tokens)
+               if use_plan else _cloud_generate_request(task))
     response = cloud.generate(request)
     if getattr(response, "truncated", False):
         status("[supervise] cloud output truncated; retrying once at same budget")
@@ -634,7 +910,10 @@ def _cloud_generate_guarded(cloud: Backend, task: str, status: callable,
     return response.text, bool(getattr(response, "truncated", False))
 
 
-def _enhance_request(task: str, context: str = "", cot: bool = False) -> ModelRequest:
+def _enhance_request(task: str, context: str = "", cot: bool = False,
+                     context_window: int = LOCAL_CONTEXT_TOKENS,
+                     output_reserve_tokens: int = DEFAULT_OUTPUT_RESERVE_TOKENS,
+                     safety_margin_tokens: int = DEFAULT_SAFETY_MARGIN_TOKENS) -> ModelRequest:
     """Request DeepSeek to ENHANCE the task and plan it for the local implementer.
 
     Runs BEFORE the local model implements: DeepSeek clarifies the user's prompt
@@ -688,14 +967,14 @@ def _enhance_request(task: str, context: str = "", cot: bool = False) -> ModelRe
             "<what you improved and why>\n"
             "=== PLAN ===\n"
             "<step-by-step plan>\n\n"
-            "=== CLARIFYING QUESTIONS ===\n"
-            "ONLY include this section if the ORIGINAL USER TASK is ambiguous, "
-            "under-specified, or unclear. List 1-5 concise, concrete questions or "
-            "answer-options (e.g., exact target files, expected behavior, edge cases, "
-            "scope). If the task is already clear, OMIT this section entirely.\n"
-            f"{cot_extra}\n"
-            f"{_local_limits_note()}"
-        ),
+             "=== CLARIFYING QUESTIONS ===\n"
+             "ONLY include this section if the ORIGINAL USER TASK is ambiguous, "
+             "under-specified, or unclear. List 1-5 concise, concrete questions or "
+             "answer-options (e.g., exact target files, expected behavior, edge cases, "
+             "scope). If the task is already clear, OMIT this section entirely.\n"
+             f"{cot_extra}\n"
+             f"{_local_limits_note(context_window, output_reserve_tokens=output_reserve_tokens, safety_margin_tokens=safety_margin_tokens)}"
+         ),
         user=f"ORIGINAL USER TASK:\n{task}\n"
              + (f"\nCONTEXT:\n{context}\n" if context else ""),
         max_tokens=2400 if not cot else 3200,
@@ -703,7 +982,9 @@ def _enhance_request(task: str, context: str = "", cot: bool = False) -> ModelRe
     )
 
 
-def _cloud_plan_request(task: str) -> ModelRequest:
+def _cloud_plan_request(task: str, context_window: int = LOCAL_CONTEXT_TOKENS,
+                        output_reserve_tokens: int = DEFAULT_OUTPUT_RESERVE_TOKENS,
+                        safety_margin_tokens: int = DEFAULT_SAFETY_MARGIN_TOKENS) -> ModelRequest:
     """Request DeepSeek to plan the task sized to the local implementer.
 
     The plan must fit the work into steps that the local model can produce in
@@ -718,7 +999,7 @@ def _cloud_plan_request(task: str) -> ModelRequest:
             "Each step must fit in ONE local model response (target under ~3500 "
             "output tokens), with per-step acceptance criteria. Split any task "
             "needing more output into multiple sequential steps.\n\n"
-            f"{_local_limits_note()}"
+            f"{_local_limits_note(context_window, output_reserve_tokens=output_reserve_tokens, safety_margin_tokens=safety_margin_tokens)}"
         ),
         user=f"OBJECTIVE: {task}\n",
         max_tokens=1200,

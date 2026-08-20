@@ -4,9 +4,15 @@ Operational conventions and known pitfalls for this workspace (`/Users/user/Desk
 
 ## Local AI / LM Studio
 
-- Local model: `qwen2.5-coder-14b-instruct-mlx` via the MLX-style chat API at `http://localhost:1234/api/v1` (POST {base}/chat with `system_prompt`/`input`; embeddings stay on the legacy `http://localhost:1234/v1/embeddings`). Run the bridge with `python3 hybrid-agent/ask.py` — it self-heals into `hybrid-agent/.venv` for PyYAML/openai, so `config.yml` (180s local timeout) is always loaded.
+- Local model: `qwen2.5-coder-14b-instruct-mlx` via the MLX-style chat API at `http://localhost:1234/api/v1` (POST {base}/chat with `system_prompt`/`input`; embeddings stay on the legacy `http://localhost:1234/v1/embeddings`). Run the bridge with `python3 hybrid-agent/ask.py` — it self-heals into `hybrid-agent/.venv` for PyYAML/openai, so `config.yml` (600s local timeout) is always loaded.
 - The hybrid agent runs the 80/20 law: local model generates first, DeepSeek reviews (needs `DEEPSEEK_API_KEY`; when unset the Kilo brain is the review gate).
 - Local inference is slow (~10-15 tok/s). The bridge sends NO `max_tokens` — the `/api/v1/chat` endpoint rejects it (`Unrecognized key(s) in object: 'max_tokens'` → empty response). `exclude_keys` handles this.
+- **Truncation safety is model-agnostic and window-agnostic:** at startup the bridge queries LM Studio `/api/v1/models` and reads the ACTUAL loaded context window (`loaded_instances[].config.context_length`). That number drives (a) server-side truncation detection at the real boundary and (b) the DeepSeek planning prompts ("IMPLEMENTER CONSTRAINTS"). Any local model — whatever `-c` it was loaded with, **including windows larger than 32768 (e.g. `-c 65536`, `131072`)** — is planned for its real window and cutoffs are caught at exactly that boundary. **Discovery always wins over `context_window:` in `config.yml`**, so a stale/too-small config can never cap a bigger loaded window (config is used only when the server is unreachable). When discovery fails the engine default is 32768.
+- **Context Safety Controller (CSC)** — `context_safety.py` turns the window into hard budgets so the local model never reaches an unusable context state. Safe input budget = discovered window − output reserve (default 12000) − safety margin (default 2000), configurable via `review.context_safety`. Before EVERY local call the prompt is measured and preflighted: **GREEN** <70% proceed, **YELLOW** 70–85% compress, **ORANGE** 85–95% aggressive compaction, **RED** >95% → the local model is **NOT called** and the task escalates to DeepSeek (`local_context_red_escalation`). Source context is compacted first, then terminal output is summarized (exit code / errors / stack traces / changed files / warnings — never raw 20k-token logs). The DeepSeek supervisor receives a `LOCAL MODEL CONTEXT` block (window, safe input, output reserve, step N/M, tools, zone) in every review, so the API model plans within the real usable context. Output states are classified distinctly: COMPLETED / OUTPUT_LIMIT_REACHED / CONTEXT_LIMIT_REACHED / TIMEOUT / MODEL_ERROR.
+- **Per-model capability discovery** — `discover_model_capabilities()` reads model id, ACTUAL loaded window, max context, architecture, format, quantization, max output, vision, tool-use from `/api/v1/models`. Models are never assumed to behave alike. The output reserve is **dynamic**: `min(configured_reserve, model_max_output, task_required_output)` so a tiny task does not sacrifice 12k tokens of context (observed live: a 2-file task ran with reserve 512 → safe budget 30256).
+- **Compaction invariants** — compaction NEVER removes the protected core: task requirements, BOUND, contract (files being modified, security requirements), supervisor fixes, engine protocol. Only bulk context (source tree, tool output) is compactable; if even the protected core exceeds the budget, the prompt is returned intact and the RED preflight escalates instead of truncating the task.
+- **Retry budget** — continuation recovery after incomplete local output is hard-capped (`max_recovery_retries`, default 1) then escalates; a pathological model cannot burn unbounded time/tokens.
+- **Context telemetry** — one structured line per local call: `MODEL | ARCH | WINDOW | SAFE_INPUT | INPUT | OUT_RESERVE | ZONE | COMPACTION | OUTPUT | STATUS | STEP | MAX_OUTPUT | VISION | TOOLS`. Token estimation is conservative (3.5 chars/token — code tokenizes denser than prose; `HYBRID_CHARS_PER_TOKEN` overrides).
 
 ## Known pitfall: chat degeneration ("garbage output")
 
@@ -34,11 +40,13 @@ The crash even **unloads the model** (next request then answers "No models loade
 **Fix:** load the model with `--parallel 1` (single-sequence; bypasses the batched scheduler). Verified working for both `stream: false` and `stream: true` on 2026-08-20, LM Studio 0.4.21+2 / MLX backend `app-mlx-generate-mac14-arm64@34`.
 
 ```bash
-python3 "Agents /hybrid-agent/reload-local.sh"   # unloads + reloads qwen with --parallel 1 + verifies
-# manual: lms unload qwen2.5-coder-14b-instruct-mlx && lms load qwen2.5-coder-14b-instruct-mlx --parallel 1 -c 16384 -y
+python3 "Agents /hybrid-agent/reload-local.sh"   # unloads + reloads qwen with --parallel 1 -c 32768 + verifies
+# manual: lms unload qwen2.5-coder-14b-instruct-mlx && lms load qwen2.5-coder-14b-instruct-mlx --parallel 1 -c 32768 -y
 ```
 
-Check current state with `lms ps` — the qwen row must show `PARALLEL 1`. Any load from the LM Studio UI may revert to `parallel: 4`, so re-run the script after reloading in the app. Kilo config for the local provider lives in `.kilo/kilo.jsonc` and `~/.config/kilo/kilo.jsonc` (`provider.lmstudio` → `http://localhost:1234/v1`).
+Check current state with `lms ps` — the qwen row must show `PARALLEL 1` and `CONTEXT 32768`. Any load from the LM Studio UI may revert to `parallel: 4`, so re-run the script after reloading in the app. Kilo config for the local provider lives in `.kilo/kilo.jsonc` and `~/.config/kilo/kilo.jsonc` (`provider.lmstudio` → `http://localhost:1234/v1`).
+
+> **Do NOT load qwen with a smaller context window (e.g. `-c 16384`).** The engine plans every coding step for a 32768-token window (`supervise.py` `LOCAL_CONTEXT_TOKENS`, `config.yml` `context_window: 32768`) and detects server-side truncation at that exact boundary. A smaller load makes LM Studio cut off multi-file output mid-generation — the "constantly truncated" symptom. The model supports the full 32768 (`config.json` `max_position_embeddings`).
 
 ## Known pitfall: indexing embedding baseUrl (MUST include `/v1`)
 

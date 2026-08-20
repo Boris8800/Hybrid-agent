@@ -224,6 +224,58 @@ class DeepSeekBackendTruncationTests(unittest.TestCase):
         self.assertFalse(resp.truncated)
 
 
+class LocalContextWindowTruncationTests(unittest.TestCase):
+    """LM Studio's /api/v1/chat never reports finish_reason, so truncation
+    against the loaded context window must be detected from prompt+output
+    token counts (the server-independent signal)."""
+
+    def test_prompt_plus_output_reaching_window_is_truncated(self):
+        from backends.local_qwen import _mlx_result
+        # 20000 prompt tokens + 13000 output = 33000 >= 32768 -> cut off.
+        res = _mlx_result(
+            {"output": [{"type": "message", "content": "```main.py\nprint('partial..."}],
+             "stats": {"input_tokens": 20000, "total_output_tokens": 13000}},
+            max_tokens=10**15, context_window=32768)
+        self.assertTrue(res["truncated"])
+        self.assertEqual(res["truncate_reason"], "context_window_reached")
+
+    def test_well_under_window_is_not_truncated(self):
+        from backends.local_qwen import _mlx_result
+        res = _mlx_result(
+            {"output": [{"type": "message", "content": "```main.py\nprint('ok')\n```\n"}],
+             "stats": {"input_tokens": 2000, "total_output_tokens": 300}},
+            max_tokens=10**15, context_window=32768)
+        self.assertFalse(res["truncated"])
+
+    def test_window_reached_but_balanced_fence_still_detected(self):
+        """Even when the output happens to end on a balanced fence (so the old
+        fence heuristic would miss it), the window check must fire."""
+        from backends.local_qwen import _mlx_result
+        text = "```a.py\nx = 1\n```\n```b.py\ny = 2\n"
+        res = _mlx_result(
+            {"output": [{"type": "message", "content": text}],
+             "stats": {"input_tokens": 30000, "total_output_tokens": 3000}},
+            max_tokens=10**15, context_window=32768)
+        self.assertTrue(res["truncated"])
+        self.assertEqual(res["truncate_reason"], "context_window_reached")
+
+    def test_no_window_knowledge_disables_the_check(self):
+        """context_window=0 (unknown) must not false-positive."""
+        from backends.local_qwen import _mlx_result
+        res = _mlx_result(
+            {"output": [{"type": "message", "content": "plain text without fences"}],
+             "stats": {"input_tokens": 5000, "total_output_tokens": 5000}},
+            max_tokens=10**15, context_window=0)
+        self.assertFalse(res["truncated"], "unknown window must not flag")
+
+    def test_backend_default_window_used(self):
+        from backends.local_qwen import QwenBackend, DEFAULT_CONTEXT_WINDOW
+        backend = QwenBackend.__new__(QwenBackend)
+        self.assertEqual(DEFAULT_CONTEXT_WINDOW, 32768,
+                         "default window must match the loaded -c 32768")
+        self.assertEqual(backend.__class__.__module__, "backends.local_qwen")
+
+
 class LocalLimitsAwarenessTests(unittest.TestCase):
     """DeepSeek must plan within the local model's context/output limits."""
 
@@ -248,6 +300,637 @@ class LocalLimitsAwarenessTests(unittest.TestCase):
         self.assertIn("NO output token cap", req.user)
         self.assertIn("COMPLETE change", req.user)
         self.assertIn("REMAINING WORK", req.user)
+
+
+class LocalDiscoveryTests(unittest.TestCase):
+    """The engine must plan within the ACTUALLY LOADED local context window,
+    discovered from LM Studio for ANY local model — never a hardcoded value."""
+
+    def test_discover_reads_loaded_instance_config(self):
+        from unittest import mock
+        from backends.local_qwen import discover_context_window
+        payload = {"models": [{
+            "key": "some-other-model",
+            "max_context_length": 65536,
+            "loaded_instances": [{"config": {"context_length": 16384}}],
+        }]}
+        with mock.patch("urllib.request.urlopen") as m:
+            m.return_value.__enter__.return_value.read.return_value.decode.return_value = (
+                __import__("json").dumps(payload))
+            self.assertEqual(discover_context_window("http://x/api/v1", model="some-other-model"),
+                             16384, "loaded_instances config wins (real -c window)")
+
+    def test_discover_falls_back_to_max_when_not_loaded(self):
+        from unittest import mock
+        from backends.local_qwen import discover_context_window
+        payload = {"models": [{"key": "model-b", "max_context_length": 32768,
+                               "loaded_instances": []}]}
+        with mock.patch("urllib.request.urlopen") as m:
+            m.return_value.__enter__.return_value.read.return_value.decode.return_value = (
+                __import__("json").dumps(payload))
+            self.assertEqual(discover_context_window("http://x/api/v1", model="model-b"),
+                             32768)
+
+    def test_discover_returns_zero_on_errors(self):
+        from unittest import mock
+        from backends.local_qwen import discover_context_window
+        with mock.patch("urllib.request.urlopen", side_effect=OSError("no server")):
+            self.assertEqual(discover_context_window("http://x/api/v1"), 0)
+        with mock.patch("urllib.request.urlopen", side_effect=Exception("bad")):
+            self.assertEqual(discover_context_window("http://x/api/v1"), 0)
+
+    def test_discover_ignores_wrong_model(self):
+        from unittest import mock
+        from backends.local_qwen import discover_context_window
+        payload = {"models": [{"key": "other", "max_context_length": 99999,
+                               "loaded_instances": []}]}
+        with mock.patch("urllib.request.urlopen") as m:
+            m.return_value.__enter__.return_value.read.return_value.decode.return_value = (
+                __import__("json").dumps(payload))
+            self.assertEqual(discover_context_window("http://x/api/v1", model="target"),
+                             0, "a different model's window must not leak in")
+
+    def test_plan_request_uses_custom_window(self):
+        from supervise import _cloud_plan_request
+        req = _cloud_plan_request("t", context_window=16384)
+        self.assertIn("16384", req.system)
+        self.assertNotIn("32768", req.system)
+
+    def test_plan_request_handles_window_larger_than_default(self):
+        """A local model loaded with -c 65536 (or 131072) must be planned for
+        ITS window, never silently capped at the 32768 default."""
+        from supervise import _cloud_plan_request, _enhance_request, _supervisor_request, ReviewPackage
+        req = _cloud_plan_request("t", context_window=65536)
+        self.assertIn("65536", req.system)
+        self.assertNotIn("32768", req.system)
+        req2 = _enhance_request("t", context_window=131072)
+        self.assertIn("131072", req2.system)
+        req3 = _supervisor_request(ReviewPackage(task="t", changes="x"), context_window=65536)
+        self.assertIn("65536", req3.system)
+
+    def test_window_larger_than_default_truncation_detection(self):
+        """Detection boundary must be the REAL loaded window, even >32768."""
+        from backends.local_qwen import _mlx_result
+        # 40000 prompt + 30000 output = 70000 >= 65536 -> truncated (would be
+        # MISSED if detection were capped at the 32768 default).
+        res = _mlx_result(
+            {"output": [{"type": "message", "content": "```a.py\nx"}],
+             "stats": {"input_tokens": 40000, "total_output_tokens": 30000}},
+            max_tokens=10**15, context_window=65536)
+        self.assertTrue(res["truncated"])
+        self.assertEqual(res["truncate_reason"], "context_window_reached")
+        # Under the real window -> not truncated (a 32768 cap would FALSELY flag).
+        res2 = _mlx_result(
+            {"output": [{"type": "message", "content": "```a.py\nx\n```\n"}],
+             "stats": {"input_tokens": 30000, "total_output_tokens": 2000}},
+            max_tokens=10**15, context_window=65536)
+        self.assertFalse(res2["truncated"])
+
+    def test_discover_reads_large_loaded_window(self):
+        """-c 65536 in loaded_instances must be discovered (not capped)."""
+        from unittest import mock
+        from backends.local_qwen import discover_context_window
+        payload = {"models": [{"key": "big-model", "max_context_length": 131072,
+                               "loaded_instances": [{"config": {"context_length": 65536}}]}]}
+        with mock.patch("urllib.request.urlopen") as m:
+            m.return_value.__enter__.return_value.read.return_value.decode.return_value = (
+                __import__("json").dumps(payload))
+            self.assertEqual(discover_context_window("http://x/api/v1", model="big-model"),
+                             65536)
+
+    def test_supervisor_request_uses_custom_window(self):
+        from supervise import ReviewPackage, _supervisor_request
+        req = _supervisor_request(ReviewPackage(task="t", changes="x"), context_window=8192)
+        self.assertIn("8192", req.system)
+
+    def test_discovery_wins_over_config_even_when_larger(self):
+        """config context_window=32768 must NOT cap a model actually loaded at
+        65536 — the server's loaded window is the source of truth."""
+        from unittest import mock
+        import ask
+
+        class FakeLP:
+            base_url = "http://localhost:1234/api/v1"
+            model = "big-model"
+            api_key = "lm-studio"
+            context_window = 32768  # stale config — must lose to discovery
+
+        cfg = {"providers": {"local": [{"name": "qwen", "enabled": True}]},
+               "backends": {"local": {"base_url": FakeLP.base_url,
+                                      "model": FakeLP.model,
+                                      "api_key": "lm-studio"}}}
+        payload = {"models": [{"key": "big-model", "max_context_length": 131072,
+                               "loaded_instances": [{"config": {"context_length": 65536}}]}]}
+        with mock.patch("ask.get_local", return_value=FakeLP()), \
+             mock.patch("urllib.request.urlopen") as m:
+            m.return_value.__enter__.return_value.read.return_value.decode.return_value = (
+                __import__("json").dumps(payload))
+            w = ask._discover_local_context_window(cfg, model="big-model",
+                                                   base_url=FakeLP.base_url)
+        self.assertEqual(w, 65536,
+                         "discovered loaded window must win over config 32768")
+
+    def test_config_used_only_when_discovery_fails(self):
+        """When the server is unreachable, the config value is the fallback."""
+        from unittest import mock
+        import ask
+
+        class FakeLP:
+            base_url = "http://localhost:1234/api/v1"
+            model = "big-model"
+            api_key = "lm-studio"
+            context_window = 32768
+
+        cfg = {"providers": {"local": [{"name": "qwen", "enabled": True}]},
+               "backends": {"local": {"base_url": FakeLP.base_url,
+                                      "model": FakeLP.model,
+                                      "api_key": "lm-studio"}}}
+        with mock.patch("ask.get_local", return_value=FakeLP()), \
+             mock.patch("urllib.request.urlopen", side_effect=OSError("down")):
+            w = ask._discover_local_context_window(cfg, model="big-model",
+                                                   base_url=FakeLP.base_url)
+        self.assertEqual(w, 32768, "config is the fallback when discovery fails")
+
+
+class ContextSafetyControllerTests(unittest.TestCase):
+    """The CSC must enforce hard budgets and NEVER call the local model with a
+    prompt that cannot safely fit — regardless of the loaded window."""
+
+    def test_safe_input_budget_never_eats_the_window(self):
+        from context_safety import safe_input_budget
+        self.assertEqual(safe_input_budget(65536, 12000, 2000), 51536)
+        self.assertEqual(safe_input_budget(32768, 12000, 2000), 18768)
+        self.assertEqual(safe_input_budget(0), 0, "unknown window -> no budget")
+        self.assertEqual(safe_input_budget(5000, 12000, 2000), 0,
+                         "tiny window with big reserve -> 0 (must not call)")
+
+    def test_assess_zone_boundaries(self):
+        from context_safety import assess_zone, safe_input_budget
+        b = safe_input_budget(65536, 12000, 2000)  # 51536
+        self.assertEqual(assess_zone(int(b * 0.69), b), "GREEN")
+        self.assertEqual(assess_zone(int(b * 0.75), b), "YELLOW")
+        self.assertEqual(assess_zone(int(b * 0.90), b), "ORANGE")
+        self.assertEqual(assess_zone(int(b * 0.99), b), "RED")
+        self.assertEqual(assess_zone(10**9, b), "RED")
+
+    def test_compact_text_marks_truncation(self):
+        from context_safety import compact_text
+        short = "abc"
+        self.assertEqual(compact_text(short, 100), short)
+        out = compact_text("x" * 5000, 100)
+        self.assertIn("context budget", out)
+        self.assertLessEqual(len(out), 100 * 4)
+
+    def test_summarize_terminal_output_extracts_errors(self):
+        from context_safety import summarize_terminal_output
+        raw = ("exit 1\nnpm test\nPASS test/a\nFAIL test/b\n"
+               "Error: something broke\n    at fn (file.js:10:5)\n"
+               "Warning: deprecated\n" + "noise\n" * 500)
+        summary = summarize_terminal_output(raw)
+        self.assertIn("exit 1", summary)
+        self.assertIn("ERRORS:", summary)
+        self.assertIn("something broke", summary)
+        self.assertIn("STACK:", summary)
+        self.assertIn("file.js:10:5", summary)
+        self.assertLess(len(summary), len(raw), "must compress, not echo")
+
+    def test_classify_output_states(self):
+        from context_safety import classify_output
+        from backends.base import ModelResponse
+        self.assertEqual(classify_output(ModelResponse(text="done")), "COMPLETED")
+        self.assertEqual(classify_output(ModelResponse(
+            text="cut", truncated=True, truncate_reason="context_window_reached")),
+            "CONTEXT_LIMIT_REACHED")
+        self.assertEqual(classify_output(ModelResponse(
+            text="cut", truncated=True, truncate_reason="max_tokens_reached")),
+            "OUTPUT_LIMIT_REACHED")
+        self.assertEqual(classify_output(ModelResponse(
+            text="cut", truncated=True, truncate_reason="stream_eof")), "TIMEOUT")
+        self.assertEqual(classify_output(ModelResponse(
+            text="cut", truncated=True, truncate_reason="unbalanced_code_fence")),
+            "OUTPUT_LIMIT_REACHED")
+
+    def test_supervisor_context_block_carries_budget(self):
+        from context_safety import supervisor_context_block
+        block = supervisor_context_block("qwen2.5-coder-14b-instruct-mlx",
+                                         65536, 12000, 2000, 3, 7,
+                                         "terminal, filesystem, tests", "GREEN")
+        self.assertIn("qwen2.5-coder-14b-instruct-mlx", block)
+        self.assertIn("65536", block)
+        self.assertIn("51536", block)  # safe input budget
+        self.assertIn("12000", block)  # output reserve
+        self.assertIn("3/7", block)    # current step
+        self.assertIn("GREEN", block)
+
+    def test_qwen_prompt_compacts_source_context_to_budget(self):
+        """A huge source context must be compacted, never sent whole."""
+        from supervise import _qwen_primary_prompt
+        big = "x" * 400_000  # ~100k tokens of context
+        req = _qwen_primary_prompt("small task", source_context=big,
+                                   context_window=32768, output_reserve_tokens=12000,
+                                   safety_margin_tokens=2000)
+        self.assertLess(len(req.user), 200_000,
+                        "source context must be compacted to the safe budget")
+        self.assertIn("compacted", req.user)
+
+    def test_qwen_prompt_summarizes_terminal_output(self):
+        from supervise import _qwen_primary_prompt
+        big = "noise\n" * 20000 + "Error: boom\n"
+        req = _qwen_primary_prompt("small task", terminal_output=big,
+                                   context_window=32768)
+        self.assertIn("SUMMARIZED", req.user)
+        self.assertIn("boom", req.user)
+        self.assertLess(len(req.user), len(big))
+
+    def test_supervise_red_never_calls_qwen(self):
+        """When the task alone exceeds the safe input budget, Qwen must NOT be
+        called — the run escalates to DeepSeek instead."""
+        calls = []
+
+        def qwen(req):
+            calls.append(req)  # must never happen
+            return ModelResponse(text="SHOULD NOT HAPPEN")
+
+        cloud = FakeCloud(verdicts=[_approved()])
+        res = supervise(local=object(), cloud=cloud, task="t", qwen_generate=qwen,
+                        status=lambda l: None,
+                        context_window=512,  # tiny window -> everything is RED
+                        output_reserve_tokens=12000, safety_margin_tokens=2000)
+        self.assertEqual(calls, [], "Qwen must not be called in RED zone")
+        self.assertTrue(res.escalated)
+        self.assertEqual(res.reason, "local_context_red_escalation")
+
+    def test_supervise_green_calls_qwen_normally(self):
+        calls = []
+
+        def qwen(req):
+            calls.append(req)
+            return ModelResponse(text="```a.py\nx\n```\n")
+
+        res = supervise(local=object(), cloud=FakeCloud(), task="tiny",
+                        qwen_generate=qwen, status=lambda l: None,
+                        context_window=32768)
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(res.verdicts[0].decision, "APPROVED")
+        self.assertFalse(res.escalated)
+
+
+class CapabilityDiscoveryTests(unittest.TestCase):
+    """Per-model capability discovery: the engine must not assume all local
+    models behave identically (window, architecture, max output, vision...)."""
+
+    def test_capabilities_parse_full_payload(self):
+        from unittest import mock
+        from backends.local_qwen import discover_model_capabilities
+        payload = {"models": [{
+            "type": "llm", "publisher": "x", "key": "model-x",
+            "architecture": "llama", "format": "gguf",
+            "quantization": {"name": "q4_k_m"},
+            "max_context_length": 131072,
+            "capabilities": {"vision": False, "trained_for_tool_use": True},
+            "loaded_instances": [{"config": {"context_length": 65536}}],
+        }]}
+        with mock.patch("urllib.request.urlopen") as m:
+            m.return_value.__enter__.return_value.read.return_value.decode.return_value = (
+                __import__("json").dumps(payload))
+            caps = discover_model_capabilities("http://x/api/v1", model="model-x")
+        self.assertEqual(caps["model_id"], "model-x")
+        self.assertEqual(caps["context_window"], 65536)
+        self.assertEqual(caps["max_context_length"], 131072)
+        self.assertEqual(caps["architecture"], "llama")
+        self.assertEqual(caps["format"], "gguf")
+        self.assertEqual(caps["quantization"], "q4_k_m")
+        self.assertTrue(caps["tool_use"])
+        self.assertFalse(caps["vision"])
+
+    def test_capabilities_safe_defaults_on_error(self):
+        from unittest import mock
+        from backends.local_qwen import discover_model_capabilities
+        with mock.patch("urllib.request.urlopen", side_effect=OSError("down")):
+            caps = discover_model_capabilities("http://x/api/v1", model="m")
+        self.assertEqual(caps["context_window"], 0)
+        self.assertEqual(caps["max_output"], 0)
+        self.assertEqual(caps["architecture"], "")
+        self.assertFalse(caps["vision"])
+
+    def test_discover_context_window_delegates_to_capabilities(self):
+        from unittest import mock
+        from backends.local_qwen import discover_context_window
+        payload = {"models": [{"key": "m", "max_context_length": 65536,
+                               "loaded_instances": [{"config": {"context_length": 32768}}]}]}
+        with mock.patch("urllib.request.urlopen") as m:
+            m.return_value.__enter__.return_value.read.return_value.decode.return_value = (
+                __import__("json").dumps(payload))
+            self.assertEqual(discover_context_window("http://x/api/v1", model="m"), 32768)
+
+
+class DynamicReserveTests(unittest.TestCase):
+    """Output reserve must be dynamic: min(configured, model_max, task need) —
+    a tiny task does not sacrifice 12k tokens of context."""
+
+    def test_reserve_capped_by_model_max_output(self):
+        from context_safety import dynamic_output_reserve
+        self.assertEqual(dynamic_output_reserve(12000, model_max_output=8192), 8192)
+        self.assertEqual(dynamic_output_reserve(12000, model_max_output=0), 12000)
+
+    def test_reserve_capped_by_task_need(self):
+        from context_safety import dynamic_output_reserve
+        self.assertEqual(dynamic_output_reserve(12000, task_required_output=3000), 3000)
+        self.assertEqual(dynamic_output_reserve(12000, task_required_output=200), 512,
+                         "never below a minimal response")
+
+    def test_reserve_min_of_all(self):
+        from context_safety import dynamic_output_reserve
+        self.assertEqual(dynamic_output_reserve(12000, model_max_output=8192,
+                                                task_required_output=4000), 4000)
+
+    def test_task_required_output_scales_with_files(self):
+        from context_safety import task_required_output
+        small = task_required_output("fix a typo", ["a.py"])
+        big = task_required_output("build an app", ["a.py", "b.py", "c.py", "d.py"])
+        self.assertGreater(big, small)
+        self.assertGreater(small, 0)
+
+    def test_dynamic_reserve_feeds_supervise_budget(self):
+        """A tiny task must yield a LARGER safe input budget (smaller reserve)."""
+        calls = []
+
+        def qwen(req):
+            calls.append(req)
+            return ModelResponse(text="```a.py\nx\n```\n")
+
+        res = supervise(local=object(), cloud=FakeCloud(), task="tiny",
+                        qwen_generate=qwen, status=lambda l: None,
+                        context_window=32768,
+                        output_reserve_tokens=12000, safety_margin_tokens=2000,
+                        contract_files=["a.py"])
+        self.assertEqual(len(calls), 1)
+        self.assertFalse(res.escalated)
+
+
+class RetryBudgetTests(unittest.TestCase):
+    """Recovery loops must be hard-capped — a pathological model cannot burn
+    unbounded time/tokens retrying."""
+
+    def test_retry_budget_caps_continuation_calls(self):
+        calls = []
+
+        def qwen(req):
+            calls.append(req)
+            return ModelResponse(text="cut...", truncated=True,
+                                 truncate_reason="context_window_reached")
+
+        cloud = FakeCloud(verdicts=[_approved()])
+        res = supervise(local=object(), cloud=cloud, task="t", qwen_generate=qwen,
+                        status=lambda l: None, context_window=32768,
+                        max_recovery_retries=3)
+        # 1 primary + exactly 3 recovery retries, then escalation — never more.
+        self.assertEqual(len(calls), 4)
+        self.assertTrue(res.escalated)
+        self.assertEqual(res.reason, "local_truncation_escalation")
+
+    def test_retry_budget_zero_means_no_retry(self):
+        calls = []
+
+        def qwen(req):
+            calls.append(req)
+            return ModelResponse(text="cut", truncated=True)
+
+        res = supervise(local=object(), cloud=FakeCloud(), task="t",
+                        qwen_generate=qwen, status=lambda l: None,
+                        context_window=32768, max_recovery_retries=0)
+        self.assertEqual(len(calls), 1, "no continuation allowed")
+
+    def test_success_after_retry_within_budget(self):
+        calls = []
+
+        def qwen(req):
+            calls.append(req)
+            if len(calls) == 1:
+                return ModelResponse(text="partial", truncated=True)
+            return ModelResponse(text="```a.py\nx\n```\n")
+
+        res = supervise(local=object(), cloud=FakeCloud(), task="t",
+                        qwen_generate=qwen, status=lambda l: None,
+                        context_window=32768, max_recovery_retries=1)
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(res.verdicts[0].decision, "APPROVED")
+        self.assertFalse(res.escalated)
+
+
+class CompactionInvariantTests(unittest.TestCase):
+    """Compaction must NEVER remove task requirements, BOUND, contract,
+    supervisor fixes, or the engine protocol — only bulk context."""
+
+    def test_core_sections_survive_compaction(self):
+        from supervise import _qwen_primary_prompt
+        task = "TASK TEXT: fix the login flow"
+        bound = "BOUND: never touch .env"
+        contract = "CONTRACT: must change src/auth.ts"
+        fixes = "FIX: revert the bad import"
+        big = "x" * 300_000  # forces source compaction
+        req = _qwen_primary_prompt(
+            task, prior_fixes=fixes, bound_text=bound, contract_text=contract,
+            source_context=big, context_window=32768,
+            output_reserve_tokens=12000, safety_margin_tokens=2000)
+        # All protected invariants present verbatim.
+        self.assertIn("TASK TEXT: fix the login flow", req.user)
+        self.assertIn("BOUND: never touch .env", req.system)
+        self.assertIn("CONTRACT: must change src/auth.ts", req.user)
+        self.assertIn("FIX: revert the bad import", req.user)
+        self.assertIn("REMAINING WORK", req.user)  # engine protocol survives
+        # Bulk context was compacted, not the core.
+        self.assertIn("compacted", req.user)
+        meta = req.metadata.get("context_safety") or {}
+        self.assertIn("source", meta.get("compaction", ""))
+
+    def test_task_never_truncated_by_compactor(self):
+        from supervise import _qwen_primary_prompt
+        task = "EXACT TASK: " + "important requirement " * 50
+        req = _qwen_primary_prompt(
+            task, source_context="y" * 500_000, context_window=32768,
+            output_reserve_tokens=12000, safety_margin_tokens=2000)
+        self.assertIn("EXACT TASK: ", req.user)
+        self.assertIn("important requirement", req.user)
+
+
+class TelemetryTests(unittest.TestCase):
+    def test_telemetry_line_has_all_fields(self):
+        from context_safety import context_telemetry
+        line = context_telemetry(model="m", window=65536, safe_input=51536,
+                                 input_tokens=18240, output_reserve=12000,
+                                 zone="GREEN", compaction="none",
+                                 output_tokens=2840, status="COMPLETED",
+                                 step=3, step_total=7, architecture="qwen2",
+                                 max_output=0, vision=False, tool_use=False)
+        for frag in ["MODEL=m", "WINDOW=65536", "SAFE_INPUT=51536",
+                     "INPUT=18240", "OUT_RESERVE=12000", "ZONE=GREEN",
+                     "COMPACTION=none", "OUTPUT=2840", "STATUS=COMPLETED",
+                     "STEP=3/7", "ARCH=qwen2", "MAX_OUTPUT=0",
+                     "VISION=false", "TOOLS=false"]:
+            self.assertIn(frag, line)
+
+    def test_supervise_emits_telemetry(self):
+        lines = []
+
+        def qwen(req):
+            return ModelResponse(text="```a.py\nx\n```\n")
+
+        res = supervise(local=object(), cloud=FakeCloud(), task="tiny",
+                        qwen_generate=qwen, status=lambda l: None,
+                        context_window=32768, telemetry=lines.append)
+        self.assertGreaterEqual(len(lines), 1)
+        self.assertIn("STATUS=COMPLETED", lines[-1])
+        self.assertIn("ZONE=GREEN", lines[-1])
+
+    def test_telemetry_emitted_on_red(self):
+        lines = []
+        res = supervise(local=object(), cloud=FakeCloud(), task="t",
+                        qwen_generate=lambda r: ModelResponse(text="x"),
+                        status=lambda l: None,
+                        context_window=512,  # RED
+                        output_reserve_tokens=12000, safety_margin_tokens=2000,
+                        telemetry=lines.append)
+        self.assertTrue(res.escalated)
+        self.assertTrue(any("RED_ESCALATION" in l for l in lines))
+
+
+class StressTests(unittest.TestCase):
+    """Deliberately adversarial inputs: the CSC must survive them without the
+    local model EVER receiving an unsafe payload."""
+
+    def test_30k_token_task_is_compacted_not_dropped(self):
+        from supervise import _qwen_primary_prompt
+        from context_safety import estimate_tokens
+        task = ("requirement " * 7500)  # ~30k tokens of task text
+        req = _qwen_primary_prompt(task, context_window=32768,
+                                   output_reserve_tokens=12000,
+                                   safety_margin_tokens=2000)
+        # The task core is protected: it stays (compaction happens on bulk
+        # context, never the task) — but the total prompt is preflight-checked
+        # by supervise(); here we assert the builder never crashes and the
+        # engine protocol survives.
+        self.assertIn("REMAINING WORK", req.user)
+        self.assertGreater(estimate_tokens(req.system + req.user), 0)
+
+    def test_100k_token_source_tree_compacted(self):
+        from supervise import _qwen_primary_prompt
+        tree = "\n".join(f"--- src/mod{i}.ts ({i} bytes)\n" + "y" * 2000
+                         for i in range(50))  # ~100k chars source tree
+        req = _qwen_primary_prompt("refactor auth", source_context=tree,
+                                   context_window=32768,
+                                   output_reserve_tokens=12000,
+                                   safety_margin_tokens=2000)
+        self.assertIn("compacted", req.user)
+        self.assertIn("refactor auth", req.user)  # task intact
+
+    def test_enormous_terminal_output_summarized(self):
+        from supervise import _qwen_primary_prompt
+        # ~200k chars (~57k tokens) — far beyond the ~18k safe input budget,
+        # so the CSC MUST summarize instead of echoing the log into the window.
+        log = "noise line\n" * 20000 + "Error: catastrophic failure\n" + "at x.js:1\n"
+        req = _qwen_primary_prompt("fix build", terminal_output=log,
+                                   context_window=32768)
+        self.assertIn("SUMMARIZED", req.user)
+        self.assertIn("catastrophic failure", req.user)
+        self.assertLess(len(req.user), len(log) // 3)
+
+    def test_repeated_tool_calls_bounded_by_terminal_rounds(self):
+        calls = []
+
+        def qwen(req):
+            calls.append(req)
+            # Model keeps asking to run the same command forever.
+            return ModelResponse(text="RUN: npm test\n```a.py\nx\n```\n")
+
+        def tool(cmd):
+            return "exit 1\nError: something failed"
+
+        res = supervise(local=object(), cloud=FakeCloud(), task="t",
+                        qwen_generate=qwen, terminal_tool=tool,
+                        max_terminal_rounds=2, status=lambda l: None,
+                        context_window=32768)
+        self.assertLessEqual(len(calls), 3, "terminal loop must terminate")
+
+    def test_10_iterations_terminate(self):
+        calls = []
+        cloud = FakeCloud(verdicts=[_fix_required() for _ in range(20)])
+
+        def qwen(req):
+            calls.append(req)
+            return ModelResponse(text="```a.py\nx\n```\n")
+
+        res = supervise(local=object(), cloud=cloud, task="t",
+                        qwen_generate=qwen, status=lambda l: None,
+                        max_iterations=10, context_window=32768)
+        self.assertLessEqual(len(calls), 10)
+        self.assertTrue(res.escalated or res.reason.startswith("deepseek_fallback"))
+
+    def test_window_change_32k_64k_128k(self):
+        from unittest import mock
+        from backends.local_qwen import discover_context_window
+        for window in (32768, 65536, 131072):
+            payload = {"models": [{"key": "m", "max_context_length": 131072,
+                                   "loaded_instances": [{"config": {"context_length": window}}]}]}
+            with mock.patch("urllib.request.urlopen") as m:
+                m.return_value.__enter__.return_value.read.return_value.decode.return_value = (
+                    __import__("json").dumps(payload))
+                self.assertEqual(discover_context_window("http://x/api/v1", model="m"),
+                                 window)
+
+    def test_forced_incomplete_output_escalates_not_applies(self):
+        calls = []
+
+        def qwen(req):
+            calls.append(req)
+            return ModelResponse(text="```a.py\ncut mid-file", truncated=True,
+                                 truncate_reason="context_window_reached")
+
+        res = supervise(local=object(), cloud=FakeCloud(), task="t",
+                        qwen_generate=qwen, status=lambda l: None,
+                        context_window=32768)
+        self.assertTrue(res.escalated)
+        self.assertNotIn("review_failed", res.reason)
+        self.assertNotEqual(res.final_text, "```a.py\ncut mid-file",
+                            "incomplete output must never be applied as-is")
+
+    def test_forced_timeout_classified_and_escalated(self):
+        calls = []
+
+        def qwen(req):
+            calls.append(req)
+            return ModelResponse(text="partial...", truncated=True,
+                                 truncate_reason="stream_eof")
+
+        res = supervise(local=object(), cloud=FakeCloud(), task="t",
+                        qwen_generate=qwen, status=lambda l: None,
+                        context_window=32768)
+        self.assertTrue(res.escalated)
+        self.assertEqual(res.reason, "local_truncation_escalation")
+
+    def test_supervisor_unavailable_applies_without_review_flag(self):
+        class DownCloud:
+            def generate(self, req):
+                raise RuntimeError("supervisor down")
+
+        def qwen(req):
+            return ModelResponse(text="```a.py\nx\n```\n")
+
+        res = supervise(local=object(), cloud=DownCloud(), task="t",
+                        qwen_generate=qwen, status=lambda l: None,
+                        context_window=32768)
+        self.assertEqual(res.reason, "review_failed_no_verdict")
+        self.assertFalse(res.escalated)
+
+    def test_local_model_unavailable_escalates(self):
+        def qwen(req):
+            raise RuntimeError("local model crashed")
+
+        res = supervise(local=object(), cloud=FakeCloud(), task="t",
+                        qwen_generate=qwen, status=lambda l: None,
+                        context_window=32768)
+        self.assertTrue(res.escalated)
+        self.assertEqual(res.reason, "local_failure_escalation")
 
 
 class EnhancementTests(unittest.TestCase):

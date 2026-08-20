@@ -55,6 +55,10 @@ class Provider:
     # fixed extra body params. Config-driven, so new endpoints need no code.
     request_exclude: list = field(default_factory=list)
     request_extra: dict = field(default_factory=dict)
+    # Loaded context window (tokens) of the local model — used to detect
+    # server-side truncation when prompt+output reach the window, which the
+    # /api/v1/chat endpoint never reports via finish_reason. 0 = engine default.
+    context_window: int = 0
 
     def describe(self) -> str:
         return f"{self.name} ({self.kind}: {self.model} @ {self.base_url})"
@@ -62,7 +66,7 @@ class Provider:
 
 def _provider(name, kind, base_url, model, api_key_env="", api_key="",
               enabled=True, timeout_s=30.0, max_retries=4, backoff_s=None,
-              request_exclude=None, request_extra=None):
+              request_exclude=None, request_extra=None, context_window=0):
     return Provider(
         name=name, kind=kind, base_url=base_url, model=model,
         api_key_env=api_key_env, api_key=api_key, enabled=enabled,
@@ -71,6 +75,7 @@ def _provider(name, kind, base_url, model, api_key_env="", api_key="",
         request_exclude=list(request_exclude) if request_exclude is not None
         else (["max_tokens"] if kind == "local" else []),
         request_extra=dict(request_extra) if request_extra else {},
+        context_window=int(context_window or 0),
     )
 
 
@@ -87,6 +92,7 @@ def _from_dict(d: dict, kind: str) -> Provider:
         max_retries=int(d.get("max_retries", 3 if kind == "local" else 4)),
         request_exclude=d.get("request_exclude"),
         request_extra=d.get("request_extra"),
+        context_window=d.get("context_window", 0),
     )
 
 
@@ -167,6 +173,8 @@ def _apply_overrides(p: Provider, overrides: dict | None = None) -> Provider:
         p.timeout_s = float(d["timeout_s"])
     if "max_retries" in d:
         p.max_retries = int(d["max_retries"])
+    if "context_window" in d:
+        p.context_window = int(d["context_window"] or 0)
     return p
 
 
@@ -236,7 +244,20 @@ def backend_for(p: Provider):
         return DeepSeekBackend(
             api_key_env=p.api_key_env or "DEEPSEEK_API_KEY", model=p.model,
             base_url=p.base_url, timeout_s=p.timeout_s, max_retries=p.max_retries)
+    # The ACTUALLY LOADED window (live discovery) wins over the config value so
+    # models loaded with windows larger than the default (e.g. -c 65536) are
+    # guarded at their real boundary. Config is the fallback when the server is
+    # unreachable or the model is not loaded yet.
+    context_window = p.context_window or 0
+    try:
+        from backends.local_qwen import discover_context_window
+        found = discover_context_window(p.base_url, p.api_key or "lm-studio", p.model)
+        if found:
+            context_window = found
+    except Exception:  # noqa: BLE001 - discovery is best-effort
+        pass
     return QwenBackend(
         base_url=p.base_url, model=p.model, api_key=p.api_key or "lm-studio",
         timeout_s=p.timeout_s, max_retries=p.max_retries,
-        exclude_keys=tuple(p.request_exclude), extra_body=p.request_extra)
+        exclude_keys=tuple(p.request_exclude), extra_body=p.request_extra,
+        context_window=context_window)

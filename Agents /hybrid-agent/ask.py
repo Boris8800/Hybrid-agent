@@ -36,9 +36,10 @@ from backends.local_qwen import QwenBackend
 from agent import HybridAgent, _load_config, apply_env_overrides
 from backends.deepseek import _resolve_api_key
 from supervise import (QWEN_MAX_TOKENS, ChainOfThoughtParser, ReviewPackage,
-                       SuperviseResult, Verdict, _enhance_request,
-                       _supervisor_request, parse_enhancement, parse_verdict,
-                       supervise)
+                       LOCAL_CONTEXT_TOKENS, SuperviseResult, Verdict,
+                       _enhance_request, _supervisor_request, parse_enhancement,
+                       parse_verdict, supervise)
+from context_safety import DEFAULT_OUTPUT_RESERVE_TOKENS, DEFAULT_SAFETY_MARGIN_TOKENS
 from context import ProjectContext
 from parallel import (DependencyAnalyzer, ParallelExecutor, parse_plan_steps,
                       summarize)
@@ -592,7 +593,7 @@ _KNOWN_CONFIG_KEYS = {
     "review": {"max_local_retries", "max_depth_tokens", "max_failure_summary_words",
                "daily_token_budget", "verify", "verify_timeout", "verify_groups",
                "verify_allowlist", "regression", "regression_timeout",
-               "terminal_timeout"},
+               "terminal_timeout", "context_safety"},
     "cache": {"enabled", "dir", "ttl_days", "max_entries"},
     "circuit_breaker": {"window_size", "local_error_ceiling",
                         "deepseek_error_ceiling", "cooldown_s"},
@@ -656,7 +657,8 @@ def _have_openai() -> bool:
 
 def _http_generate(base_url: str, api_key: str, model: str, req: ModelRequest,
                    stream: bool = False, exclude_keys: tuple = (),
-                   extra_body: dict | None = None) -> ModelResponse:
+                   extra_body: dict | None = None,
+                   context_window: int = 0) -> ModelResponse:
     """Local MLX-format chat via urllib (POST {base_url}/chat).
 
     Streams generated tokens live to stderr (so the user sees the local model
@@ -672,7 +674,7 @@ def _http_generate(base_url: str, api_key: str, model: str, req: ModelRequest,
                     base_url, api_key, model, req.system, req.user,
                     timeout_s=req.timeout_s, temperature=req.temperature,
                     max_tokens=req.max_tokens, exclude_keys=exclude_keys,
-                    extra_body=extra_body)
+                    extra_body=extra_body, context_window=context_window)
                 marker = False
                 for token in (res["text"] or ""):
                     if not marker:
@@ -689,7 +691,8 @@ def _http_generate(base_url: str, api_key: str, model: str, req: ModelRequest,
                     base_url, api_key, model, req.system, req.user,
                     stream=False, timeout_s=req.timeout_s,
                     temperature=req.temperature, max_tokens=req.max_tokens,
-                    exclude_keys=exclude_keys, extra_body=extra_body)
+                    exclude_keys=exclude_keys, extra_body=extra_body,
+                    context_window=context_window)
                 text = res["text"]
             return ModelResponse(
                 text=text, raw=res["raw"],
@@ -719,14 +722,21 @@ def _generate(agent: HybridAgent, cfg: dict, args: argparse.Namespace,
             api_key = lp.api_key or "lm-studio"
             model = args.model or lp.model
             exclude_keys, extra_body = tuple(lp.request_exclude), lp.request_extra
+            # Discovery wins over config so windows >32768 are handled correctly.
+            context_window = _discover_local_context_window(cfg, model, base_url)
+            if not context_window:
+                context_window = LOCAL_CONTEXT_TOKENS
         else:
             lc = cfg["backends"]["local"]
             base_url = lc["base_url"]
             api_key = lc.get("api_key") or "lm-studio"
             model = args.model or lc["model"]
             exclude_keys, extra_body = ("max_tokens",), {}
+            context_window = _discover_local_context_window(cfg, model, base_url) \
+                or LOCAL_CONTEXT_TOKENS
         return _http_generate(base_url, api_key, model, req, stream=True,
-                              exclude_keys=exclude_keys, extra_body=extra_body)
+                              exclude_keys=exclude_keys, extra_body=extra_body,
+                              context_window=context_window)
 
     if _have_openai():
         backend = _select_backend(agent, cfg, route, args.model)
@@ -737,15 +747,19 @@ def _generate(agent: HybridAgent, cfg: dict, args: argparse.Namespace,
         base_url = lc["base_url"]
         api_key = lc.get("api_key") or "lm-studio"
         model = args.model or lc["model"]
+        context_window = _discover_local_context_window(cfg, model, base_url) \
+            or LOCAL_CONTEXT_TOKENS
     else:
         dc = cfg["backends"]["deepseek"]
         base_url = dc.get("base_url") or "https://api.deepseek.com"
         api_key = _resolve_api_key(dc["api_key_env"])
         model = dc["model"]
+        context_window = 0
         if not api_key:
             raise RuntimeError(f"missing API key: set {dc['api_key_env']} or install Kilo auth.json")
     return _http_generate(base_url, api_key, model, req,
-                          stream=stream and route == "local")
+                          stream=stream and route == "local",
+                          context_window=context_window)
 
 
 MAX_OUTPUT_TOKENS = 8192
@@ -1085,6 +1099,61 @@ def _format_tokens(resp: ModelResponse) -> dict:
     return tokens
 
 
+def _discover_local_capabilities(cfg: dict, model: str | None = None,
+                                 base_url: str | None = None) -> dict:
+    """Full per-model capability discovery (LM Studio /api/v1/models):
+    context window, max context, architecture, format, quantization, max
+    output, vision, tool use. Falls back to the provider config / defaults —
+    models are NOT assumed to behave identically."""
+    lp = get_local(cfg)
+    url = base_url or (lp.base_url if lp is not None else "")
+    if url:
+        model_name = model or (lp.model if lp is not None else "")
+        try:
+            from backends.local_qwen import discover_model_capabilities
+            caps = discover_model_capabilities(
+                url, api_key=lp.api_key or "lm-studio", model=model_name)
+            if caps.get("context_window"):
+                return caps
+        except Exception:  # noqa: BLE001 - discovery is best-effort
+            pass
+    return {
+        "model_id": model or (lp.model if lp is not None else ""),
+        "context_window": lp.context_window if lp is not None else 0,
+        "max_context_length": 0,
+        "architecture": "", "format": "", "quantization": "",
+        "max_output": 0, "vision": False, "tool_use": False, "tokenizer": "",
+    }
+
+
+def _discover_local_context_window(cfg: dict, model: str | None = None,
+                                   base_url: str | None = None) -> int:
+    """Resolve the ACTUALLY LOADED local context window for truncation detection.
+
+    Priority: live discovery via LM Studio /api/v1/models FIRST (the server is
+    the source of truth — whatever `-c` the model was loaded with, including
+    windows LARGER than the engine default, e.g. 65536/131072) -> provider
+    config `context_window` (fallback only when the server is unreachable or
+    the model is not loaded) -> engine default. Returns the window in tokens
+    (0 = could not determine).
+    """
+    lp = get_local(cfg)
+    url = base_url or (lp.base_url if lp is not None else "")
+    if url:
+        model_name = model or (lp.model if lp is not None else "")
+        try:
+            from backends.local_qwen import discover_context_window
+            found = discover_context_window(
+                url, api_key=lp.api_key or "lm-studio", model=model_name)
+            if found:
+                return found
+        except Exception:  # noqa: BLE001 - discovery is best-effort
+            pass
+    if lp is not None:
+        return lp.context_window or 0
+    return 0
+
+
 def _supervise_qwen_generate(cfg: dict, model_override: str | None,
                               local_provider: str | None = None):
     """Return a streaming wrapper for the supervise loop's local step.
@@ -1104,6 +1173,11 @@ def _supervise_qwen_generate(cfg: dict, model_override: str | None,
         timeout_s = lp.timeout_s
         exclude_keys = tuple(lp.request_exclude)
         extra_body = lp.request_extra
+        # Discovery wins (server truth, any window incl. >32768); config is a
+        # fallback only when the server is unreachable.
+        context_window = _discover_local_context_window(cfg, model, base_url)
+        if not context_window:
+            context_window = LOCAL_CONTEXT_TOKENS
     else:
         lc = cfg["backends"]["local"]
         base_url = lc["base_url"]
@@ -1112,11 +1186,14 @@ def _supervise_qwen_generate(cfg: dict, model_override: str | None,
         timeout_s = lc["timeout_s"]
         exclude_keys = ("max_tokens",)  # MLX server rejects it
         extra_body = {}
+        context_window = _discover_local_context_window(cfg, model, base_url) \
+            or LOCAL_CONTEXT_TOKENS
 
     def _gen(req: ModelRequest) -> ModelResponse:
         req.timeout_s = timeout_s
         return _http_generate(base_url, api_key, model, req, stream=True,
-                              exclude_keys=exclude_keys, extra_body=extra_body)
+                              exclude_keys=exclude_keys, extra_body=extra_body,
+                              context_window=context_window)
 
     return _gen
 
@@ -1236,7 +1313,10 @@ MAX_CLARIFY_ROUNDS = 3
 
 
 def _enhance_task(agent: HybridAgent, cfg: dict, args: argparse.Namespace,
-                  task: str, context: str, cache=None):
+                  task: str, context: str, cache=None,
+                  local_context_window: int = LOCAL_CONTEXT_TOKENS,
+                  output_reserve_tokens: int = DEFAULT_OUTPUT_RESERVE_TOKENS,
+                  safety_margin_tokens: int = DEFAULT_SAFETY_MARGIN_TOKENS):
     """Run DeepSeek prompt-enhancement with an interactive clarification loop.
 
     DeepSeek ENHANCES the prompt and plans around the local model's limits. If
@@ -1252,7 +1332,10 @@ def _enhance_task(agent: HybridAgent, cfg: dict, args: argparse.Namespace,
     for round_num in range(MAX_CLARIFY_ROUNDS):
         enh_label = "deepseek (prompt enhancer)"
         _status(f"[hybrid] ▶ {enh_label} working on \"{_task_preview(current)}\" ...")
-        req = _enhance_request(current, context, cot=args.cot)
+        req = _enhance_request(current, context, cot=args.cot,
+                               context_window=local_context_window,
+                               output_reserve_tokens=output_reserve_tokens,
+                               safety_margin_tokens=safety_margin_tokens)
         if cache is not None and cache.enabled:
             k = cache.key("enhance", req.system, req.user)
             hit = cache.get("enhance", k)
@@ -2170,6 +2253,8 @@ def _select_backend(agent: HybridAgent, cfg: dict, route: str,
     return QwenBackend(
         lc["base_url"], model,
         timeout_s=lc["timeout_s"], max_retries=lc["max_retries"],
+        context_window=_discover_local_context_window(cfg, model, lc["base_url"])
+        or LOCAL_CONTEXT_TOKENS,
     )
 
 
@@ -2601,6 +2686,29 @@ def main() -> int:
                   "(env DEEPSEEK_API_KEY or Kilo auth.json)", file=sys.stderr)
             return 2
         local, cloud = agent._backends()
+        # Per-model CAPABILITY discovery: context window (the source of truth
+        # for truncation detection — discovery WINS over config so windows >
+        # 32768 are handled), plus architecture / max output / vision / tool
+        # support. Different local models are NOT assumed to behave alike.
+        local_model_name = (args.model or (local.model if hasattr(local, "model") else "")
+                            or "local model")
+        local_caps = _discover_local_capabilities(
+            cfg, model=local_model_name,
+            base_url=(local.base_url if hasattr(local, "base_url") else None))
+        local_context_window = local_caps.get("context_window") or 0
+        if not local_context_window:
+            local_context_window = LOCAL_CONTEXT_TOKENS
+        # Context Safety Controller budgets (config review.context_safety).
+        _cs = (cfg.get("review") or {}).get("context_safety") or {}
+        output_reserve_tokens = int(_cs.get("output_reserve_tokens", 12000))
+        safety_margin_tokens = int(_cs.get("safety_margin_tokens", 2000))
+        _safe_input = max(0, local_context_window - output_reserve_tokens
+                          - safety_margin_tokens)
+        _status(f"[hybrid] 🧭 local model: {local_model_name} "
+                f"(arch={local_caps.get('architecture') or '?'}, "
+                f"ctx={local_caps.get('max_context_length') or '?'}) "
+                f"window {local_context_window} · safe input {_safe_input} "
+                f"(reserve {output_reserve_tokens} + margin {safety_margin_tokens})")
         tracker = ProgressTracker()
         cache = CacheManager(cfg, args)
         cloud = _cached_cloud(cloud, cache)
@@ -2676,7 +2784,10 @@ def main() -> int:
             tracker.start_phase("enhance")
             try:
                 task_for_qwen, enhancement, clar_needed = _enhance_task(
-                    agent, cfg, args, args.task, context, cache=cache)
+                    agent, cfg, args, args.task, context, cache=cache,
+                    local_context_window=local_context_window,
+                    output_reserve_tokens=output_reserve_tokens,
+                    safety_margin_tokens=safety_margin_tokens)
             except BudgetExceeded as exc:
                 _status("[hybrid] ⛔ deepseek (prompt enhancer) skipped: daily token budget exhausted")
                 print(f"error: {exc}", file=sys.stderr)
@@ -2771,6 +2882,16 @@ def main() -> int:
                     contract_text=contract.to_prompt(),
                     source_context=dep_ctx,
                     evidence_provider=_evidence_provider(cfg, args, tracker),
+                    context_window=local_context_window,
+                    output_reserve_tokens=output_reserve_tokens,
+                    safety_margin_tokens=safety_margin_tokens,
+                    local_model=local_model_name,
+                    model_max_output=local_caps.get("max_output") or 0,
+                    contract_files=contract.files if contract.complete else None,
+                    architecture=local_caps.get("architecture") or "",
+                    vision=bool(local_caps.get("vision")),
+                    tool_use=bool(local_caps.get("tool_use")),
+                    telemetry=lambda line: tracker.tick(f"telemetry {line}"),
                 )
         except BudgetExceeded as exc:
             _status("[hybrid] ⛔ supervise aborted: daily DeepSeek token budget exhausted")
@@ -3092,8 +3213,16 @@ def main() -> int:
             print("error: --enhance is for the local route; use --local or MODE=hybrid/local.", file=sys.stderr)
             return 3
         try:
+            local_window = _discover_local_context_window(
+                cfg, model=args.model or (cfg.get("backends", {})
+                                          .get("local", {}).get("model", "")))
+            _cs = (cfg.get("review") or {}).get("context_safety") or {}
+            _or = int(_cs.get("output_reserve_tokens", 12000))
+            _sm = int(_cs.get("safety_margin_tokens", 2000))
             task_for_qwen, enhancement, clar_needed = _enhance_task(
-                agent, cfg, args, args.task, context, cache=cache)
+                agent, cfg, args, args.task, context, cache=cache,
+                local_context_window=local_window or LOCAL_CONTEXT_TOKENS,
+                output_reserve_tokens=_or, safety_margin_tokens=_sm)
         except BudgetExceeded as exc:
             _status("[hybrid] ⛔ deepseek (prompt enhancer) skipped: daily token budget exhausted")
             print(f"error: {exc}", file=sys.stderr)

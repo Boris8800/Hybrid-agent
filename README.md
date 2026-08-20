@@ -24,6 +24,7 @@ The bridge is a self-contained CLI (`ask.py`) that talks directly to two OpenAI-
 - [Quick start](#quick-start)
 - [CLI reference](#cli-reference)
 - [The supervise loop](#the-supervise-loop)
+- [Context Safety Controller](#context-safety-controller)
 - [Prompt enhancement](#prompt-enhancement)
 - [Parallel execution](#parallel-execution)
 - [Verification stage](#verification-stage)
@@ -500,9 +501,12 @@ use plain `python3 ask.py …` (the CLI self-heals into the venv interpreter).
 
 ## The supervise loop
 
-1. **Qwen implements** the task (streamed live). Truncated output is retried once at
-   double budget; if still cut off, the run escalates to DeepSeek rather than
-   pretending the output is complete.
+1. **Qwen implements** the task (streamed live), gated by the [Context Safety
+   Controller](#context-safety-controller): the prompt is budgeted and preflighted
+   before the call. Incomplete output (`OUTPUT_LIMIT_REACHED` /
+   `CONTEXT_LIMIT_REACHED` / `TIMEOUT`) is continued once at double budget
+   (hard retry cap); if still cut off, the run escalates to DeepSeek rather
+   than pretending the output is complete.
 2. **A compact review package** is built — task, plan, Qwen output, uncertainties,
    a **live git diff** (via `review/diff_builder.py`), and any verification context.
    DeepSeek never sees the whole conversation, only this package.
@@ -516,6 +520,74 @@ use plain `python3 ask.py …` (the CLI self-heals into the venv interpreter).
 
 **Verdict caching:** identical review packages (same task + output + diff) are served
 from the response cache — no API spend on a repeat review.
+
+## Context Safety Controller
+
+The orchestration layer — never the local model — decides whether the context is
+safe. Before **every** local-model call, the prompt is measured against hard
+budgets derived from the model's **actually loaded** context window, so the
+local model can never reach an unusable context state. Truncation is a
+*prevented* state, not a failure detected after the fact.
+
+**Per-model capability discovery.** At startup the engine queries LM Studio's
+`/api/v1/models` and reads the real loaded window
+(`loaded_instances[].config.context_length`), max context, architecture,
+format, quantization, max output, vision and tool-use support. Discovery wins
+over config: a stale `context_window:` value in `config.yml` can never cap a
+model loaded with a larger window (`-c 65536`, `131072`, …). Config is used
+only when the server is unreachable; the engine default is 32768. Models are
+never assumed to behave alike.
+
+**Budget math.** The safe input budget never uses 100% of the window:
+
+```
+safe_input_budget = discovered_window − output_reserve − safety_margin
+```
+
+Defaults (configurable via `review.context_safety`): reserve 12000, margin
+2000. The reserve is **dynamic** — `min(configured_reserve, model_max_output,
+task_required_output)` — so a tiny task does not sacrifice 12k tokens of
+window (a 2-file task runs with reserve ≈ 512 → safe budget ≈ 30256 on a
+32768 window).
+
+**Preflight zones** (checked before the model is called):
+
+| Zone | Usage | Action |
+|------|-------|--------|
+| GREEN | < 70% | proceed |
+| YELLOW | 70–85% | compress / reduce context |
+| ORANGE | 85–95% | aggressive compaction |
+| RED | > 95% | **do NOT call the model** — escalate to DeepSeek (`local_context_red_escalation`) |
+
+**Compaction invariants.** Compaction never removes the protected core: task
+requirements, BOUND constraints, contract (files being modified, security
+requirements), supervisor fixes, and the engine protocol. Only bulk context is
+compactable — source context first, then terminal output, which is summarized
+(exit code / errors / stack traces / changed files / warnings) instead of
+echoing raw 20k-token logs back into the window. If even the protected core
+exceeds the budget, the prompt is returned intact and the RED preflight
+escalates; the task is never truncated by the compactor.
+
+**Retry budget.** Recovery loops after incomplete local output are hard-capped
+(`max_recovery_retries`, default 1: one continuation, then escalation), so a
+pathological model cannot burn unbounded time/tokens. Output states are
+classified distinctly: `COMPLETED` / `OUTPUT_LIMIT_REACHED` /
+`CONTEXT_LIMIT_REACHED` / `TIMEOUT` / `MODEL_ERROR` — an incomplete response is
+never marked successful or applied.
+
+**Supervisor awareness.** Every DeepSeek review/plan/enhance prompt carries a
+`LOCAL MODEL CONTEXT` block (model, actual window, safe input budget, output
+reserve, step N/M, tools, zone) so the API supervisor plans within the real
+usable context.
+
+**Telemetry.** One structured line per local call:
+
+```
+MODEL=qwen2.5-coder-14b-instruct-mlx | ARCH=qwen2 | WINDOW=32768 | SAFE_INPUT=30256 | INPUT=553 | OUT_RESERVE=512 | ZONE=GREEN | COMPACTION=none | OUTPUT=28 | STATUS=COMPLETED | STEP=1/3 | MAX_OUTPUT=0 | VISION=false | TOOLS=false
+```
+
+Token estimation is conservative (3.5 chars/token — code tokenizes denser than
+prose; override with `HYBRID_CHARS_PER_TOKEN`).
 
 ## Dynamic supervision routing
 
@@ -685,7 +757,7 @@ Unknown keys are ignored by the loader, and every section has a safe default.
 | `router` | `local_threshold`, `threshold_min/max`, `target_local_rate`, `alpha`, `supervision` (auto/full/local_first/critical), `weights` |
 | `backends.local` | `base_url`, `api_key`, `model`, `timeout_s`, `max_retries`, `backoff_s`, `cold_start_wait_s` |
 | `backends.deepseek` | `api_key_env`, `base_url`, `model`, `timeout_s`, `max_retries`, `backoff_s` |
-| `review` | `verify`, `verify_timeout`, `verify_groups`, `verify_allowlist`, `regression`, `regression_timeout`, `daily_token_budget`, `max_depth_tokens`, `max_failure_summary_words`, `terminal_timeout` |
+| `review` | `verify`, `verify_timeout`, `verify_groups`, `verify_allowlist`, `regression`, `regression_timeout`, `daily_token_budget`, `max_depth_tokens`, `max_failure_summary_words`, `terminal_timeout`, `context_safety` (`output_reserve_tokens`, `safety_margin_tokens`) |
 | `cache` | `enabled`, `dir`, `ttl_days`, `max_entries` |
 | `circuit_breaker` | `window_size`, `local_error_ceiling`, `deepseek_error_ceiling`, `cooldown_s` |
 | `memory` | `root`, `max_project_summary_words`, `semantic_similarity`, `embedding_model`, `embedding_threshold` |
@@ -714,6 +786,12 @@ Unknown keys are ignored by the loader, and every section has a safe default.
 - review counts (`deepseek_reviews`, `approvals`, `rejections`, `fix_required`, `deepseek_fallbacks`);
 - sessions (`tasks_completed`, `files_generated`, `total_iterations`, `truncation_events`, quality);
 - weekly snapshots under `periods` and phase timings under `phase_timings`;
+
+Per-call **context telemetry** is emitted live during runs (see
+[Context Safety Controller](#context-safety-controller)): model, architecture,
+window, safe input budget, input tokens, output reserve, zone, compaction,
+output tokens, status, step, max output, vision and tool-use — one structured
+line per local-model call so context-pipeline issues are easy to debug.
 - `verify` metrics (iterations, API calls, tokens, estimated cost, pass/fail);
 - `cache` hit/miss counters and `api_tokens` daily usage for the budget.
 
