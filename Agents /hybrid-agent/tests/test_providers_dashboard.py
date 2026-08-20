@@ -13,6 +13,7 @@ import sys
 import tempfile
 import types
 import unittest
+import unittest.mock
 from argparse import Namespace
 from pathlib import Path
 
@@ -254,6 +255,37 @@ class TestDashboardAPI(unittest.TestCase):
             self.assertEqual(resp.status_code, 200)
         finally:
             self.mod.TOKEN = ""
+
+
+class TestEnhanceProceed(unittest.TestCase):
+    """--proceed continues with the enhanced prompt when non-interactive."""
+
+    RAW = ("=== ENHANCED PROMPT ===\nDo the thing.\n\n=== PLAN ===\nStep 1\n\n"
+           "=== CLARIFYING QUESTIONS ===\n1. Which database?")
+
+    def _run(self, proceed: bool):
+        import contextlib
+        import io
+        fake_resp = ModelResponse(text=self.RAW, backend="deepseek")
+        args = Namespace(cot=False, json=False, proceed=proceed, router="auto")
+        cfg = {"backends": {"local": {}, "deepseek": {}}, "review": {}}
+        with contextlib.redirect_stdout(io.StringIO()), \
+                unittest.mock.patch.object(sys, "stdin",
+                                           types.SimpleNamespace(isatty=lambda: False)), \
+                unittest.mock.patch.object(ask, "_generate_with_retry",
+                                           return_value=fake_resp):
+            task_for_gemma, enhancement, clar_needed = ask._enhance_task(
+                types.SimpleNamespace(), cfg, args, "check the web", "", cache=None)
+        return task_for_gemma, clar_needed
+
+    def test_aborts_when_not_proceeding(self):
+        _, clar_needed = self._run(proceed=False)
+        self.assertTrue(clar_needed)
+
+    def test_proceeds_with_enhanced_prompt(self):
+        task_for_gemma, clar_needed = self._run(proceed=True)
+        self.assertFalse(clar_needed)
+        self.assertIn("Do the thing.", task_for_gemma)
 
 
 if __name__ == "__main__":

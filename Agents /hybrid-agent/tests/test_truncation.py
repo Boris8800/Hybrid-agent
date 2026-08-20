@@ -348,7 +348,7 @@ class EnhanceTaskClarificationTests(unittest.TestCase):
 
     @staticmethod
     def _args():
-        return type("A", (), {"json": False, "cot": False})()
+        return type("A", (), {"json": False, "cot": False, "proceed": False})()
 
     def test_non_tty_unclear_stops_for_clarification(self):
         def fake_gen(agent, cfg, args, route, req):

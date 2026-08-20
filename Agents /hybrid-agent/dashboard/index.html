@@ -204,6 +204,7 @@ h4.sub{font-size:13px;margin:20px 0 10px;color:var(--muted);text-transform:upper
         <label class="chk"><input type="checkbox" id="f-cot"> cot</label>
         <label class="chk"><input type="checkbox" id="f-turbo"><b>turbo</b></label>
         <label class="chk"><input type="checkbox" id="f-scan"> context-scan</label>
+        <label class="chk" title="Continue with the enhanced prompt even when DeepSeek asks clarifying questions"><input type="checkbox" id="f-proceed" checked> proceed if unclear</label>
       </div>
       <div class="row" style="margin-top:12px">
         <button class="green" onclick="submitTask()">▶ Run task</button>
@@ -368,7 +369,7 @@ function submitTask(){
     task,mode:$id('mode').value,online_provider:$id('online-prov').value,local_provider:$id('local-prov').value,
     enhance:$id('f-enhance').checked,verify:$id('f-verify').checked,regression:$id('f-regression').checked,
     apply:$id('f-apply').checked,parallel:$id('f-parallel').checked,cot:$id('f-cot').checked,
-    turbo:$id('f-turbo').checked,context_scan:$id('f-scan').checked,
+    turbo:$id('f-turbo').checked,context_scan:$id('f-scan').checked,proceed:$id('f-proceed').checked,
     max_iterations:parseInt($id('max-iter').value||'3',10)};
   fetch('/api/task',{method:'POST',headers:headers(),body:JSON.stringify(body)})
     .then(r=>r.json()).then(d=>{

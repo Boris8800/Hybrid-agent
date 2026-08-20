@@ -1168,8 +1168,13 @@ def _enhance_task(agent: HybridAgent, cfg: dict, args: argparse.Namespace,
             break  # prompt is clear
         if not sys.stdin.isatty():
             # Non-interactive: surface the questions and let the caller stop so
-            # the user can adjust the prompt and re-run.
-            return (current, enhancement, True)
+            # the user can adjust the prompt and re-run. With --proceed the run
+            # continues using the (usually self-contained) enhanced prompt.
+            if not args.proceed:
+                return (current, enhancement, True)
+            _status("[hybrid] ↻ non-interactive + --proceed: continuing with "
+                    "the enhanced prompt despite clarifying questions")
+            break
         print("\nThe task has ambiguities. Make the prompt clear and concise "
               "by answering DeepSeek's questions.")
         try:
@@ -1881,6 +1886,10 @@ def main() -> int:
                         help="multi-model mode: fan every online call out to all enabled "
                              "online providers in parallel and use the best response "
                              "(multiplies API spend; still capped by the token budget)")
+    parser.add_argument("--proceed", action="store_true",
+                        help="with --enhance in a non-interactive run: continue with the "
+                             "enhanced prompt even when DeepSeek raised clarifying "
+                             "questions (otherwise the run aborts with TASK UNCLEAR)")
     parser.add_argument("--stats", action="store_true",
                         help="print the 80/20 strategy summary (hybrid-agent/stats.json)")
     parser.add_argument("--evaluate", action="store_true",
