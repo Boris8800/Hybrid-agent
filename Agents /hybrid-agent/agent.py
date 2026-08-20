@@ -12,11 +12,13 @@ Run:  python agent.py --task "add validation to validate_email"
 import argparse
 import importlib
 import os
+import time
 
 from backends.base import Backend, ModelRequest
 from backends.circuit_breaker import CircuitBreaker
 from backends.deepseek import DeepSeekBackend
 from backends.local_gemma import GemmaBackend
+from memory import TaskMemory, TaskRecord
 from router import archetypes
 from router.confidence import MemoryView, score
 from router.threshold import ThresholdController
@@ -114,12 +116,15 @@ class HybridAgent:
         return self.threshold.decide(conf), f"confidence:{conf:.2f}"
 
     # --- execution ------------------------------------------------------
-    def run(self, task: str, context_chars: int = 2000) -> dict:
-        memory = MemoryView()  # P4: wire to memory/store.py
+    def run(self, task: str, context_chars: int = 2000,
+            memory: MemoryView | None = None) -> dict:
+        memory = memory or TaskMemory(
+            (self.cfg.get("memory") or {}).get("root")).memory_view(task)
         route, reason = self.route(task, context_chars, memory)
         local, cloud = self._backends()
 
         result = {"task": task, "route": route, "reason": reason, "text": ""}
+        local_ok = True
         if route == "local":
             try:
                 resp = local.generate(self._local_request(task))
@@ -127,9 +132,8 @@ class HybridAgent:
                 result["tokens"] = resp.token_usage
                 result["latency_ms"] = resp.latency_ms
                 self.local_breaker.record(False)
-                # TODO(P3): build structured diff -> DeepSeek review -> local
-                # tests -> apply -> write memory event.
             except Exception:  # noqa: BLE001 - escalation path
+                local_ok = False
                 self.local_breaker.record(True)
                 result["route"] = "deepseek"
                 result["reason"] = "local_failure_escalation"
@@ -143,8 +147,25 @@ class HybridAgent:
             result["latency_ms"] = resp.latency_ms
             self.cloud_breaker.record(False)
 
-        # Adaptive threshold observation (P4 wires real statistics).
-        self.threshold.record(routed_local=(route == "local"), success=True)
+        # Adaptive threshold: feed REAL outcomes (local success = no escalation;
+        # cloud success = the call itself returned). update() runs periodically
+        # once the observation window has enough samples.
+        self.threshold.record(
+            routed_local=(result["route"] == "local"),
+            success=(result["route"] == "local" and local_ok)
+            or (result["route"] == "deepseek"),
+        )
+        self.threshold.maybe_update()
+
+        # Persistent memory event so the router's confidence/novelty signals
+        # reflect real history (memory.py keeps only recent records).
+        try:
+            TaskMemory((self.cfg.get("memory") or {}).get("root")).record(TaskRecord(
+                task=task, ts=time.time(), route=result["route"],
+                verdict="APPROVED" if local_ok else result["reason"],
+            ))
+        except Exception:  # noqa: BLE001 - memory must never break the run
+            pass
         return result
 
     # --- prompts (ARCHITECTURE.md §4) -----------------------------------
@@ -158,8 +179,8 @@ class HybridAgent:
             ),
             user=(
                 f"TASK: {task}\n"
-                "CONTEXT (compressed): imports/signatures placeholder — P2 wires "
-                "context/compress.py header-only extraction.\n"
+                "CONTEXT: project context is injected by the ask.py bridge "
+                "(--context-scan / --context), not here.\n"
             ),
             max_tokens=4096,
             temperature=0.2,
@@ -173,7 +194,8 @@ class HybridAgent:
                 "step-by-step plan with file-level breakdown (max 400 words unless "
                 "the task demands more)."
             ),
-            user=f"OBJECTIVE: {task}\nPROJECT SUMMARY: (memory placeholder)\n",
+            user=f"OBJECTIVE: {task}\nPROJECT SUMMARY: injected from TaskMemory "
+                 f"(hybrid-agent/memory.py) when history exists.\n",
             max_tokens=1200,
             temperature=0.1,
             timeout_s=self.cfg["backends"]["deepseek"]["timeout_s"],

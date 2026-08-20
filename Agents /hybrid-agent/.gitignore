@@ -4,3 +4,4 @@ stats.json
 context.json
 __pycache__/
 .venv/
+memory/

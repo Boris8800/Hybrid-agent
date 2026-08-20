@@ -35,5 +35,13 @@ class ThresholdController:
         self._total = 0
         return self.threshold
 
+    def maybe_update(self, min_samples: int = 50) -> float:
+        """Like update(), but only acts once at least min_samples outcomes have
+        been observed since the last adaptation. Keeps small noisy windows from
+        moving the threshold."""
+        if self._total >= min_samples:
+            return self.update()
+        return self.threshold
+
     def decide(self, confidence: float) -> str:
         return "local" if confidence >= self.threshold else "deepseek"

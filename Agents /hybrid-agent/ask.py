@@ -32,7 +32,6 @@ from datetime import date, datetime, timedelta
 
 from backends.base import ModelRequest, ModelResponse
 from backends.local_gemma import GemmaBackend
-from router.confidence import MemoryView
 
 from agent import HybridAgent, _load_config, apply_env_overrides
 from backends.deepseek import _resolve_api_key
@@ -42,6 +41,7 @@ from supervise import (GEMMA_MAX_TOKENS, ChainOfThoughtParser, ReviewPackage,
 from context import ProjectContext
 from parallel import (DependencyAnalyzer, ParallelExecutor, parse_plan_steps,
                       summarize)
+from memory import TaskMemory, TaskRecord
 
 # --- Self-heal: loading config.yml requires PyYAML + openai, which exist only
 # in the project venv (hybrid-agent/.venv). When invoked with a system python3
@@ -413,6 +413,21 @@ class StatsTracker:
         c["hits" if hit else "misses"] += 1
         self._save()
 
+    def record_tokens(self, route: str, prompt_tokens: int = 0,
+                      completion_tokens: int = 0, estimated: bool = False) -> None:
+        """Persist daily token usage per route (API budget accounting)."""
+        day = str(date.today())
+        s = self.stats.setdefault("api_tokens", {}).setdefault(
+            day, {"tokens": 0, "estimated": 0})
+        s["tokens"] += int(prompt_tokens or 0) + int(completion_tokens or 0)
+        if estimated:
+            s["estimated"] += 1
+        self._save()
+
+    def daily_api_tokens(self) -> int:
+        """Tokens consumed by API routes so far today (0 when never recorded)."""
+        return self.stats.get("api_tokens", {}).get(str(date.today()), {}).get("tokens", 0)
+
     def evaluate(self) -> dict:
         """Self-evaluation report for the current week vs the previous week."""
         s = self.stats
@@ -680,6 +695,37 @@ MAX_OUTPUT_TOKENS = 8192
 LOCAL_MAX_OUTPUT_TOKENS = 16384
 
 
+class BudgetExceeded(RuntimeError):
+    """Raised when the configured daily DeepSeek token budget is exhausted."""
+
+
+def _budgeted_cloud(cloud, cfg: dict):
+    """Wrap the DeepSeek backend so every generate() enforces the daily token
+    budget (review.daily_token_budget) and records actual usage. No-op when no
+    budget is configured. Covers the supervise loop, parallel review, and the
+    verify-fix stage, which call cloud.generate directly."""
+    budget = (cfg.get("review") or {}).get("daily_token_budget") or 0
+    if not budget:
+        return cloud
+
+    class _BudgetedCloud:
+        def generate(self, req):
+            used = StatsTracker().daily_api_tokens()
+            if used >= budget:
+                raise BudgetExceeded(
+                    f"daily DeepSeek token budget exhausted ({used}/{budget}). "
+                    "Raise review.daily_token_budget or retry tomorrow.")
+            resp = cloud.generate(req)
+            tok = _normalize_tokens(resp.token_usage)
+            StatsTracker().record_tokens(
+                "deepseek",
+                tok.get("prompt_tokens", 0), tok.get("completion_tokens", 0),
+                estimated=bool(tok.get("estimated")))
+            return resp
+
+    return _BudgetedCloud()
+
+
 def _generate_with_retry(agent: HybridAgent, cfg: dict, args: argparse.Namespace,
                          route: str, req: ModelRequest,
                          stream: bool = False) -> ModelResponse:
@@ -687,6 +733,14 @@ def _generate_with_retry(agent: HybridAgent, cfg: dict, args: argparse.Namespace
     doubled budget so truncated files are never returned silently. Long local
     generations (especially thinking-mode models) routinely need more than a
     single 2k budget; this is the guard that makes truncation rare."""
+    if route == "deepseek":
+        budget = (cfg.get("review") or {}).get("daily_token_budget") or 0
+        if budget:
+            used = StatsTracker().daily_api_tokens()
+            if used >= budget:
+                raise BudgetExceeded(
+                    f"daily DeepSeek token budget exhausted ({used}/{budget}). "
+                    "Raise review.daily_token_budget or retry tomorrow.")
     cap = LOCAL_MAX_OUTPUT_TOKENS if route == "local" else MAX_OUTPUT_TOKENS
     resp = _generate(agent, cfg, args, route, req, stream=stream)
     if resp.truncated and resp.text and req.max_tokens < cap:
@@ -697,6 +751,12 @@ def _generate_with_retry(agent: HybridAgent, cfg: dict, args: argparse.Namespace
         resp = _generate(agent, cfg, args, route, req, stream=stream)
         if resp.truncated:
             _status("[hybrid] ⚠ still truncated after retry - output is incomplete, do not apply blindly")
+    if route == "deepseek":
+        tok = _normalize_tokens(resp.token_usage)
+        StatsTracker().record_tokens(
+            "deepseek",
+            tok.get("prompt_tokens", 0), tok.get("completion_tokens", 0),
+            estimated=bool(tok.get("estimated")))
     return resp
 
 
@@ -1062,6 +1122,25 @@ def _write_diff_log(root: str, files: list[str]) -> str:
                             encoding="utf-8")
         return str(log_path)
     except OSError:
+        return ""
+
+
+def _current_diff(root: str, max_chars: int = 4000) -> str:
+    """Render a capped unified diff of the working tree vs HEAD for the review
+    package's DIFF section (via review/diff_builder.py). '' when not a git repo
+    or nothing changed. Best-effort: never raises."""
+    try:
+        proc = subprocess.run(["git", "diff"], cwd=root, capture_output=True,
+                              text=True, timeout=15)
+        if proc.returncode != 0 or not proc.stdout.strip():
+            return ""
+        from review import diff_builder
+        diffs = diff_builder.parse_unified_diff(proc.stdout)
+        if not diffs:
+            return ""
+        rendered = "\n\n".join(d.render() for d in diffs)
+        return rendered if len(rendered) <= max_chars else rendered[:max_chars]
+    except Exception:  # noqa: BLE001 - diff is a best-effort enrichment
         return ""
 
 
@@ -1552,9 +1631,10 @@ def main() -> int:
         cfg = _load_config_quiet(args.config or _default_config_path())
         agent = HybridAgent(cfg)
         context = args.context or ""
+        memory = TaskMemory((cfg.get("memory") or {}).get("root")).memory_view(args.task)
         route, reason = agent.route(
             args.task, context_chars=len(args.task) + len(context),
-            memory=MemoryView(),
+            memory=memory,
         )
         print(f"route\t{route}\t{reason}")
         return 0
@@ -1631,6 +1711,7 @@ def main() -> int:
                   "(env DEEPSEEK_API_KEY or Kilo auth.json)", file=sys.stderr)
             return 2
         local, cloud = agent._backends()
+        cloud = _budgeted_cloud(cloud, cfg)
         tracker = ProgressTracker()
         cache = CacheManager(cfg, args)
 
@@ -1652,6 +1733,10 @@ def main() -> int:
             try:
                 task_for_gemma, enhancement, clar_needed = _enhance_task(
                     agent, cfg, args, args.task, context, cache=cache)
+            except BudgetExceeded as exc:
+                _status("[hybrid] ⛔ deepseek (prompt enhancer) skipped: daily token budget exhausted")
+                print(f"error: {exc}", file=sys.stderr)
+                return 6
             except KeyboardInterrupt:
                 return 130
             except Exception as exc:  # noqa: BLE001 - report cleanly
@@ -1673,6 +1758,7 @@ def main() -> int:
                 changes=f"Gemma output (iteration {iteration}):\n{code}",
                 uncertainties=context,
                 verification="None supplied — caller can pass --context with test/lint results.",
+                diff=_current_diff(args.root),
             )
 
         # Results that must NEVER leave files behind: output was either never
@@ -1685,24 +1771,29 @@ def main() -> int:
                     "multi-file tasks need 8192+ (truncation will escalate)")
 
         tracker.start_phase("implement")
-        if args.parallel:
-            if not enhancement:
-                _status("[hybrid] ⛔ refusal: --parallel requires --enhance (needs the plan).")
-                print("error: --parallel requires --enhance so steps can be split from the plan.",
-                      file=sys.stderr)
-                return 3
-            result = _run_parallel(
-                agent, cfg, args, cloud, task_for_gemma, enhancement, context)
-        else:
-            result = supervise(
-                local, cloud,
-                task=task_for_gemma,
-                package_builder=_pkg,
-                max_iterations=args.max_iterations,
-                gemma_generate=_supervise_gemma_generate(cfg, args.model),
-                status=lambda line: tracker.tick(line),
-                gemma_max_tokens=args.max_tokens or GEMMA_MAX_TOKENS,
-            )
+        try:
+            if args.parallel:
+                if not enhancement:
+                    _status("[hybrid] ⛔ refusal: --parallel requires --enhance (needs the plan).")
+                    print("error: --parallel requires --enhance so steps can be split from the plan.",
+                          file=sys.stderr)
+                    return 3
+                result = _run_parallel(
+                    agent, cfg, args, cloud, task_for_gemma, enhancement, context)
+            else:
+                result = supervise(
+                    local, cloud,
+                    task=task_for_gemma,
+                    package_builder=_pkg,
+                    max_iterations=args.max_iterations,
+                    gemma_generate=_supervise_gemma_generate(cfg, args.model),
+                    status=lambda line: tracker.tick(line),
+                    gemma_max_tokens=args.max_tokens or GEMMA_MAX_TOKENS,
+                )
+        except BudgetExceeded as exc:
+            _status("[hybrid] ⛔ supervise aborted: daily DeepSeek token budget exhausted")
+            print(f"error: {exc}", file=sys.stderr)
+            return 6
         tracker.end_phase()
         # Record 80/20 metrics.
         stats = StatsTracker()
@@ -1737,6 +1828,19 @@ def main() -> int:
             truncation=result.reason in trunc_reasons,
             quality=final_quality,
         )
+
+        # Persistent task memory for the router's confidence/threshold learning.
+        try:
+            TaskMemory((cfg.get("memory") or {}).get("root")).record(TaskRecord(
+                task=args.task,
+                ts=time.time(),
+                route=result.route,
+                verdict=(result.verdicts[-1].decision if result.verdicts
+                         else result.reason),
+                quality=final_quality,
+            ))
+        except Exception:  # noqa: BLE001 - memory must never break the run
+            pass
 
         # Final error-check stage: before the task is marked complete, run the
         # verification commands and have DeepSeek fix any errors (looping until
@@ -1884,6 +1988,10 @@ def main() -> int:
         try:
             task_for_gemma, enhancement, clar_needed = _enhance_task(
                 agent, cfg, args, args.task, context, cache=cache)
+        except BudgetExceeded as exc:
+            _status("[hybrid] ⛔ deepseek (prompt enhancer) skipped: daily token budget exhausted")
+            print(f"error: {exc}", file=sys.stderr)
+            return 6
         except KeyboardInterrupt:
             return 130
         except Exception as exc:  # noqa: BLE001 - report cleanly
