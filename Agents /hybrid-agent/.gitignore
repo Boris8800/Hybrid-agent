@@ -1,0 +1,6 @@
+# Hybrid agent runtime state (never commit)
+.cache/
+stats.json
+context.json
+__pycache__/
+.venv/

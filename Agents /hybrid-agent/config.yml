@@ -44,11 +44,24 @@ review:
   verify: []
   # Per-command timeout (seconds) for verification commands (default 600).
   verify_timeout: 600
+  # Optional dependency-aware parallel verify: ordered groups of commands.
+  # Commands within a group run in parallel (with --verify-parallel), groups
+  # run sequentially. Empty = sequential verify. Example:
+  #   verify_groups:
+  #     - ["npm run build", "npx tsc --noEmit", "npm run lint"]
+  #     - ["npm test"]
+  verify_groups: []
   # Regression guard: full test suite run AFTER verification passes, to catch
   # fixes that break tests elsewhere. Empty = regression guard disabled.
   # Example: ["npm test", "python -m pytest"]
   regression: []
   regression_timeout: 600
+
+cache:
+  enabled: true
+  dir: ".cache"
+  ttl_days: 7
+  max_entries: 100
 
 circuit_breaker:
   window_size: 20

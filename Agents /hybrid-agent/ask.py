@@ -17,6 +17,7 @@ Run (from repo root or from inside hybrid-agent/):
 
 import argparse
 import contextlib
+import hashlib
 import io
 import json
 import os
@@ -26,7 +27,8 @@ import subprocess
 import sys
 import time
 import urllib.request
-from datetime import date, timedelta
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import date, datetime, timedelta
 
 from backends.base import ModelRequest, ModelResponse
 from backends.local_gemma import GemmaBackend
@@ -150,6 +152,150 @@ def _iso_week() -> str:
     return f"{iso[0]}-W{iso[1]:02d}"
 
 
+class ProgressTracker:
+    """Minimal progress/percentage indicator for the pipeline phases.
+
+    Tracks weighted phase percentages and per-phase elapsed times. Renders a
+    live ``\\r`` bar on stderr when stderr is a TTY, and a plain
+    ``[hybrid] progress ...`` line otherwise (so agent stderr parsers keep
+    working when piped). Never writes to stdout — stdout carries the model
+    output / single JSON object. Strictly additive: existing
+    ``[hybrid]`` / ``[supervise]`` status lines are passed through unchanged.
+    """
+
+    def __init__(self, weights: dict | None = None):
+        self.weights = weights or {
+            "enhance": 10, "implement": 45, "apply": 5, "verify": 40,
+        }
+        self._phases: dict = {}
+        self._current: str | None = None
+        self._start: float | None = None
+        self._done_weight = 0
+        self._tty = sys.stderr.isatty()
+
+    def start_phase(self, name: str) -> None:
+        self._current = name
+        self._start = time.monotonic()
+
+    def end_phase(self) -> None:
+        if self._current is None:
+            return
+        name, self._current = self._current, None
+        elapsed = (time.monotonic() - self._start) if self._start else 0.0
+        self._done_weight += self.weights.get(name, 0)
+        self._phases[name] = {"elapsed_s": round(elapsed, 2), "pct": self._done_weight}
+        if not self._tty:
+            _status(f"[hybrid] progress phase={name} {self._done_weight}% {elapsed:.2f}s")
+        else:
+            self.refresh()
+
+    def tick(self, line: str) -> None:
+        """Emit a status line, then re-render the bar (chains status callbacks)."""
+        _status(line)
+        self.refresh()
+
+    def refresh(self) -> None:
+        if not self._tty or self._current is None:
+            return
+        elapsed = (time.monotonic() - self._start) if self._start else 0.0
+        pct = min(100, self._done_weight + self.weights.get(self._current, 0))
+        filled = int(pct / 100 * 20)
+        bar = "#" * filled + "." * (20 - filled)
+        sys.stderr.write(f"\r[{self._current} {pct:3d}%] {bar} {elapsed:5.1f}s")
+        sys.stderr.flush()
+
+    def phases(self) -> dict:
+        return self._phases
+
+    def done(self) -> dict:
+        """Close out the bar (newline on TTY, 100% close-out line when piped)."""
+        if self._tty:
+            sys.stderr.write("\n")
+            sys.stderr.flush()
+        else:
+            total = round(sum(d["elapsed_s"] for d in self._phases.values()), 2)
+            _status(f"[hybrid] progress phase=done 100% {total:.2f}s")
+        return self._phases
+
+
+class CacheManager:
+    """Response cache for the hybrid bridge (enhance / generate / fix kinds).
+
+    Stores raw model response text under hybrid-agent/.cache/<kind>/<sha256>.json
+    with a TTL and a per-kind entry cap. Reads/writes are exception-safe and
+    never raise. Truncated or empty output is never cached. Hit/miss counters
+    go to stats.json via StatsTracker.record_cache.
+    """
+
+    def __init__(self, cfg: dict, args: argparse.Namespace):
+        cache_cfg = cfg.get("cache", {})
+        self.enabled = cache_cfg.get("enabled", True) and not args.no_cache
+        self.dir = pathlib.Path(__file__).resolve().parent / cache_cfg.get("dir", ".cache")
+        self.ttl_days = args.cache_ttl or cache_cfg.get("ttl_days", 7)
+        self.max_entries = args.cache_max_size or cache_cfg.get("max_entries", 100)
+        if self.enabled:
+            self.clean()
+
+    def key(self, kind: str, *parts: str) -> str:
+        """Deterministic cache key from the kind and full request material."""
+        raw = kind + "|" + "\x1f".join(parts)
+        return hashlib.sha256(raw.encode()).hexdigest()
+
+    def get(self, kind: str, key: str) -> str | None:
+        """Return cached text if fresh, else None. Never raises."""
+        if not self.enabled:
+            return None
+        try:
+            path = self.dir / kind / f"{key}.json"
+            if not path.exists():
+                return None
+            if time.time() - path.stat().st_mtime > self.ttl_days * 86400:
+                path.unlink()
+                return None
+            return json.loads(path.read_text()).get("text")
+        except (OSError, ValueError, KeyError):
+            return None
+
+    def set(self, kind: str, key: str, text: str, source: str = "gemma") -> None:
+        """Store text (never empty) and prune the oldest entries past the cap."""
+        if not self.enabled or not text:
+            return
+        try:
+            kind_dir = self.dir / kind
+            kind_dir.mkdir(parents=True, exist_ok=True)
+            payload = {"text": text, "source": source, "ts": datetime.now().isoformat()}
+            (kind_dir / f"{key}.json").write_text(json.dumps(payload))
+            entries = sorted(kind_dir.glob("*.json"), key=lambda p: p.stat().st_mtime)
+            while len(entries) > self.max_entries:
+                entries[0].unlink()
+                entries.pop(0)
+        except OSError:
+            pass
+
+    def clean(self) -> None:
+        """Delete all entries older than the TTL across every kind."""
+        if not self.enabled:
+            return
+        try:
+            for kind_dir in self.dir.iterdir():
+                if not kind_dir.is_dir():
+                    continue
+                for entry in kind_dir.glob("*.json"):
+                    try:
+                        if time.time() - entry.stat().st_mtime > self.ttl_days * 86400:
+                            entry.unlink()
+                    except OSError:
+                        continue
+        except OSError:
+            pass
+
+    def record(self, hit: bool) -> None:
+        """Record a hit/miss counter. No-op when disabled."""
+        if not self.enabled:
+            return
+        StatsTracker().record_cache(hit)
+
+
 class StatsTracker:
     """Persists 80/20 strategy + self-evaluation metrics to hybrid-agent/stats.json."""
 
@@ -246,6 +392,25 @@ class StatsTracker:
         elif status in ("FAILED", "REGRESSION_FAILED", "ENV_ERROR", "BLOCKED"):
             v["failed"] += 1
         v["last"] = metrics
+        self._save()
+
+    def record_phases(self, phases: dict) -> None:
+        """Persist per-phase timing aggregates (runs, total seconds) to stats.json."""
+        if not phases:
+            return
+        s = self.stats
+        pt = s.setdefault("phase_timings", {})
+        for name, data in phases.items():
+            entry = pt.setdefault(name, {"runs": 0, "total_s": 0.0})
+            entry["runs"] += 1
+            entry["total_s"] = round(entry["total_s"] + data.get("elapsed_s", 0.0), 2)
+        self._save()
+
+    def record_cache(self, hit: bool) -> None:
+        """Record a cache hit or miss counter."""
+        s = self.stats
+        c = s.setdefault("cache", {"hits": 0, "misses": 0})
+        c["hits" if hit else "misses"] += 1
         self._save()
 
     def evaluate(self) -> dict:
@@ -631,7 +796,7 @@ MAX_CLARIFY_ROUNDS = 3
 
 
 def _enhance_task(agent: HybridAgent, cfg: dict, args: argparse.Namespace,
-                  task: str, context: str):
+                  task: str, context: str, cache=None):
     """Run DeepSeek prompt-enhancement with an interactive clarification loop.
 
     DeepSeek ENHANCES the prompt and plans around the local model's limits. If
@@ -647,9 +812,21 @@ def _enhance_task(agent: HybridAgent, cfg: dict, args: argparse.Namespace,
     for round_num in range(MAX_CLARIFY_ROUNDS):
         enh_label = "deepseek (prompt enhancer)"
         _status(f"[hybrid] ▶ {enh_label} working on \"{_task_preview(current)}\" ...")
-        enh_resp = _generate_with_retry(
-            agent, cfg, args, "deepseek", _enhance_request(current, context, cot=args.cot)
-        )
+        req = _enhance_request(current, context, cot=args.cot)
+        if cache is not None and cache.enabled:
+            k = cache.key("enhance", req.system, req.user)
+            hit = cache.get("enhance", k)
+            if hit is not None:
+                enh_resp = ModelResponse(text=hit, backend="cache", latency_ms=0.0)
+                cache.record(True)
+                _status(f"[hybrid] 🗃 cache HIT enhance {k[:8]}")
+            else:
+                enh_resp = _generate_with_retry(agent, cfg, args, "deepseek", req)
+                cache.record(False)
+                if not enh_resp.truncated and enh_resp.text:
+                    cache.set("enhance", k, enh_resp.text, source="deepseek")
+        else:
+            enh_resp = _generate_with_retry(agent, cfg, args, "deepseek", req)
         enhancement = parse_enhancement(enh_resp.text)
         _status(f"[hybrid] ✓ {enh_label} done · {int(enh_resp.latency_ms)} ms · "
                 f"tokens={_format_tokens(enh_resp)}")
@@ -934,7 +1111,7 @@ def _run_regression_guard(root: str, cmds, status,
     return True, "regression passed"
 
 
-def _deepseek_fix(cloud, task: str, error_text: str):
+def _deepseek_fix(cloud, task: str, error_text: str, cache=None):
     """Ask DeepSeek to fix the errors and return the fixed files."""
     system = (
         "You are a senior engineer fixing errors found during verification. "
@@ -947,16 +1124,92 @@ def _deepseek_fix(cloud, task: str, error_text: str):
         f"VERIFICATION ERRORS:\n{_truncate_error(error_text)}\n\n"
         "Fix every error. Output corrected files as path-labeled fenced blocks."
     )
-    return cloud.generate(ModelRequest(
+    if cache is not None and cache.enabled:
+        key = cache.key("fix", task, _truncate_error(error_text))
+        hit = cache.get("fix", key)
+        if hit:
+            cache.record(True)
+            _status(f"[hybrid] 🗃 cache HIT fix {key[:8]}")
+            return hit
+    resp = cloud.generate(ModelRequest(
         system=system, user=user, max_tokens=8192, temperature=0.1,
-    )).text
+    ))
+    if cache is not None and cache.enabled:
+        cache.record(False)
+        if resp.text and not resp.truncated:
+            cache.set("fix", key, resp.text, source="deepseek")
+    return resp.text
+
+
+def _run_single_verify(root, cmd: str, timeout_s: int) -> str:
+    """Run one verification command; return an error entry or "" when clean."""
+    try:
+        proc = subprocess.run(cmd, shell=True, cwd=root,
+                              capture_output=True, text=True, timeout=timeout_s)
+    except subprocess.TimeoutExpired:
+        return f"$ {cmd}\n[timed out after {timeout_s}s]"
+    output = (proc.stdout or "") + "\n" + (proc.stderr or "")
+    if proc.returncode != 0 or _looks_like_error(output):
+        return f"$ {cmd} (exit {proc.returncode})\n{output}"
+    return ""
+
+
+def _run_verify_commands(root, cmds, status, timeout_s,
+                         parallel=False, workers=4, verify_groups=None) -> list[str]:
+    """Run verification commands sequentially, or in dependency groups.
+
+    With parallel + verify_groups, commands within a group run concurrently
+    (ThreadPoolExecutor, per-command timeout) while groups run in order, so a
+    build always completes before the tests that depend on it. Error entries
+    are merged in group/command order for deterministic DeepSeek reports.
+    """
+    if not parallel or not verify_groups:
+        errors: list[str] = []
+        for cmd in cmds:
+            status(f"[hybrid] 🔍 verify: {cmd}")
+            entry = _run_single_verify(root, cmd, timeout_s)
+            if entry:
+                errors.append(entry)
+        return errors
+
+    configured = [g for g in verify_groups if g]
+    flat = [c for g in configured for c in g]
+    leftover = [c for c in cmds if c not in flat]
+    groups = configured + ([leftover] if leftover else [])
+    if not groups:
+        return _run_verify_commands(root, cmds, status, timeout_s)
+
+    errors: list[str] = []
+    for i, group in enumerate(groups):
+        status(f"[hybrid] 🔍 verify group {i + 1}/{len(groups)} "
+               f"(parallel, {len(group)} cmds)")
+        results: dict = {}
+        with ThreadPoolExecutor(max_workers=min(workers, len(group))) as executor:
+            future_to_idx = {}
+            for idx, cmd in enumerate(group):
+                status(f"[hybrid] 🔍 verify: {cmd}")
+                future_to_idx[executor.submit(_run_single_verify, root, cmd, timeout_s)] = idx
+            for future in as_completed(future_to_idx):
+                idx = future_to_idx[future]
+                try:
+                    results[idx] = future.result()
+                except Exception as exc:  # noqa: BLE001 - report worker failure cleanly
+                    results[idx] = f"$ {group[idx]}\n[worker error: {exc}]"
+        # Deterministic merge: skip clean (empty) entries, keep group/command order.
+        for idx in range(len(group)):
+            if results.get(idx):
+                errors.append(results[idx])
+    return errors
 
 
 def _run_final_verify(cloud, root: str, task: str, cmds, status,
                       max_iter: int = 2, timeout_s: int = 600,
                       verify_stats: dict | None = None,
                       regression_cmds=None,
-                      regression_timeout: int = 600) -> tuple[bool, str]:
+                      regression_timeout: int = 600,
+                      cache=None,
+                      parallel=False, parallel_workers=4,
+                      verify_groups=None) -> tuple[bool, str]:
     """Final error-check stage: run verification commands and, on errors, have
     DeepSeek fix them (applied to disk) until clean or max_iter exhausted.
 
@@ -969,7 +1222,9 @@ def _run_final_verify(cloud, root: str, task: str, cmds, status,
     if verify_stats is None:
         verify_stats = {}
     verify_stats.update({"iterations": 0, "api_calls": 0, "tokens_used": 0,
-                         "status": "FAILED"})
+                         "status": "FAILED",
+                         "parallel": bool(parallel and verify_groups),
+                         "groups": len([g for g in (verify_groups or []) if g]) if parallel else 0})
     api_calls = 0
     tokens_used = 0
 
@@ -989,19 +1244,9 @@ def _run_final_verify(cloud, root: str, task: str, cmds, status,
     snapshot: str | None = None
     for iteration in range(max_iter + 1):
         verify_stats["iterations"] = iteration + 1
-        errors: list[str] = []
-        for cmd in safe_cmds:
-            status(f"[hybrid] 🔍 verify: {cmd}")
-            try:
-                proc = subprocess.run(cmd, shell=True, cwd=root,
-                                      capture_output=True, text=True,
-                                      timeout=timeout_s)
-            except subprocess.TimeoutExpired:
-                errors.append(f"$ {cmd}\n[timed out after {timeout_s}s]")
-                continue
-            output = (proc.stdout or "") + "\n" + (proc.stderr or "")
-            if proc.returncode != 0 or _looks_like_error(output):
-                errors.append(f"$ {cmd} (exit {proc.returncode})\n{output}")
+        errors = _run_verify_commands(
+            root, safe_cmds, status, timeout_s,
+            parallel=parallel, workers=parallel_workers, verify_groups=verify_groups)
 
         if not errors:
             status("[hybrid] ✅ verification passed")
@@ -1030,7 +1275,7 @@ def _run_final_verify(cloud, root: str, task: str, cmds, status,
         if snapshot is None:
             snapshot = _git_snapshot(root)
         try:
-            fix_text = _deepseek_fix(cloud, task, error_text)
+            fix_text = _deepseek_fix(cloud, task, error_text, cache=cache)
         except Exception as exc:  # noqa: BLE001
             status(f"[hybrid] ⚠ DeepSeek fix failed: {exc}")
             if snapshot:
@@ -1099,29 +1344,52 @@ _APPLY_EXTENSIONS = {
 def _parse_fenced_files(text: str) -> list[tuple[str, str]]:
     """Parse path-labeled fenced code blocks from model output.
 
-    Accepts ```path, ```path/to/f.ext, ```lang path, and ```lang:path forms.
-    Returns [(relative_path, content)] in document order. Blocks whose label
-    has no plausible path (e.g. bare ```python``` with no filename) are ignored.
+    Accepts ```path, ```path/to/f.ext, ```lang path, and ```lang:path forms,
+    plus a clean path on the line just before the fence, or as the first line
+    inside the block. Returns [(relative_path, content)] in document order.
+    Bare language tags and comment/HTML lines are never treated as paths.
     """
     pattern = re.compile(r"```([^\n`]*)\n(.*?)```", re.S)
     files = []
     for m in pattern.finditer(text):
-        label = m.group(1).strip()
-        body = m.group(2)
-        if not label:
-            continue
+        label, body = m.group(1).strip(), m.group(2)
         path = None
-        for token in label.replace(":", " ").split():
-            t = token.strip("`").strip()
-            if not t or t.startswith("_"):
-                continue
-            # A plausible path: contains a "/" or ends with a known extension.
-            if "/" in t or t.lower().rsplit(".", 1)[-1] in _APPLY_EXTENSIONS:
-                path = t
-                break
+        if label:
+            for token in label.replace(":", " ").split():
+                t = token.strip("`").strip()
+                if t and not t.startswith("_") and _looks_like_path(t):
+                    path = t
+                    break
+        # fallback: clean path on the line immediately before the fence
+        if path is None:
+            prefix = text[:m.start()].rstrip("\n")
+            if prefix and not prefix.rstrip().endswith("```"):
+                prev = prefix.rsplit("\n", 1)[-1].strip()
+                if prev and not prev.startswith("```") and _clean_path(prev):
+                    path = prev
+        # fallback: clean path as the first line inside the block
+        if path is None:
+            lines = body.lstrip("\n").split("\n", 1)
+            if lines and _clean_path(lines[0].strip()):
+                path = lines[0].strip()
+                body = lines[1] if len(lines) > 1 else ""
         if path:
             files.append((path, body.rstrip("\n") + "\n"))
     return files
+
+
+_APPLY_LANG = set(_APPLY_EXTENSIONS)
+_CLEAN_PATH = re.compile(r"[\w./-]+\Z")
+
+
+def _looks_like_path(t: str) -> bool:
+    if "/" in t or "." in t:
+        return t.lower() not in _APPLY_LANG and bool(_CLEAN_PATH.match(t))
+    return False
+
+
+def _clean_path(t: str) -> bool:
+    return bool(_CLEAN_PATH.match(t)) and ("/" in t or "." in t)
 
 
 def _apply_fenced_files(text: str, root: str = ".") -> tuple[list[tuple[str, int]], list[str]]:
@@ -1132,7 +1400,7 @@ def _apply_fenced_files(text: str, root: str = ".") -> tuple[list[tuple[str, int
     escaping `root` via ".." are never written.
     """
     root_abs = os.path.abspath(root)
-    written, skipped = [], []
+    written, skipped, seen = [], [], set()
     for rel_path, content in _parse_fenced_files(text):
         clean = rel_path.replace("\\", "/")
         # Reject absolute paths and any ".." traversal BEFORE normalization.
@@ -1144,6 +1412,10 @@ def _apply_fenced_files(text: str, root: str = ".") -> tuple[list[tuple[str, int
         if target != root_abs and not target.startswith(root_abs + os.sep):
             skipped.append(f"{rel_path} (escapes root)")
             continue
+        if clean in seen:
+            skipped.append(f"{rel_path} (duplicate block would overwrite)")
+            continue
+        seen.add(clean)
         os.makedirs(os.path.dirname(target), exist_ok=True)
         with open(target, "w", encoding="utf-8") as fh:
             fh.write(content)
@@ -1230,6 +1502,11 @@ def main() -> int:
                              "implies --verify")
     parser.add_argument("--verify-max", type=int, default=2,
                         help="max verify-fix iterations before giving up (default 2)")
+    parser.add_argument("--verify-parallel", action="store_true",
+                        help="run verification commands in parallel within config "
+                             "review.verify_groups groups (groups run in order)")
+    parser.add_argument("--verify-workers", type=int, default=4,
+                        help="max parallel verify workers per group (default 4)")
     parser.add_argument("--verify-timeout", type=int, default=0,
                         help="per-command timeout in seconds for verification "
                              "(default from review.verify_timeout, else 600)")
@@ -1241,6 +1518,13 @@ def main() -> int:
     parser.add_argument("--regression-timeout", type=int, default=0,
                         help="per-command timeout for regression tests "
                              "(default from review.regression_timeout, else 600)")
+    parser.add_argument("--no-cache", action="store_true",
+                        help="bypass the response cache entirely")
+    parser.add_argument("--cache-max-size", type=int, default=0,
+                        help="max entries per cache kind "
+                             "(default from config cache.max_entries)")
+    parser.add_argument("--cache-ttl", type=int, default=0,
+                        help="cache TTL in days (default from config cache.ttl_days)")
     args = parser.parse_args()
 
     if args.evaluate:
@@ -1347,6 +1631,8 @@ def main() -> int:
                   "(env DEEPSEEK_API_KEY or Kilo auth.json)", file=sys.stderr)
             return 2
         local, cloud = agent._backends()
+        tracker = ProgressTracker()
+        cache = CacheManager(cfg, args)
 
         # Optional context (files/diff) goes into the review package via a builder.
         context = args.context or ""
@@ -1362,9 +1648,10 @@ def main() -> int:
         enhancement = None
         task_for_gemma = args.task
         if args.enhance:
+            tracker.start_phase("enhance")
             try:
                 task_for_gemma, enhancement, clar_needed = _enhance_task(
-                    agent, cfg, args, args.task, context)
+                    agent, cfg, args, args.task, context, cache=cache)
             except KeyboardInterrupt:
                 return 130
             except Exception as exc:  # noqa: BLE001 - report cleanly
@@ -1377,6 +1664,7 @@ def main() -> int:
                       "clearer --task, or run interactively to answer DeepSeek's "
                       "questions.", file=sys.stderr)
                 return 4
+            tracker.end_phase()
 
         def _pkg(task: str, code: str, iteration: int) -> ReviewPackage:
             return ReviewPackage(
@@ -1396,6 +1684,7 @@ def main() -> int:
             _status(f"[hybrid] ⚠ --max-tokens={args.max_tokens} is low — "
                     "multi-file tasks need 8192+ (truncation will escalate)")
 
+        tracker.start_phase("implement")
         if args.parallel:
             if not enhancement:
                 _status("[hybrid] ⛔ refusal: --parallel requires --enhance (needs the plan).")
@@ -1411,9 +1700,10 @@ def main() -> int:
                 package_builder=_pkg,
                 max_iterations=args.max_iterations,
                 gemma_generate=_supervise_gemma_generate(cfg, args.model),
-                status=lambda line: _status(line),
+                status=lambda line: tracker.tick(line),
                 gemma_max_tokens=args.max_tokens or GEMMA_MAX_TOKENS,
             )
+        tracker.end_phase()
         # Record 80/20 metrics.
         stats = StatsTracker()
         for v in result.verdicts:
@@ -1426,6 +1716,7 @@ def main() -> int:
         # paths return non-zero below and must not leave files behind.
         applied: list[tuple[str, int]] = []
         if args.apply and result.reason not in _UNSAFE_REASONS:
+            tracker.start_phase("apply")
             applied, skipped = _apply_fenced_files(result.final_text, args.root)
             for rel, nbytes in applied:
                 _status(f"[hybrid] ✓ APPLIED {rel} ({nbytes} B)")
@@ -1434,6 +1725,7 @@ def main() -> int:
                         f"{', '.join(skipped[:3])}")
             if not applied and not skipped:
                 _status("[hybrid] ⚠ --apply: no path-labeled fenced blocks found in output")
+            tracker.end_phase()
 
         # Record the session for self-evaluation (files, iterations, truncation,
         # and the final quality score).
@@ -1453,24 +1745,34 @@ def main() -> int:
         verified = True
         verify_report = ""
         verify_stats: dict = {}
-        verify_cmds = list(args.verify_cmds)
+        verify_cmds = list(args.verify_cmd)
         if args.verify and not verify_cmds:
             verify_cmds = list(cfg.get("review", {}).get("verify", []) or [])
-        regression_cmds = list(args.regression_cmds)
+        regression_cmds = list(args.regression_cmd)
         if args.regression and not regression_cmds:
             regression_cmds = list(cfg.get("review", {}).get("regression", []) or [])
+        verify_groups = list(cfg.get("review", {}).get("verify_groups", []) or [])
+        if args.verify_parallel and not verify_groups:
+            _status("[hybrid] ⚠ --verify-parallel set but no review.verify_groups "
+                    "configured — falling back to sequential")
         if verify_cmds:
+            tracker.start_phase("verify")
             verify_timeout = (args.verify_timeout
                               or cfg.get("review", {}).get("verify_timeout", 600))
             regression_timeout = (args.regression_timeout
                                   or cfg.get("review", {}).get("regression_timeout", 600))
             verified, verify_report = _run_final_verify(
-                cloud, args.root, args.task, verify_cmds, _status,
+                cloud, args.root, args.task, verify_cmds,
+                lambda line: tracker.tick(line),
                 max_iter=args.verify_max, timeout_s=verify_timeout,
                 verify_stats=verify_stats, regression_cmds=regression_cmds,
-                regression_timeout=regression_timeout)
+                regression_timeout=regression_timeout, cache=cache,
+                parallel=args.verify_parallel, parallel_workers=args.verify_workers,
+                verify_groups=verify_groups)
+            tracker.end_phase()
         if verify_stats:
             stats.record_verify(verify_stats)
+        stats.record_phases(tracker.phases())
         if not verified:
             _status("[hybrid] ⛔ FINAL CHECK FAILED: the task is NOT fully verified. "
                     "Fix DEEPSEEK_API_KEY/network, the verify command, or the code.")
@@ -1486,6 +1788,7 @@ def main() -> int:
                 "quality_scores": [v.quality_score for v in result.verdicts],
                 "applied_files": [rel for rel, _ in applied],
                 "verified": verified,
+                "progress": tracker.phases(),
             }
             if args.enhance and enhancement is not None:
                 payload["enhanced_prompt"] = enhancement.enhanced_prompt
@@ -1517,6 +1820,7 @@ def main() -> int:
                     file=sys.stderr,
                 )
             return 3
+        tracker.done()
         _status(f"[hybrid] ✓ supervise done · {result.iterations} iter · reason={result.reason} "
                 f"· verdicts={[v.decision for v in result.verdicts]} "
                 f"· scores={[v.quality_score for v in result.verdicts]}")
@@ -1562,6 +1866,8 @@ def main() -> int:
               "DEEPSEEK_API_KEY.", file=sys.stderr)
         return 2
 
+    cache = None if args.no_cache else CacheManager(cfg, args)
+
     # --enhance (standalone, local route): DeepSeek enhances the prompt and plans
     # around Gemma's limits, shows the improved prompt + reasoning + plan (and
     # asks for clarification if the task is unclear), then the ENHANCED prompt
@@ -1577,7 +1883,7 @@ def main() -> int:
             return 3
         try:
             task_for_gemma, enhancement, clar_needed = _enhance_task(
-                agent, cfg, args, args.task, context)
+                agent, cfg, args, args.task, context, cache=cache)
         except KeyboardInterrupt:
             return 130
         except Exception as exc:  # noqa: BLE001 - report cleanly
@@ -1594,18 +1900,32 @@ def main() -> int:
             args.task = task_for_gemma
 
     req = _build_request(agent, args, route, context)
-    model_label = _model_label(cfg, route, args.model)
-    via = "http-fallback" if not _have_openai() else "backend"
-    streaming = " · streaming" if (args.stream and route == "local") else ""
-    _status(f"[hybrid] ▶ {model_label} working on \"{_task_preview(args.task)}\" (route={route}, {reason}, via={via}{streaming})")
-    try:
-        resp = _generate_with_retry(agent, cfg, args, route, req, stream=args.stream)
-    except KeyboardInterrupt:
-        return 130
-    except Exception as exc:  # noqa: BLE001 - report any generation failure cleanly
-        _status(f"[hybrid] ✗ {model_label} failed")
-        print(f"error: {exc}", file=sys.stderr)
-        return 3
+    cached_text = None
+    if cache is not None and cache.enabled:
+        key = cache.key("generate", req.system, req.user,
+                        str(req.max_tokens), str(req.temperature))
+        cached_text = cache.get("generate", key)
+        if cached_text is not None:
+            cache.record(True)
+            _status(f"[hybrid] 🗃 cache HIT generate {key[:8]}")
+            resp = ModelResponse(text=cached_text, backend="cache", latency_ms=0.0)
+    if cached_text is None:
+        model_label = _model_label(cfg, route, args.model)
+        via = "http-fallback" if not _have_openai() else "backend"
+        streaming = " · streaming" if (args.stream and route == "local") else ""
+        _status(f"[hybrid] ▶ {model_label} working on \"{_task_preview(args.task)}\" (route={route}, {reason}, via={via}{streaming})")
+        try:
+            resp = _generate_with_retry(agent, cfg, args, route, req, stream=args.stream)
+        except KeyboardInterrupt:
+            return 130
+        except Exception as exc:  # noqa: BLE001 - report any generation failure cleanly
+            _status(f"[hybrid] ✗ {model_label} failed")
+            print(f"error: {exc}", file=sys.stderr)
+            return 3
+        if cache is not None and cache.enabled:
+            cache.record(False)
+            if resp.text and not resp.truncated:
+                cache.set("generate", key, resp.text, source=route)
 
     tokens = _format_tokens(resp)
     if resp.truncated:

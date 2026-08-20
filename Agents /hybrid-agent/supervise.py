@@ -115,6 +115,12 @@ def parse_enhancement(raw: str) -> Enhancement:
     enh.reasoning = _section("REASONING")
     enh.plan = _section("PLAN")
     enh.clarifying_questions = _section("CLARIFYING QUESTIONS")
+    _cq = enh.clarifying_questions.lower()[:60]
+    if enh.clarifying_questions and any(k in _cq for k in (
+        "no clarifying", "no questions", "none needed", "already clear",
+        "not ambiguous", "no clarification", "task is clear",
+        "clear and well-specified", "no ambiguities")):
+        enh.clarifying_questions = ""
     if not enh.enhanced_prompt:
         enh.enhanced_prompt = raw.strip()
     return enh
