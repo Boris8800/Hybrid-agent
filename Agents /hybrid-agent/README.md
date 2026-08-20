@@ -6,9 +6,12 @@ implements, DeepSeek supervises, with routing, prompt enhancement, parallel
 step execution, caching, token budgeting, persistent memory, a hardened
 file-application engine, a **Context Safety Controller** (per-model capability
 discovery, hard budgets, preflight zones, compaction, retry budgets,
-telemetry), and a **durable task-state machine** (Task Contract as permanent
+telemetry), a **durable task-state machine** (Task Contract as permanent
 state: strict legal transitions, evidence ledger, batch transactions,
-idempotent operations, restart/resume, and a deploy trust boundary).
+idempotent operations, restart/resume, deploy trust boundary), and a
+**centralized Task Recovery Manager** (FailureClassifier + RecoveryManager:
+bounded, state-recorded, invariant-preserving recovery for every failure
+class, with chaos testing).
 
 **Full documentation lives in the repository root: [`README.md`](../../README.md).**
 

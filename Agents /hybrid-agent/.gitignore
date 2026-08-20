@@ -5,3 +5,6 @@ context.json
 __pycache__/
 .venv/
 memory/
+
+# durable task state (runtime artifacts)
+.hybrid-agent/

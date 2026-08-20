@@ -26,6 +26,7 @@ The bridge is a self-contained CLI (`ask.py`) that talks directly to two OpenAI-
 - [The supervise loop](#the-supervise-loop)
 - [Context Safety Controller](#context-safety-controller)
 - [Durable task state](#durable-task-state-state-machine--evidence-ledger)
+- [Task Recovery Manager](#task-recovery-manager)
 - [Prompt enhancement](#prompt-enhancement)
 - [Parallel execution](#parallel-execution)
 - [Verification stage](#verification-stage)
@@ -662,6 +663,49 @@ to a structured opinion (VERDICT / CONFIDENCE / CRITICAL_ISSUES / REQUIRED_FIXES
 and adjudicated deterministically with zero extra API spend: any non-APPROVED
 verdict beats APPROVED, the strictest (REJECTED > FIX_REQUIRED > UNKNOWN) wins,
 and among approvals the highest confidence/evidence wins.
+
+## Task Recovery Manager
+
+All failure recovery is centralized in `recovery.py` — one policy instead of
+scattered logic in supervise.py / verify / parallel.py / gitops.py:
+
+```
+Failure → FailureClassifier (transient / model / context / tool /
+          verification / contract / security / infrastructure / unknown)
+       → RecoveryManager (retry / compact / switch_model /
+          ask_supervisor / rollback / resume / escalate)
+```
+
+Deterministic, bounded, and state-aware:
+
+| Failure class | Recovery decision |
+|---------------|-------------------|
+| transient / infrastructure / tool | bounded retry with backoff (3/2/2), then escalate |
+| model | switch model once (local ↔ DeepSeek), then escalate |
+| context | compact once (the CSC already shrank the prompt), then escalate |
+| verification | ask the supervisor (fix vs rollback is a review decision) |
+| contract / security / unknown | **escalate immediately** — never auto-retry what needs a human |
+
+Every attempt is recorded in the durable TaskState (recovery_attempts,
+recovery_failures, escalations, last_error) via a RecoveryManager bound to the
+state. Crucially, the manager **never changes task facts** — it only decides
+the next action, and every action still executes through the state machine, so
+recovery cannot manufacture approval: `TRUNCATED → APPROVED`,
+`UNVERIFIED → DEPLOY_AUTHORIZED`, `FAILED → DEPLOYED`, and duplicate operations
+remain impossible at the transition level regardless of what failed.
+
+**Flexible, contract-driven paths.** The machine is not rigid: a task with
+`--apply` and no regression suite walks `GENERATED → REVIEWED → VERIFIED →
+APPROVED → APPLIED` (skipping REGRESSION_VERIFIED); a deploy task walks the
+full chain through `DEPLOY_AUTHORIZED → DEPLOYED`. What is *never* flexible:
+approval without review, approval without verification, deploy without the
+authorization boundary.
+
+**Chaos testing.** The suite (`tests/test_recovery.py`) injects failures at
+every boundary — Qwen dies, DeepSeek dies, LM Studio restarts, context
+discovery fails, parallel workers crash, state JSON corrupts, SIGKILL-style
+restart, duplicate operations, model switches mid-task, unsafe commands — and
+asserts the NEVER-invariants hold under every injection.
 
 ## Dynamic supervision routing
 

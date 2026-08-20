@@ -41,6 +41,8 @@ from supervise import (QWEN_MAX_TOKENS, ChainOfThoughtParser, ReviewPackage,
                        parse_verdict, supervise)
 from context_safety import DEFAULT_OUTPUT_RESERVE_TOKENS, DEFAULT_SAFETY_MARGIN_TOKENS
 from context import ProjectContext
+from recovery import (FailureClass, RecoveryAction, RecoveryManager,
+                      classify_failure, default_recovery)
 from task_state import (BatchStatus, BatchTransaction, Evidence, IllegalTransition,
                         ModelCapabilities, OperationLog, TaskState, TaskStatus,
                         FileState as _FileState)
@@ -2824,6 +2826,9 @@ def main() -> int:
         if state.status == TaskStatus.PLANNING:
             state.transition(TaskStatus.IMPLEMENTING)
         state.save()
+        # ONE recovery policy for the whole run, bound to the durable state so
+        # every failure/attempt is recorded and every decision is bounded.
+        recovery_mgr = RecoveryManager(state=state)
 
         tracker = ProgressTracker()
         cache = CacheManager(cfg, args)
@@ -3022,6 +3027,7 @@ def main() -> int:
                     vision=bool(local_caps.get("vision")),
                     tool_use=bool(local_caps.get("tool_use")),
                     telemetry=lambda line: tracker.tick(f"telemetry {line}"),
+                    recovery=recovery_mgr,
                 )
             # Durable state: record verdicts + recovery facts from the run.
             for v in result.verdicts:
@@ -3339,6 +3345,14 @@ def main() -> int:
                             state.final["deployed"] = True
                         else:
                             state.operations.mark_failed(deploy_op, deploy_msg)
+                            # Centralized recovery: deployment failures are
+                            # infrastructure-class — bounded retry policy is
+                            # recorded in durable state; the run still reports
+                            # the failure (an operator may re-run --resume).
+                            decision = recovery_mgr.handle_failure(
+                                f"deploy failed: {deploy_msg}", scope="deploy")
+                            _status(f"[hybrid] recovery: {decision.action.value} "
+                                    f"({decision.detail})")
                         state.save()
                         _status(f"[hybrid] {'🚀 deployed' if deploy_ok else '⛔ deploy failed'}: {deploy_msg}")
                 else:

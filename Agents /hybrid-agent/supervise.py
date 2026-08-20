@@ -43,6 +43,8 @@ from context_safety import (
     supervisor_context_block,
     task_required_output,
 )
+from recovery import (RecoveryAction, RecoveryManager, classify_failure,
+                      default_recovery)
 
 
 @dataclass
@@ -558,6 +560,7 @@ def supervise(
     architecture: str = "",
     vision: bool = False,
     tool_use: bool = False,
+    recovery: RecoveryManager | None = None,
 ) -> SuperviseResult:
     """Run Qwen-primary / DeepSeek-supervisor on a task.
 
@@ -601,6 +604,10 @@ def supervise(
         status = lambda line: None  # noqa: E731
     if qwen_generate is None:
         qwen_generate = lambda req: local.generate(req)  # noqa: E731
+    # Centralized recovery: every failure in this loop routes through ONE
+    # policy (classify -> bounded retry/compact/switch/escalate). Pass a
+    # RecoveryManager bound to the durable TaskState to record attempts.
+    recovery_mgr = recovery or default_recovery
 
     result = SuperviseResult(task=task)
     current = task
@@ -662,6 +669,11 @@ def supervise(
                    f"tokens); NOT calling Qwen; escalating to DeepSeek")
             _telemetry(input_tokens=estimate_tokens(req.system) + estimate_tokens(req.user),
                        compaction="red", status="RED_ESCALATION")
+            # Centralized recovery: context failures -> compact (already done
+            # by the prompt builder) then escalate; NEVER call Qwen in RED.
+            decision = recovery_mgr.decide("context RED", scope=f"iter{iteration}")
+            status(f"[supervise] recovery decision: {decision.action.value} "
+                   f"({decision.detail})")
             text, still_truncated = _cloud_generate_guarded(
                 cloud, task, status, use_plan=True, context_window=context_window,
                 output_reserve_tokens=eff_reserve,
@@ -674,7 +686,12 @@ def supervise(
         try:
             resp: ModelResponse = qwen_generate(req)
         except Exception as exc:  # noqa: BLE001
-            status(f"[supervise] local failed ({exc}); escalating to DeepSeek")
+            # Centralized recovery: model failures -> switch model (DeepSeek
+            # fallback) on the first occurrence, escalate afterwards.
+            decision = recovery_mgr.handle_failure(
+                f"local failed ({exc})", scope=f"iter{iteration}")
+            status(f"[supervise] local failed ({exc}); recovery: "
+                   f"{decision.action.value} ({decision.detail})")
             _telemetry(input_tokens=estimate_tokens(req.system) + estimate_tokens(req.user),
                        compaction="none", status="MODEL_ERROR")
             text, still_truncated = _cloud_generate_guarded(cloud, task, status, use_plan=True,
@@ -711,7 +728,11 @@ def supervise(
                     output_reserve_tokens=eff_reserve,
                     safety_margin_tokens=safety_margin_tokens))
             except Exception as exc:  # noqa: BLE001
-                status(f"[supervise] local retry failed ({exc}); escalating to DeepSeek")
+                # Centralized recovery for the continuation retry.
+                decision = recovery_mgr.handle_failure(
+                    f"local retry failed ({exc})", scope=f"iter{iteration}-retry")
+                status(f"[supervise] local retry failed ({exc}); recovery: "
+                       f"{decision.action.value} ({decision.detail})")
                 _telemetry(input_tokens=estimate_tokens(req.system) + estimate_tokens(req.user),
                            compaction="none", status="MODEL_ERROR")
                 text, still_truncated = _cloud_generate_guarded(cloud, task, status, use_plan=False,
