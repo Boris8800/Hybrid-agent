@@ -224,5 +224,44 @@ class TestLocalFirstSupervise(unittest.TestCase):
         self.assertEqual(result.verdicts[0].quality_score, 8.5)
 
 
+class TestMemoryCLIReport(unittest.TestCase):
+    """ask.py --memory / --consolidate report helper (offline)."""
+
+    def _seed(self, tmp):
+        mem = TaskMemory(root=tmp)
+        now = time.time()
+        for i in range(12):
+            mem.record(TaskRecord(
+                task=f"fix auth bug {i}", ts=now - i * 3600, route="local",
+                verdict="APPROVED" if i % 3 else "FIX_REQUIRED"))
+        return mem
+
+    def test_report_shows_records_and_insights(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            self._seed(tmp)
+            report = ask._memory_report({"memory": {"root": tmp}})
+            self.assertEqual(report["count"], 12)
+            self.assertIn("TASK MEMORY", report["insights"])
+            # Newest first.
+            self.assertEqual(report["records"][0]["task"], "fix auth bug 11")
+            self.assertIn("fix auth bug 0", report["records"][-1]["task"])
+            self.assertTrue(report["path"].endswith("tasks.json"))
+
+    def test_report_force_consolidates(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            self._seed(tmp)
+            report = ask._memory_report({"memory": {"root": tmp}}, force=True)
+            self.assertIn("TASK MEMORY", report["insights"])
+            # The insights file now exists (cached).
+            self.assertTrue((Path(tmp) / "insights.json").is_file())
+
+    def test_report_empty_memory(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            report = ask._memory_report({"memory": {"root": tmp}})
+            self.assertEqual(report["count"], 0)
+            self.assertEqual(report["records"], [])
+            self.assertEqual(report["insights"], "")
+
+
 if __name__ == "__main__":
     unittest.main()

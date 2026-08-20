@@ -455,7 +455,9 @@ fixes, enhancement, and single-shot calls — and actual usage is persisted to
 - **Consolidation pass** — with ≥ 10 records, `consolidate()` synthesizes
   approval rates, trend direction, and strongest task domains into
   `memory/insights.json`; `insights_text()` injects a compact summary into the
-  enhancement/review context. Local-only.
+  enhancement/review context. Local-only. Runs automatically when the cached
+  insights are stale (24h); `--memory` prints the records + insights and
+  `--consolidate` forces a refresh — both fully offline.
 - **Atomic writes** — all memory, stats, and cache files are written via
   temp + `os.replace`, so concurrent Agent Manager sessions can never tear them.
 - **MemoryView** — `similar_task_success_rate` (semantic + trigram) and `seen_ngrams`
@@ -530,7 +532,7 @@ report.
 
 ```bash
 cd "Agents /hybrid-agent"
-./.venv/bin/python -m unittest discover -s tests -v    # 161 tests
+./.venv/bin/python -m unittest discover -s tests -v    # 164 tests
 ```
 
 Coverage includes: the fenced-file parser, the apply overwrite/unsafe-path guards,

@@ -1083,6 +1083,27 @@ def _make_terminal_tool(cfg: dict, args: argparse.Namespace):
     return run_terminal
 
 
+def _memory_report(cfg: dict, force: bool = False, cwd: str = ".") -> dict:
+    """View or force-consolidate task memory. Fully offline — no model calls.
+
+    Returns {"path", "count", "records": [...newest first...], "insights"}.
+    With force=True the consolidation pass runs now (by default it only runs
+    lazily when the cached insights are stale and there are >=10 records)."""
+    mem = TaskMemory(memory_root_from_cfg(cfg, cwd=cwd))
+    if force:
+        mem.consolidate()
+    return {
+        "path": str(mem.path),
+        "count": mem.count(),
+        "records": [{
+            "task": r.get("task", ""), "verdict": r.get("verdict", ""),
+            "route": r.get("route", ""), "quality": r.get("quality", 0.0),
+            "ts": r.get("ts", 0.0),
+        } for r in mem._load()[-15:][::-1]],
+        "insights": mem.insights_text(),
+    }
+
+
 def _list_models(base_url: str) -> int:
     """Print one loaded model id per line from the local endpoint. Exit 0 / 1."""
     base_url = base_url.rstrip("/")
@@ -1948,6 +1969,12 @@ def main() -> int:
     parser.add_argument("--terminal-rounds", type=int, default=3,
                         help="max terminal rounds for the RUN: tool in the supervise loop "
                              "(0 disables the terminal tool)")
+    parser.add_argument("--memory", action="store_true",
+                        help="print the task-memory records and consolidated insights "
+                             "(offline, no model calls)")
+    parser.add_argument("--consolidate", action="store_true",
+                        help="force a memory consolidation pass and print the insights "
+                             "(offline; normally runs automatically when stale)")
     parser.add_argument("--stats", action="store_true",
                         help="print the 80/20 strategy summary (hybrid-agent/stats.json)")
     parser.add_argument("--evaluate", action="store_true",
@@ -2021,6 +2048,21 @@ def main() -> int:
     if args.models:
         cfg = _load_cfg(args)
         return _list_models(cfg["backends"]["local"]["base_url"])
+
+    if args.memory or args.consolidate:
+        cfg = _load_cfg(args)
+        report = _memory_report(cfg, force=args.consolidate, cwd=os.getcwd())
+        if args.json:
+            print(json.dumps(report, ensure_ascii=False))
+        else:
+            print(f"task memory: {report['count']} record(s) · {report['path']}")
+            if report["insights"]:
+                print("\n" + report["insights"])
+            for r in report["records"]:
+                ts = (datetime.fromtimestamp(r["ts"]).strftime("%Y-%m-%d %H:%M")
+                      if r["ts"] else "?")
+                print(f"  {ts}  {r['verdict']:<12} {r['route']:<9} {r['task'][:70]}")
+        return 0
 
     if args.route_only:
         if not args.task:
