@@ -3,5 +3,26 @@
   "default_agent": "hybrid",
   "disabled_providers": ["ollama"],
   "provider": {
+    "lmstudio": {
+      "options": {
+        "baseURL": "http://localhost:1234/v1",
+        "apiKey": "lm-studio",
+        "timeout": 300000
+      },
+      "models": {
+        "qwen2.5-coder-14b-instruct-mlx": {
+          "name": "Qwen 2.5 Coder 14B (local)",
+          "context": 32768,
+          "output": 4096
+        },
+        "text-embedding-nomic-embed-text-v1.5": {
+          "name": "Nomic Embed Text v1.5"
+        }
+      },
+      "whitelist": [
+        "qwen2.5-coder-14b-instruct-mlx",
+        "text-embedding-nomic-embed-text-v1.5"
+      ]
+    }
   }
 }
