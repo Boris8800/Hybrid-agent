@@ -25,6 +25,7 @@ The bridge is a self-contained CLI (`ask.py`) that talks directly to two OpenAI-
 - [CLI reference](#cli-reference)
 - [The supervise loop](#the-supervise-loop)
 - [Context Safety Controller](#context-safety-controller)
+- [Durable task state](#durable-task-state-state-machine--evidence-ledger)
 - [Prompt enhancement](#prompt-enhancement)
 - [Parallel execution](#parallel-execution)
 - [Verification stage](#verification-stage)
@@ -165,11 +166,20 @@ The engine can manage the whole ship-and-ship-it loop:
 - **`--push`** — after verification passes, stage exactly the engine's own
   changes (applied files + verification fixes), commit with an identifiable
   `hybrid-agent: <task>` message, and push. Never force-pushes; the first push
-  of a new branch auto-sets upstream.
-- **`--deploy`** / `--deploy-cmd` — after verification passes, run the deploy
-  command from `deploy.command` (config.yml) or the flag override, from
-  `deploy.cwd` (default: the project root). E.g. `docker compose up -d --build`
-  or `git push origin main`.
+  of a new branch auto-sets upstream. Idempotent via the OperationLog: a
+  completed push is skipped on resume.
+- **`--deploy`** / `--deploy-cmd` — run the deploy command from `deploy.command`
+  (config.yml) or the flag override, from `deploy.cwd` (default: the project
+  root). **Trust boundary:** deployment requires the durable task state to be
+  `DEPLOY_AUTHORIZED` (the full GENERATED → REVIEWED → VERIFIED → APPROVED →
+  APPLIED → DEPLOY_AUTHORIZED chain). Passing tests alone does **not**
+  authorize deployment — a `FAILED`/`REJECTED` state or a missing boundary
+  step is refused at the code level. Idempotent via the OperationLog.
+- **`--resume`** — resume a previous run of the same task from its durable
+  state: prints the `TASK <id> RESUMING` summary (step N/M, previous state,
+  completed steps, previous evidence), skips already-completed operations,
+  and continues from the last recorded position. A non-terminal prior state
+  is auto-continued even without `--resume`.
 
 Push and deploy only run when the task is **verified** and the output was
 independently reviewed — never on `review_failed_no_verdict` or truncated
@@ -473,8 +483,9 @@ use plain `python3 ask.py …` (the CLI self-heals into the venv interpreter).
 |------|-------------|
 | `--verify` | Run the final error-check stage (build/lint/tests) before the task is marked complete. |
 | `--pull` | `git pull --ff-only` before the task (best-effort). |
-| `--push` | After verification: git add + commit + push the engine's changes. |
-| `--deploy` / `--deploy-cmd CMD` | After verification: run the deploy command. |
+| `--push` | After verification: git add + commit + push the engine's changes (idempotent). |
+| `--deploy` / `--deploy-cmd CMD` | After verification AND the DEPLOY_AUTHORIZED trust boundary: run the deploy command (idempotent). |
+| `--resume` | Resume the same task from its durable state (step N/M, completed ops skipped). |
 | `--terminal-rounds N` | Max terminal rounds for the `RUN:` tool (0 disables). |
 | `--no-bound` | Disable BOUND runtime enforcement (user-level escape hatch). |
 | `--journeys FILE` | Verify user journeys headlessly (Vibe DSL); DeepSeek fixes and re-runs until green. |
@@ -588,6 +599,69 @@ MODEL=qwen2.5-coder-14b-instruct-mlx | ARCH=qwen2 | WINDOW=32768 | SAFE_INPUT=30
 
 Token estimation is conservative (3.5 chars/token — code tokenizes denser than
 prose; override with `HYBRID_CHARS_PER_TOKEN`).
+
+## Durable task state (state machine + evidence ledger)
+
+The Task Contract is the **permanent source of truth**, not just another context
+component. The conversation is temporary working memory; `task_state.py` is
+durable task state that survives context compaction, model switching, Qwen or
+DeepSeek failure, process restart, retry, verification, and parallel execution.
+Persisted as JSON at `<root>/.hybrid-agent/tasks/TASK-<hash>.json` after every
+stage (`HYBRID_TASK_STATE_DIR` overrides the location).
+
+**Strict state machine.** Illegal transitions are impossible at code level —
+there is no edge where they can happen:
+
+```
+PLANNING → IMPLEMENTING → GENERATED → REVIEWING → REVIEWED
+  → FIXING (loops back to GENERATED) | VERIFYING → VERIFIED
+  → REGRESSION_VERIFIED → APPROVED → APPLIED → DEPLOY_AUTHORIZED
+  → PUSHED → DEPLOYED          FAILED / REJECTED are terminal
+```
+
+- `FAILED → DEPLOYED`, `TRUNCATED → APPROVED`, `GENERATED → APPROVED`
+  (approval without review) and `REVIEWED → APPROVED` (approval without
+  verification) raise `IllegalTransition`.
+- **Generated ≠ approved ≠ verified ≠ applied ≠ deployed** — each is a
+  distinct state, never collapsed into one `success=True`.
+
+**Evidence ledger.** Every important claim gets an evidence object
+(`E-001`, `E-002`, …): type, command, exit code, output hash, timestamp, files
+affected, source, summary. Verify commands, applied files, review verdicts and
+batch outcomes are all recorded, and the ledger renders compactly so approvals
+are auditable (`E-019 cmd:npm test exit:0 hash:… files:src/auth.ts`).
+
+**Model capability contracts.** `ModelCapabilities` formalizes what a model can
+do (context window, max output, tool use, streaming, vision, structured output,
+embeddings, reasoning, diff generation). The orchestrator asks
+`can_perform_role("implementer", "long")` — never "is this Qwen?". Unknown
+capabilities are treated conservatively (not guaranteed).
+
+**Batch transactions.** Parallel batches get an explicit transaction state:
+`SUCCESS` / `PARTIAL_FAILURE` / `FAILED`. 3/4 steps OK is `PARTIAL_FAILURE` and
+the supervisor decides retry vs rollback — never silent success.
+
+**Idempotency.** Apply, push, and deploy are tracked in an `OperationLog`
+(`OP-<hash>`); a completed operation is never executed again — restart/resume
+cannot double `npm install`, migrations, commits, or deployments.
+
+**Restart/resume.** `--resume` (or an automatic continue when a non-terminal
+state exists) reports `TASK <id> RESUMING · step 3/4 · state IMPLEMENTING ·
+completed step 1, step 2 · evidence E-014…E-021` and continues from the last
+recorded position without resending the conversation.
+
+**Deploy trust boundary.** Passing tests does **not** authorize deployment.
+`--deploy` requires the durable state to have walked the full chain to
+`DEPLOY_AUTHORIZED` (GENERATED → REVIEWED → VERIFIED → APPROVED → APPLIED →
+DEPLOY_AUTHORIZED); anything less, including a `FAILED`/`REJECTED` terminal
+state, is refused at the code level.
+
+**Turbo consensus.** `--turbo` no longer picks the longest response — that is
+not a quality criterion for supervision. Each provider's output is normalized
+to a structured opinion (VERDICT / CONFIDENCE / CRITICAL_ISSUES / REQUIRED_FIXES)
+and adjudicated deterministically with zero extra API spend: any non-APPROVED
+verdict beats APPROVED, the strictest (REJECTED > FIX_REQUIRED > UNKNOWN) wins,
+and among approvals the highest confidence/evidence wins.
 
 ## Dynamic supervision routing
 

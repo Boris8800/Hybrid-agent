@@ -4,11 +4,11 @@ Bridge CLI that lets a coding agent delegate work out-of-band to two external
 models — a local LM Studio model (Qwen) and the DeepSeek cloud API. Qwen
 implements, DeepSeek supervises, with routing, prompt enhancement, parallel
 step execution, caching, token budgeting, persistent memory, a hardened
-file-application engine, and a **Context Safety Controller** that prevents the
-local model from ever reaching an unusable context state (per-model capability
-discovery, hard input/output budgets, preflight GREEN/YELLOW/ORANGE/RED zones,
-invariant-preserving compaction, tool-output summarization, retry budgets,
-output-state classification, and per-call context telemetry).
+file-application engine, a **Context Safety Controller** (per-model capability
+discovery, hard budgets, preflight zones, compaction, retry budgets,
+telemetry), and a **durable task-state machine** (Task Contract as permanent
+state: strict legal transitions, evidence ledger, batch transactions,
+idempotent operations, restart/resume, and a deploy trust boundary).
 
 **Full documentation lives in the repository root: [`README.md`](../../README.md).**
 

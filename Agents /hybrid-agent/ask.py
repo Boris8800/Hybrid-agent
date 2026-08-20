@@ -41,6 +41,9 @@ from supervise import (QWEN_MAX_TOKENS, ChainOfThoughtParser, ReviewPackage,
                        parse_verdict, supervise)
 from context_safety import DEFAULT_OUTPUT_RESERVE_TOKENS, DEFAULT_SAFETY_MARGIN_TOKENS
 from context import ProjectContext
+from task_state import (BatchStatus, BatchTransaction, Evidence, IllegalTransition,
+                        ModelCapabilities, OperationLog, TaskState, TaskStatus,
+                        FileState as _FileState)
 from parallel import (DependencyAnalyzer, ParallelExecutor, parse_plan_steps,
                       summarize)
 from memory import TaskMemory, TaskRecord, memory_root_from_cfg
@@ -857,8 +860,24 @@ def _failover_cloud(primary_cloud, cfg: dict, args: argparse.Namespace):
 
 def _parallel_cloud(primary_cloud, cfg: dict, args: argparse.Namespace):
     """Turbo mode: fan the SAME request out to every enabled online provider in
-    parallel and return the longest non-truncated response. Uses many AIs at
-    the same time; multiplies online spend (still capped by the token budget)."""
+    parallel, then adjudicate deterministically — NEVER 'longest response'.
+
+    Each provider response is normalized into a structured opinion
+    (VERDICT / CONFIDENCE / CRITICAL_ISSUES / REQUIRED_FIXES) via the same
+    parser the engine uses everywhere, then deterministic conflict rules pick
+    the final response without spending more API tokens:
+
+      * any non-APPROVED verdict (REJECTED/FIX_REQUIRED/UNKNOWN) beats
+        APPROVED — a reviewer that found problems wins over ones that didn't;
+      * among conflicting non-APPROVED opinions the strictest (REJECTED >
+        FIX_REQUIRED > UNKNOWN) wins, breaking ties by most critical issues;
+      * all-APPROVED (or all-UNKNOWN with no issues) picks the highest
+        confidence + longest evidence;
+      * truncated/failed providers are excluded first.
+
+    'Longest response' is NOT a quality criterion for supervision — this
+    consensus path is deterministic, auditable, and costs nothing extra.
+    """
     online = enabled_online(cfg)
     if len(online) <= 1:
         return primary_cloud
@@ -871,25 +890,57 @@ def _parallel_cloud(primary_cloud, cfg: dict, args: argparse.Namespace):
             if not resolve_api_key(prov):
                 continue
             workers.append(backend_for(prov))
-        results = []
+        raw = []
         with ThreadPoolExecutor(max_workers=len(workers)) as executor:
             futs = [executor.submit(w.generate, req) for w in workers]
             for f in futs:
                 try:
-                    results.append(f.result())
+                    raw.append(f.result())
                 except Exception:  # noqa: BLE001 - a failed provider is tolerated
                     pass
-        good = [r for r in results if r and r.text and not r.truncated]
+        good = [r for r in raw if r and r.text and not r.truncated]
         if not good:
-            good = [r for r in results if r and r.text]
+            good = [r for r in raw if r and r.text]
         if not good:
             raise BackendError("turbo: all online providers failed")
-        best = max(good, key=lambda r: len(r.text))
-        _status(f"[hybrid] ⚡ turbo: {len(good)}/{len(workers)} provider(s) "
-                f"returned; using {best.backend or 'provider'}")
-        return best
+        _status(f"[hybrid] ⚡ turbo: {len(good)}/{len(workers)} provider(s) returned")
+        return _adjudicate_turbo(good)
 
     return type("_ParallelCloud", (), {"generate": generate})()
+
+
+def _adjudicate_turbo(responses) -> ModelResponse:
+    """Deterministic consensus over provider responses (see _parallel_cloud).
+    Picks the response whose verdict wins the conflict rules; the chosen
+    response's full text is returned so the normal pipeline parses it.
+    Truncated/failed responses are excluded here too (defense in depth —
+    callers may not have pre-filtered)."""
+    usable = [r for r in responses if r and r.text and not getattr(r, "truncated", False)]
+    if not usable:
+        usable = [r for r in responses if r and r.text]
+    if not usable:
+        raise BackendError("turbo: all online providers failed")
+    opinions = []  # (response, verdict, weight)
+    for r in usable:
+        try:
+            v = parse_verdict(r.text)
+        except Exception:  # noqa: BLE001 - a broken response is UNKNOWN
+            v = Verdict(decision="UNKNOWN")
+        weight = 0
+        if v.decision == "APPROVED":
+            weight = 1
+        elif v.decision == "UNKNOWN":
+            weight = 2
+        elif v.decision == "FIX_REQUIRED":
+            weight = 3
+        elif v.decision == "REJECTED":
+            weight = 4
+        opinions.append((r, v, weight))
+
+    # Strictest-wins: REJECTED > FIX_REQUIRED > UNKNOWN > APPROVED. Among
+    # equal verdicts prefer the higher quality score, then longer evidence.
+    opinions.sort(key=lambda o: (-o[2], -o[1].quality_score, -len(o[0].text or "")))
+    return opinions[0][0]
 
 
 def _detect_step_conflicts(steps: list[dict]) -> set[str]:
@@ -1433,11 +1484,13 @@ def _scan_project_context(root: str, task: str = "") -> str:
 
 def _run_parallel(agent: HybridAgent, cfg: dict, args: argparse.Namespace,
                   cloud, task: str, enhancement, context: str,
-                  review: bool = True) -> SuperviseResult:
+                  review: bool = True, state: TaskState | None = None) -> SuperviseResult:
     """Parallel --supervise path: split the plan into steps, run independent
     steps in parallel on the local model, then DeepSeek reviews the combined
     output. Returns a SuperviseResult so the existing apply/stats/print tail
-    in the --supervise branch works unchanged.
+    in the --supervise branch works unchanged. Each batch is a TRANSACTION
+    with explicit status (SUCCESS / PARTIAL_FAILURE / FAILED) recorded in the
+    durable task state — 3/4 steps OK is PARTIAL_FAILURE, never silent success.
     """
     steps = parse_plan_steps(enhancement.plan if enhancement else "")
     analyzer = DependencyAnalyzer(steps)
@@ -1448,7 +1501,9 @@ def _run_parallel(agent: HybridAgent, cfg: dict, args: argparse.Namespace,
         max_tokens=args.max_tokens or QWEN_MAX_TOKENS,
     )
     texts: list[str] = []
+    batch_index = 0
     for group in groups:
+        batch_index += 1
         if len(group) > 1:
             _status(f"[hybrid] ⚡ Running {len(group)} steps in parallel...")
         ok_steps, conf_steps = _plan_group_runs(group)
@@ -1464,6 +1519,24 @@ def _run_parallel(agent: HybridAgent, cfg: dict, args: argparse.Namespace,
         if conf_steps:
             by_id = {r.get("id"): r for r in results if r.get("id") is not None}
             results = [by_id.get(s.get("id")) for s in group]
+        # TRANSACTION BOUNDARY: the batch gets an explicit status. 3/4 steps
+        # OK is PARTIAL_FAILURE, never silent success — the supervisor (or the
+        # caller, in local-first mode) decides retry vs rollback.
+        batch = BatchTransaction(
+            batch_id=f"{state.task_id}-B{batch_index}",
+            steps=[{"id": s.get("id"), "name": s.get("name", f"step {s.get('id')}"),
+                    "status": "success" if r["status"] == "success" else "failed",
+                    "error": r.get("error", "") if r["status"] != "success" else ""}
+                   for s, r in zip(group, results)])
+        batch._recompute()
+        state.record_batch(batch)
+        state.save()
+        if batch.is_partial():
+            _status(f"[hybrid] ⚠ BATCH {batch.batch_id}: {batch.status} — "
+                    f"failed step(s): {batch.failed_step_ids}; the supervisor "
+                    "decides retry vs rollback")
+        elif batch.status == BatchStatus.FAILED.value:
+            _status(f"[hybrid] ⛔ BATCH {batch.batch_id}: ALL steps failed")
         _status(f"[hybrid] 📝 {summarize(results)}")
         for r in results:
             if r["status"] == "success":
@@ -2447,10 +2520,20 @@ def main() -> int:
                              "engine's changes (applied files + verification fixes) with "
                              "an identifiable 'hybrid-agent: ...' message. Never force-pushes")
     parser.add_argument("--deploy", action="store_true",
-                        help="after verification passes, run the deploy command from "
-                             "deploy.command in config.yml (or --deploy-cmd)")
+                        help="after verification passes AND the deploy trust boundary "
+                             "is crossed (DEPLOY_AUTHORIZED), run the deploy command "
+                             "from deploy.command in config.yml (or --deploy-cmd). "
+                             "Passing tests alone does NOT authorize deployment")
     parser.add_argument("--deploy-cmd", default=None,
                         help="deploy command override (implies --deploy)")
+    parser.add_argument("--resume", action="store_true",
+                        help="resume a previous run of the SAME task from its durable "
+                             "task state (.hybrid-agent/tasks/TASK-*.json): reports the "
+                             "resume summary, skips already-completed operations "
+                             "(idempotent push/deploy/apply), and continues from the "
+                             "last recorded state")
+    parser.add_argument("--task-state-dir", default=None, metavar="DIR",
+                        help="durable task-state directory (default: <root>/.hybrid-agent/tasks)")
     parser.add_argument("--terminal-rounds", type=int, default=3,
                         help="max terminal rounds for the RUN: tool in the supervise loop "
                              "(0 disables the terminal tool)")
@@ -2709,6 +2792,39 @@ def main() -> int:
                 f"ctx={local_caps.get('max_context_length') or '?'}) "
                 f"window {local_context_window} · safe input {_safe_input} "
                 f"(reserve {output_reserve_tokens} + margin {safety_margin_tokens})")
+
+        # DURABLE TASK STATE: the contract becomes state, not context. Created
+        # (or resumed with --resume) before any model call; persisted after
+        # every stage so the task survives compaction, model switching, model
+        # failure, retry, verification, parallel execution, and process
+        # restart. The conversation stays temporary working memory.
+        if args.task_state_dir:
+            os.environ["HYBRID_TASK_STATE_DIR"] = args.task_state_dir
+        prev_state = TaskState.load(args.task, root=args.root)
+        if prev_state is not None and args.resume:
+            _status("[hybrid] ▶ " + prev_state.resume_summary().replace("\n", " · "))
+            state = prev_state
+        elif prev_state is not None and prev_state.status in (
+                TaskStatus.DEPLOYED, TaskStatus.REJECTED, TaskStatus.FAILED):
+            # Previous run finished or failed terminally — start fresh unless
+            # --resume explicitly asks to continue from a non-terminal state.
+            _status(f"[hybrid] ♻ previous run ended in {prev_state.status.value}; "
+                    "starting a new run (use --resume to continue)")
+            state = TaskState(args.task, root=args.root)
+        else:
+            state = TaskState(args.task, root=args.root)
+            if prev_state is not None:
+                # Same task seen before but not terminal: continue from where
+                # it stopped even without --resume (durable state is the norm).
+                _status(f"[hybrid] ▶ continuing previous run at {prev_state.status.value}")
+                state = prev_state
+        state.model_implementer = local_model_name
+        state.capabilities = ModelCapabilities.from_discovery(local_caps)
+        state.root = args.root
+        if state.status == TaskStatus.PLANNING:
+            state.transition(TaskStatus.IMPLEMENTING)
+        state.save()
+
         tracker = ProgressTracker()
         cache = CacheManager(cfg, args)
         cloud = _cached_cloud(cloud, cache)
@@ -2815,6 +2931,12 @@ def main() -> int:
             _status(f"[hybrid] 📋 contract: risk={contract.risk or 'n/a'} · "
                     f"files={len(contract.files)} · "
                     f"acceptance_cases={len(contract.acceptance_cases)}")
+            # Durable state: record the contract's files + acceptance criteria.
+            state.acceptance_criteria = list(contract.acceptance_criteria)
+            for f in contract.files:
+                if not any(fs.path == f for fs in state.files):
+                    state.files.append(_FileState(path=f, role="required"))
+            state.save()
         dep_ctx = ""
         if contract.risky and args.router == "auto" and plan != "critical":
             plan = "critical"
@@ -2865,8 +2987,16 @@ def main() -> int:
                     return 3
                 result = _run_parallel(
                     agent, cfg, args, cloud, task_for_qwen, enhancement, context,
-                    review=(plan != "local_first"))
+                    review=(plan != "local_first"), state=state)
             else:
+                # Durable state: GENERATED -> REVIEWING before the model review.
+                try:
+                    if state.status == TaskStatus.IMPLEMENTING:
+                        state.transition(TaskStatus.GENERATED)
+                    if state.can_transition(TaskStatus.REVIEWING):
+                        state.transition(TaskStatus.REVIEWING)
+                except IllegalTransition:
+                    pass  # resume from a later state keeps its position
                 result = supervise(
                     local, cloud,
                     task=task_for_qwen,
@@ -2893,6 +3023,17 @@ def main() -> int:
                     tool_use=bool(local_caps.get("tool_use")),
                     telemetry=lambda line: tracker.tick(f"telemetry {line}"),
                 )
+            # Durable state: record verdicts + recovery facts from the run.
+            for v in result.verdicts:
+                state.record_verdict(v.decision, v.quality_score)
+            if result.escalated:
+                state.record_recovery(ok=False, escalation=True)
+                if state.status not in (TaskStatus.FAILED, TaskStatus.REJECTED):
+                    try:
+                        state.transition(TaskStatus.FAILED)
+                    except IllegalTransition:
+                        pass
+            state.save()
         except BudgetExceeded as exc:
             _status("[hybrid] ⛔ supervise aborted: daily DeepSeek token budget exhausted")
             print(f"error: {exc}", file=sys.stderr)
@@ -2911,13 +3052,28 @@ def main() -> int:
         applied: list[tuple[str, int]] = []
         if args.apply and result.reason not in _UNSAFE_REASONS:
             tracker.start_phase("apply")
-            applied, skipped = _apply_fenced_files(result.final_text, args.root,
-                                                   dry_run=args.apply_dry_run,
-                                                   bound=bound)
-            verb = "DRY-RUN" if args.apply_dry_run else "APPLIED"
-            for rel, nbytes in applied:
-                _status(f"[hybrid] {verb} {rel} ({nbytes} B)"
-                        + (" [dry run]" if args.apply_dry_run else ""))
+            op_id = OperationLog.make_id(state.task_id, "apply")
+            if state.operations.is_completed(op_id):
+                _status("[hybrid] ♻ apply already completed (idempotent) — skipping")
+                applied = [(fs.path, 0) for fs in state.files if fs.status == "applied"]
+            else:
+                state.operations.mark_started(op_id)
+                applied, skipped = _apply_fenced_files(result.final_text, args.root,
+                                                       dry_run=args.apply_dry_run,
+                                                       bound=bound)
+                verb = "DRY-RUN" if args.apply_dry_run else "APPLIED"
+                for rel, nbytes in applied:
+                    _status(f"[hybrid] {verb} {rel} ({nbytes} B)"
+                            + (" [dry run]" if args.apply_dry_run else ""))
+                    # Durable state: each applied file becomes an evidence fact.
+                    state.mark_file(rel, applied=True)
+                    state.evidence.add(
+                        "FILE", command=f"write {rel}", exit_code=0,
+                        output=f"{nbytes} bytes", files_affected=[rel],
+                        source="apply", summary=f"applied {rel}")
+                if not args.apply_dry_run:
+                    state.operations.mark_completed(op_id,
+                                                    {"files": [r for r, _ in applied]})
             if skipped:
                 _status(f"[hybrid] ⚠ skipped {len(skipped)} block(s): "
                         f"{', '.join(skipped[:3])}")
@@ -2925,6 +3081,17 @@ def main() -> int:
                 _status("[hybrid] ⚠ --apply: no path-labeled fenced blocks found in output")
             bound_violations = [s for s in skipped if "(bound:" in s]
             tracker.end_phase()
+            # Durable state: APPLIED means files were written to disk — a
+            # distinct fact from "generated" or "approved".
+            if applied and not args.apply_dry_run:
+                try:
+                    if state.can_transition(TaskStatus.APPLIED):
+                        state.transition(TaskStatus.APPLIED)
+                except IllegalTransition:
+                    pass
+                state.final["applied"] = True
+                state.final["applied_files"] = [rel for rel, _ in applied]
+                state.save()
             # Scope metric: how much did the agent change vs the contract?
             if contract.complete and applied:
                 required = {pathlib.Path(f).name.lower() for f in contract.files}
@@ -3071,31 +3238,116 @@ def main() -> int:
         if verify_stats:
             stats.record_verify(verify_stats)
         stats.record_phases(tracker.phases())
+        # Durable state: verification is a distinct fact from generation or
+        # approval. Every verify command becomes an evidence ledger entry.
+        if verify_cmds or verify_stats:
+            for cmd in verify_cmds:
+                exit_code = 0
+                if verify_stats.get("results"):
+                    for r in verify_stats["results"]:
+                        if r.get("command") == cmd:
+                            exit_code = 0 if r.get("ok") else 1
+                state.evidence.add(
+                    "VERIFY", command=cmd, exit_code=exit_code,
+                    output=verify_report or "", source="verify",
+                    summary=f"verify {cmd} exit {exit_code}")
+            state.evidence.add(
+                "VERIFY", command="verify stage", exit_code=0 if verified else 1,
+                output=verify_report or "", source="verify",
+                summary="verification passed" if verified else "verification failed")
+            try:
+                if verified and state.can_transition(TaskStatus.VERIFIED):
+                    state.transition(TaskStatus.VERIFIED)
+                elif not verified and state.status not in (TaskStatus.FAILED,):
+                    if state.can_transition(TaskStatus.FAILED):
+                        state.transition(TaskStatus.FAILED)
+            except IllegalTransition:
+                pass
+            state.final["verified"] = bool(verified)
+            state.save()
         if not verified:
             _status("[hybrid] ⛔ FINAL CHECK FAILED: the task is NOT fully verified. "
                     "Fix DEEPSEEK_API_KEY/network, the verify command, or the code.")
+        # Trust boundary: APPLIED + VERIFIED -> DEPLOY_AUTHORIZED (explicit,
+        # separate from 'tests passed'). A scope/bound violation earlier sets
+        # verified=False so this edge is never reached from a dirty state.
+        if verified and result.reason not in _UNSAFE_REASONS:
+            try:
+                if state.can_transition(TaskStatus.DEPLOY_AUTHORIZED):
+                    state.transition(TaskStatus.DEPLOY_AUTHORIZED)
+                    state.save()
+            except IllegalTransition:
+                pass
 
         # --push / --deploy: ship the verified changes. Never run when the
         # final check failed or the run never independently reviewed its output.
+        # DEPLOY TRUST BOUNDARY: passing tests alone does NOT authorize
+        # deployment. The durable state must have walked GENERATED -> REVIEWED
+        # -> VERIFIED -> APPROVED -> APPLIED -> DEPLOY_AUTHORIZED; anything
+        # less (including a FAILED/REJECTED terminal state) makes --deploy a
+        # refusal, and push/deploy are idempotent via the OperationLog.
         push_ok = deploy_ok = None
         push_msg = deploy_msg = ""
         if verified and result.reason not in _UNSAFE_REASONS:
             if args.push:
-                push_files = [rel for rel, _ in applied]
-                push_files += list(verify_stats.get("files", []))
-                _status("[hybrid] ⬆ git push ...")
-                push_ok, push_msg = git_push(
-                    args.root, files=push_files or None,
-                    message=f"hybrid-agent: {args.task[:100]}")
-                _status(f"[hybrid] {'⬆ pushed' if push_ok else '⚠ push skipped'}: {push_msg}")
+                push_op = OperationLog.make_id(state.task_id, "push")
+                if state.operations.is_completed(push_op):
+                    _status("[hybrid] ♻ push already completed (idempotent) — skipping")
+                    push_ok, push_msg = True, "already pushed (idempotent skip)"
+                else:
+                    state.operations.mark_started(push_op)
+                    push_files = [rel for rel, _ in applied]
+                    push_files += list(verify_stats.get("files", []))
+                    _status("[hybrid] ⬆ git push ...")
+                    push_ok, push_msg = git_push(
+                        args.root, files=push_files or None,
+                        message=f"hybrid-agent: {args.task[:100]}")
+                    if push_ok:
+                        state.operations.mark_completed(push_op, push_msg)
+                        try:
+                            if state.can_transition(TaskStatus.PUSHED):
+                                state.transition(TaskStatus.PUSHED)
+                        except IllegalTransition:
+                            pass
+                    else:
+                        state.operations.mark_failed(push_op, push_msg)
+                    _status(f"[hybrid] {'⬆ pushed' if push_ok else '⚠ push skipped'}: {push_msg}")
+                    state.save()
             if args.deploy or args.deploy_cmd:
                 deploy_cmd = args.deploy_cmd or (cfg.get("deploy") or {}).get("command", "")
                 deploy_cwd = (cfg.get("deploy") or {}).get("cwd") or args.root
-                _status("[hybrid] 🚀 deploy ...")
-                deploy_ok, deploy_msg = run_deploy(
-                    args.root, deploy_cmd, cwd=deploy_cwd,
-                    timeout=int((cfg.get("deploy") or {}).get("timeout", 1800)))
-                _status(f"[hybrid] {'🚀 deployed' if deploy_ok else '⛔ deploy failed'}: {deploy_msg}")
+                # Trust boundary: only DEPLOY_AUTHORIZED (or later, e.g. PUSHED)
+                # states may run deployment. VERIFIED is NOT enough.
+                if state.status in (TaskStatus.DEPLOY_AUTHORIZED, TaskStatus.PUSHED):
+                    deploy_op = OperationLog.make_id(state.task_id, "deploy")
+                    if state.operations.is_completed(deploy_op):
+                        _status("[hybrid] ♻ deploy already completed (idempotent) — skipping")
+                        deploy_ok, deploy_msg = True, "already deployed (idempotent skip)"
+                    else:
+                        state.operations.mark_started(deploy_op)
+                        _status("[hybrid] 🚀 deploy (trust boundary: "
+                                f"{state.status.value}) ...")
+                        deploy_ok, deploy_msg = run_deploy(
+                            args.root, deploy_cmd, cwd=deploy_cwd,
+                            timeout=int((cfg.get("deploy") or {}).get("timeout", 1800)))
+                        if deploy_ok:
+                            state.operations.mark_completed(deploy_op, deploy_msg)
+                            try:
+                                state.transition(TaskStatus.DEPLOYED)
+                            except IllegalTransition:
+                                pass
+                            state.final["deployed"] = True
+                        else:
+                            state.operations.mark_failed(deploy_op, deploy_msg)
+                        state.save()
+                        _status(f"[hybrid] {'🚀 deployed' if deploy_ok else '⛔ deploy failed'}: {deploy_msg}")
+                else:
+                    _status(f"[hybrid] ⛔ DEPLOY REFUSED: state {state.status.value} is "
+                            "not DEPLOY_AUTHORIZED — passing tests does not "
+                            "authorize deployment (requires the full GENERATED -> "
+                            "REVIEWED -> VERIFIED -> APPROVED -> APPLIED -> "
+                            "DEPLOY_AUTHORIZED chain).")
+                    deploy_ok, deploy_msg = False, f"deploy refused: state {state.status.value}"
 
         tokens = {}
         if args.json:
