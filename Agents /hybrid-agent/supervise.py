@@ -341,6 +341,8 @@ def supervise(
     status: callable = None,
     gemma_generate: callable = None,
     gemma_max_tokens: int = GEMMA_MAX_TOKENS,
+    review: bool = True,
+    review_quality_hint: float = 0.0,
 ) -> SuperviseResult:
     """Run Gemma-primary / DeepSeek-supervisor on a task.
 
@@ -350,6 +352,10 @@ def supervise(
     `gemma_generate(request) -> ModelResponse` overrides how Gemma is invoked.
     Pass a streaming wrapper here so the caller can stream Gemma's output live
     (always showing the local model working). Defaults to `local.generate`.
+
+    With `review=False` the DeepSeek review is skipped entirely (local-first
+    routing): one Gemma pass, then a synthetic APPROVED verdict so the
+    caller's apply/stats tail works unchanged. Zero API spend.
     """
     if status is None:
         status = lambda line: None  # noqa: E731
@@ -405,6 +411,21 @@ def supervise(
                 result.reason = "cloud_fallback_truncated" if still_truncated else "local_truncation_escalation"
                 return result
         code = resp.text
+
+        # Local-first routing: skip the DeepSeek review entirely. One Gemma
+        # pass plus a synthetic APPROVED verdict keeps the apply/stats tail
+        # unchanged. review_quality_hint carries the router confidence (0-10).
+        if not review:
+            result.final_text = code
+            result.reason = "router_local_skip_review"
+            result.verdicts.append(Verdict(
+                decision="APPROVED",
+                quality_score=review_quality_hint or 7.0,
+                assessment="Router decided this task needs no DeepSeek review "
+                           "(local-first supervision plan).",
+            ))
+            status(f"[supervise] iter {iteration}: local-first — DeepSeek review skipped")
+            return result
 
         # 2. Build the compact review package.
         pkg = package_builder(task, code, iteration) if package_builder else _default_package(task, code)

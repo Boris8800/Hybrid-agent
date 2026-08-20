@@ -36,8 +36,9 @@ from backends.local_gemma import GemmaBackend
 from agent import HybridAgent, _load_config, apply_env_overrides
 from backends.deepseek import _resolve_api_key
 from supervise import (GEMMA_MAX_TOKENS, ChainOfThoughtParser, ReviewPackage,
-                       SuperviseResult, _enhance_request, _supervisor_request,
-                       parse_enhancement, parse_verdict, supervise)
+                       SuperviseResult, Verdict, _enhance_request,
+                       _supervisor_request, parse_enhancement, parse_verdict,
+                       supervise)
 from context import ProjectContext
 from parallel import (DependencyAnalyzer, ParallelExecutor, parse_plan_steps,
                       summarize)
@@ -801,6 +802,65 @@ def _warn_output_overlaps(results: list[dict]) -> None:
                     f"{ids} — apply keeps the first block")
 
 
+# --- dynamic supervision routing ------------------------------------------
+
+# Task signals that never need a DeepSeek review (local-first candidates).
+_LOCAL_SKIP_MARKERS = (
+    "typo", "rename", "format", "prettier", "readme", "docstring", "comment",
+    "draft", "spelling", "whitespace", "indent", "sort ", "reorder",
+)
+
+# Task signals that always deserve DeepSeek involvement (enhance + review).
+_CRITICAL_MARKERS = (
+    "architecture", "security", "authentication", " auth", "migration",
+    "database", "schema", "refactor", "concurrency", "performance",
+    "payment", "encryption", "api design", "data model", "deadlock",
+    "authorization", "rate limit",
+)
+
+
+def _plan_supervision(agent: HybridAgent | None, cfg: dict, args: argparse.Namespace,
+                      task: str, context: str, memory) -> tuple[str, str]:
+    """Decide the supervision plan for a task.
+
+    Levels: 'full' (DeepSeek reviews), 'local_first' (skip the DeepSeek review
+    — one local pass + apply/verify only), 'critical' (force prompt enhancement
+    and the full review loop). Returns (level, reason).
+
+    Precedence: explicit --router / router.supervision config > critical task
+    signals > trivial task signals > budget pressure > router confidence +
+    memory history > memory-similar tasks > default full.
+    """
+    override = args.router or (cfg.get("router") or {}).get("supervision") or "auto"
+    if override != "auto":
+        return override, f"override:{override}"
+    low = (task or "").lower()
+    if any(m in low for m in _CRITICAL_MARKERS):
+        return "critical", "critical_task_signals"
+    if any(m in low for m in _LOCAL_SKIP_MARKERS):
+        return "local_first", "trivial_task_signals"
+    # Budget pressure: near the daily cap, degrade to local-only.
+    budget = (cfg.get("review") or {}).get("daily_token_budget") or 0
+    if budget:
+        used = StatsTracker().daily_api_tokens()
+        if used >= budget * 0.8:
+            return "local_first", f"budget_pressure ({used}/{budget})"
+    if agent is not None:
+        try:
+            route, reason = agent.route(
+                task, context_chars=len(task) + len(context), memory=memory)
+        except Exception:  # noqa: BLE001 - routing must never break the run
+            route, reason = "", "router_error"
+        if route == "deepseek" and reason.startswith("archetype"):
+            return "critical", reason
+        if route == "local" and memory.has_history:
+            return "local_first", reason
+    # Memory alone: strong similar-task history of local success is a signal.
+    if memory.has_history and memory.similar_task_success_rate >= 0.7:
+        return "local_first", "memory_similar_tasks"
+    return "full", "default"
+
+
 def _generate_with_retry(agent: HybridAgent, cfg: dict, args: argparse.Namespace,
                          route: str, req: ModelRequest,
                          stream: bool = False) -> ModelResponse:
@@ -1039,7 +1099,8 @@ def _scan_project_context(root: str, task: str = "") -> str:
 
 
 def _run_parallel(agent: HybridAgent, cfg: dict, args: argparse.Namespace,
-                  cloud, task: str, enhancement, context: str) -> SuperviseResult:
+                  cloud, task: str, enhancement, context: str,
+                  review: bool = True) -> SuperviseResult:
     """Parallel --supervise path: split the plan into steps, run independent
     steps in parallel on the local model, then DeepSeek reviews the combined
     output. Returns a SuperviseResult so the existing apply/stats/print tail
@@ -1078,6 +1139,15 @@ def _run_parallel(agent: HybridAgent, cfg: dict, args: argparse.Namespace,
                 _status(f"[hybrid] ⚠ step {r['id']} failed: {r['error']}")
         _warn_output_overlaps(results)
     final_text = "\n\n".join(t for t in texts if t)
+
+    if not review:
+        _status("[hybrid] 🔒 local-first plan — skipping DeepSeek review of parallel output")
+        return SuperviseResult(
+            task=task, final_text=final_text, route="local",
+            reason="router_local_skip_review",
+            verdicts=[Verdict(decision="APPROVED", quality_score=7.0,
+                              assessment="Local-first router plan; no DeepSeek review.")],
+            iterations=max(1, len(groups)))
 
     _status("[hybrid] ▶ deepseek reviewing parallel output ...")
     try:
@@ -1665,6 +1735,13 @@ def main() -> int:
                         help="agent mode: hybrid (local impl + API supervision), "
                              "local (local impl, no API), code (API impl, no API supervision). "
                              "Default from $MODE, else hybrid")
+    parser.add_argument("--router", choices=["auto", "full", "local_first", "critical"],
+                        default="auto",
+                        help="supervision plan override: auto (router decides per task), "
+                             "full (always DeepSeek review), local_first (skip DeepSeek "
+                             "review, local implement + verify only), critical (force "
+                             "prompt enhancement + full review loop). Default from "
+                             "router.supervision in config, else auto")
     parser.add_argument("--stats", action="store_true",
                         help="print the 80/20 strategy summary (hybrid-agent/stats.json)")
     parser.add_argument("--evaluate", action="store_true",
@@ -1838,13 +1915,29 @@ def main() -> int:
             if scanned:
                 context = (context + "\n\n" + scanned).strip() if context else scanned
 
+        # Persistent task memory: router signal + consolidated insights injected
+        # into the enhance/package context so both models learn from history.
+        mem = TaskMemory((cfg.get("memory") or {}).get("root"))
+        memory = mem.memory_view(args.task)
+        plan, plan_reason = _plan_supervision(
+            agent, cfg, args, args.task, context, memory)
+        if plan != "full":
+            _status(f"[hybrid] 🧭 router: supervision={plan} ({plan_reason})")
+        insights = mem.insights_text()
+        if insights:
+            context = (context + "\n\n" + insights).strip() if context else insights
+
         # --enhance: DeepSeek enhances the task and plans around Gemma's limits
         # BEFORE Gemma implements. The improved prompt + reasoning + plan are
         # shown (and DeepSeek asks for clarification if the task is unclear),
-        # then the enhanced prompt is what Gemma implements.
+        # then the enhanced prompt is what Gemma implements. Critical tasks
+        # force enhancement even without an explicit --enhance.
         enhancement = None
         task_for_gemma = args.task
-        if args.enhance:
+        do_enhance = args.enhance or plan == "critical"
+        if do_enhance:
+            if plan == "critical" and not args.enhance:
+                _status("[hybrid] 🧭 critical plan — forcing prompt enhancement")
             tracker.start_phase("enhance")
             try:
                 task_for_gemma, enhancement, clar_needed = _enhance_task(
@@ -1895,7 +1988,8 @@ def main() -> int:
                           file=sys.stderr)
                     return 3
                 result = _run_parallel(
-                    agent, cfg, args, cloud, task_for_gemma, enhancement, context)
+                    agent, cfg, args, cloud, task_for_gemma, enhancement, context,
+                    review=(plan != "local_first"))
             else:
                 result = supervise(
                     local, cloud,
@@ -1905,6 +1999,7 @@ def main() -> int:
                     gemma_generate=_supervise_gemma_generate(cfg, args.model),
                     status=lambda line: tracker.tick(line),
                     gemma_max_tokens=args.max_tokens or GEMMA_MAX_TOKENS,
+                    review=(plan != "local_first"),
                 )
         except BudgetExceeded as exc:
             _status("[hybrid] ⛔ supervise aborted: daily DeepSeek token budget exhausted")

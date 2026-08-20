@@ -5,6 +5,13 @@ router:
   threshold_max: 0.85
   target_local_rate: 0.93
   alpha: 0.01
+  # Per-task supervision plan (--router overrides this):
+  #   auto         router decides per task (default): critical/trivial signals,
+  #                budget pressure, confidence + memory history, memory similarity
+  #   full         always DeepSeek review (the supervise loop)
+  #   local_first  skip DeepSeek review — one local pass + apply/verify only
+  #   critical     force prompt enhancement + the full review loop
+  supervision: auto
   weights:
     clarity: 0.30
     specificity: 0.25

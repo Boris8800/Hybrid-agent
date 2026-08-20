@@ -138,6 +138,7 @@ use plain `python3 ask.py …` (the CLI self-heals into the venv interpreter).
 | `--json` | Emit a single JSON object on stdout (for tooling). |
 | `--config PATH` | Optional YAML config override. |
 | `--mode hybrid\|local\|code` | Role enforcement mode (see [Modes](#modes)). |
+| `--router auto\|full\|local_first\|critical` | Supervision-plan override (see [Dynamic supervision routing](#dynamic-supervision-routing)). |
 | `--route-only` | Print the routing decision only, without calling any model. |
 | `--models` | List loaded local model ids. |
 
@@ -206,6 +207,29 @@ use plain `python3 ask.py …` (the CLI self-heals into the venv interpreter).
 
 **Verdict caching:** identical review packages (same task + output + diff) are served
 from the response cache — no API spend on a repeat review.
+
+## Dynamic supervision routing
+
+Before a task enters the pipeline, the router decides the **supervision plan** —
+the per-task "autonomy schedule":
+
+| Level | Behavior |
+|-------|----------|
+| `full` | Current behavior: DeepSeek reviews every iteration. |
+| `local_first` | **Skip the DeepSeek review entirely** — one Gemma pass, then apply/verify. Zero API spend (unless `--verify` finds errors DeepSeek must fix). |
+| `critical` | Force prompt enhancement + the full review loop, even without `--enhance`. |
+
+`_plan_supervision` picks a level by precedence:
+
+1. explicit `--router` / `router.supervision` config override;
+2. **critical task signals** (`architecture`, `security`, `auth`, `migration`, `schema`, `concurrency`, …) → `critical`;
+3. **trivial task signals** (`typo`, `rename`, `readme`, `docstring`, `draft`, `format`, …) → `local_first`;
+4. **budget pressure** — daily API usage ≥ 80% of `review.daily_token_budget` degrades to `local_first`;
+5. router confidence: DeepSeek-archetype-pinned tasks → `critical`; local-pinned tasks with memory history → `local_first`;
+6. **memory similarity** — strong (≥ 0.7) local success on similar past tasks → `local_first`;
+7. default → `full`.
+
+`local_first` results carry a synthetic APPROVED verdict (`reason="router_local_skip_review"`) so the apply/stats tail works unchanged. Safety bias: **critical always wins** when a task is ambiguous, and the `--verify` stage remains a real error-driven safety net.
 
 ## Prompt enhancement
 
@@ -302,17 +326,26 @@ fixes, enhancement, and single-shot calls — and actual usage is persisted to
 
 ## Memory & routing
 
-`memory.py` persists one outcome per completed task in `memory/tasks.json` (kept to the
-most recent 200 records): task text, route, verdict, and quality score.
+`memory.py` persists one outcome per completed task in `memory/tasks.json`:
 
-- The router's confidence scorer reads a real `MemoryView` — `similar_task_success_rate`
-  is the share of APPROVED tasks sharing a trigram with the current task, and novelty is
-  computed against genuinely seen n-grams.
-- The **adaptive threshold** (`router/threshold.py`) is updated from real outcomes only
-  once a 50-sample observation window exists (`maybe_update`), so it learns without
-  being moved by noise.
-- Circuit breakers independently trip the local or API backend after error-rate ceilings
-  are exceeded, with a cooldown.
+- **Scored eviction** — instead of a naive FIFO cut, entries past the cap are
+  evicted by a score combining **recency and task frequency** (0.7/0.3), so
+  frequently-recurring and recent tasks survive while one-shot stale ones are
+  forgotten.
+- **Consolidation pass** — with ≥ 10 records, `consolidate()` synthesizes the
+  history into high-level insights (overall and recent approval rates, trend
+  direction, strongest task domains) and caches them to `memory/insights.json`.
+  `insights_text()` lazily refreshes stale insights and injects a compact
+  summary into the enhancement/review context, so both models learn from
+  history. Local-only — no model calls are involved.
+- **MemoryView** — `similar_task_success_rate` is the share of APPROVED tasks
+  sharing a trigram with the current task; novelty is computed against genuinely
+  seen n-grams.
+
+The **adaptive threshold** (`router/threshold.py`) is updated from real outcomes
+only once a 50-sample observation window exists (`maybe_update`), and circuit
+breakers independently trip the local or API backend after error-rate ceilings
+are exceeded. The router's decision feeds the [supervision plan](#dynamic-supervision-routing).
 
 `--route-only` previews the decision: e.g. `route deepseek confidence:0.78` or
 `route local archetype:refactor`.
@@ -331,7 +364,7 @@ Unknown keys are ignored by the loader, and every section has a safe default.
 
 | Section | Key settings |
 |---------|--------------|
-| `router` | `local_threshold`, `threshold_min/max`, `target_local_rate`, `alpha`, `weights` |
+| `router` | `local_threshold`, `threshold_min/max`, `target_local_rate`, `alpha`, `supervision` (auto/full/local_first/critical), `weights` |
 | `backends.local` | `base_url`, `api_key`, `model`, `timeout_s`, `max_retries`, `backoff_s`, `cold_start_wait_s` |
 | `backends.deepseek` | `api_key_env`, `base_url`, `model`, `timeout_s`, `max_retries`, `backoff_s` |
 | `review` | `verify`, `verify_timeout`, `verify_groups`, `verify_allowlist`, `regression`, `regression_timeout`, `daily_token_budget`, `max_depth_tokens`, `max_failure_summary_words` |
@@ -376,13 +409,15 @@ report.
 
 ```bash
 cd "Agents /hybrid-agent"
-./.venv/bin/python -m unittest discover -s tests -v    # 95 tests
+./.venv/bin/python -m unittest discover -s tests -v    # 112 tests
 ```
 
 Coverage includes: the fenced-file parser, the apply overwrite/unsafe-path guards,
 dry-run, the clarify heuristic, `CacheManager` (TTL/cap/disabled), the verdict cache,
-`TaskMemory`, token-budget accounting, parallel-verify groups, truncation retries, and
-parallel step conflict detection/serialization.
+`TaskMemory` (scored eviction, consolidation, insights), the supervision router
+(trivial/critical signals, budget pressure, overrides, memory similarity), the
+local-first `review=False` supervise path, token-budget accounting, parallel-verify
+groups, truncation retries, and parallel step conflict detection/serialization.
 
 `.github/workflows/ci.yml` runs the full suite on Python 3.11 and 3.12 for every push and
 pull request, plus a syntax check of every engine module and the `.kilo/agent/*.md`
