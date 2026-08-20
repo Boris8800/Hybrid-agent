@@ -33,9 +33,10 @@ from backends.base import Backend, ModelRequest, ModelResponse
 
 @dataclass
 class Verdict:
-    decision: str  # "APPROVED" | "FIX_REQUIRED" | "REJECTED"
+    decision: str  # "APPROVED" | "FIX_REQUIRED" | "REJECTED" | "UNKNOWN"
     quality_score: float = 0.0  # 0-10 quality score (80/20 strategy)
     assessment: str = ""
+    evidence: str = ""          # machine evidence cited for an APPROVED verdict
     issues: list[dict] = field(default_factory=list)
     approval_conditions: str = ""
     rejection_reason: str = ""
@@ -169,8 +170,18 @@ class ChainOfThoughtParser:
 
 
 def _decision_from(raw: str) -> str:
-    """Extract the decision keyword from a review response."""
+    """Extract the decision keyword from a review response.
+
+    UNKNOWN is first-class: an APPROVED verdict with NO cited machine evidence
+    is downgraded to UNKNOWN, so the supervisor can never approve on vibes.
+    """
+    if re.search(r"\bUNKNOWN\b", raw.upper()):
+        return "UNKNOWN"
     m = re.search(r"\b(APPROVED|FIX_REQUIRED|REJECTED)\b", raw.upper())
+    if m and m.group(1) == "APPROVED":
+        if not re.search(r"===\s*EVIDENCE\s*===", raw, re.I | re.S) \
+                or not re.search(r"===\s*EVIDENCE\s*===.*?\S", raw, re.S | re.I):
+            return "UNKNOWN"  # APPROVED without machine evidence
     return m.group(1) if m else "FIX_REQUIRED"
 
 
@@ -190,6 +201,7 @@ def parse_verdict(raw: str) -> Verdict:
         return m.group(1).strip() if m else ""
 
     verdict.assessment = _section("OVERALL ASSESSMENT")
+    verdict.evidence = _section("EVIDENCE")[:2000]
     verdict.approval_conditions = _section("APPROVAL CONDITIONS")
     verdict.rejection_reason = _section("REJECTION EXPLANATION")
 
@@ -342,6 +354,10 @@ def _supervisor_request(pkg: ReviewPackage, verbose: bool = True) -> ModelReques
         "Rules: be specific, show the fix not just describe it, be brutal about "
         "correctness and security, be reasonable about style. Do NOT rewrite the "
         "whole codebase — you are reviewing, Gemma implements.\n\n"
+        "EVIDENCE RULE: if you return APPROVED you MUST cite the concrete machine "
+        "evidence (test names, file:line, command output) under a "
+        "'=== EVIDENCE ===' section. If you cannot point to machine evidence for "
+        "your verdict, return UNKNOWN instead of guessing.\n\n"
         "Note: the code under review was produced by a local model with a "
         f"{LOCAL_OUTPUT_TOKENS}-token output cap and {LOCAL_CONTEXT_TOKENS}-token "
         "context window. Judge whether the step was appropriately scoped and "
@@ -382,6 +398,7 @@ def supervise(
     bound_text: str = "",
     contract_text: str = "",
     source_context: str = "",
+    evidence_provider: callable = None,
 ) -> SuperviseResult:
     """Run Gemma-primary / DeepSeek-supervisor on a task.
 
@@ -516,6 +533,29 @@ def supervise(
 
         verdict = parse_verdict(review_resp.text)
         result.verdicts.append(verdict)
+
+        if verdict.decision == "UNKNOWN":
+            # First-class UNKNOWN: collect machine evidence once and re-review.
+            evidence = evidence_provider() if evidence_provider else None
+            if evidence:
+                status(f"[supervise] iter {iteration}: UNKNOWN — collecting evidence")
+                pkg.verification = ((pkg.verification + "\n\n" if pkg.verification else "")
+                                    + "MACHINE EVIDENCE:\n" + evidence[:3000])
+                try:
+                    review_resp = cloud.generate(_supervisor_request(pkg))
+                except Exception as exc:  # noqa: BLE001
+                    status(f"[supervise] evidence re-review failed ({exc})")
+                    evidence = None
+                if evidence:
+                    verdict = parse_verdict(review_resp.text)
+                    result.verdicts.append(verdict)
+                    status(f"[supervise] iter {iteration}: re-review -> {verdict.decision}")
+            if verdict.decision == "UNKNOWN":
+                result.final_text = code
+                result.reason = "unknown_evidence"
+                status("[supervise] ⛔ UNKNOWN: not enough machine evidence — "
+                       "requiring human review")
+                return result
 
         if verdict.approved:
             status(f"[supervise] iter {iteration}: APPROVED (score {verdict.quality_score:.1f}/10)")

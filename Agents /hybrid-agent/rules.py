@@ -73,6 +73,22 @@ class EngineeringRules:
         return None
 
 
+def load_constitution(root: str | Path) -> str:
+    """Optional per-project constitution (.agent/constitution.md or root
+    constitution.md): fundamental rules injected into every stage. '' when
+    absent."""
+    for path in (Path(root) / ".agent" / "constitution.md",
+                 Path(root) / "constitution.md"):
+        if path.is_file():
+            try:
+                text = path.read_text(encoding="utf-8").strip()
+            except OSError:
+                return ""
+            if text:
+                return "AGENT CONSTITUTION (immutable rules):\n" + text[:2000]
+    return ""
+
+
 def load_engineering_rules(root: str | Path) -> EngineeringRules:
     """Load .agent/engineering-rules.yml (or root engineering-rules.yml)."""
     candidates = [

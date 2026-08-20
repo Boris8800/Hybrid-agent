@@ -54,7 +54,7 @@ from patcher import (apply_unified_diff, extract_context, extract_error_location
 from contract import parse_contract
 from dependencies import build_dependency_context
 from scanner import redact_cloud, redact_text
-from rules import load_engineering_rules
+from rules import load_constitution, load_engineering_rules
 from learned_rules import LearnedRules
 from dependency_gate import run_dependency_gate
 from providers import (backend_for, enabled_online, get_local, get_online,
@@ -978,6 +978,33 @@ def _plan_supervision(agent: HybridAgent | None, cfg: dict, args: argparse.Names
     return "full", "default"
 
 
+def _evidence_provider(cfg, args, tracker):
+    """Callable that runs the configured verify commands and returns machine
+    evidence for UNKNOWN verdicts (None when no commands are configured)."""
+    def _provide() -> str | None:
+        vcmds = list(args.verify_cmd) or list(cfg.get("review", {}).get("verify", []) or [])
+        if not vcmds:
+            return None
+        timeout = args.verify_timeout or cfg.get("review", {}).get("verify_timeout", 600)
+        safe = [c for c in vcmds if _is_safe_verify_cmd(c)]
+        if not safe:
+            return None
+        errors = _run_verify_commands(args.root, safe,
+                                      lambda line: tracker.tick(line), timeout)
+        if errors:
+            return "VERIFY OUTPUT (exit non-zero):\n" + "\n\n".join(errors)[:3000]
+        return "VERIFY OUTPUT: all configured verification commands passed"
+    return _provide
+
+
+def _fix_fingerprint(fix_text: str, applied_files) -> str:
+    """Loop-detection fingerprint of one fix round: sorted files + normalized
+    fix text. The same fingerprint twice = the agent is going in circles."""
+    files = sorted(f for f, _ in (applied_files or []))
+    norm = re.sub(r"\s+", " ", (fix_text or ""))[:400]
+    return hashlib.sha1(("|".join(files) + "||" + norm).encode()).hexdigest()[:16]
+
+
 def _generate_with_retry(agent: HybridAgent, cfg: dict, args: argparse.Namespace,
                          route: str, req: ModelRequest,
                          stream: bool = False) -> ModelResponse:
@@ -1747,6 +1774,8 @@ def _run_final_verify(cloud, root: str, task: str, cmds, status,
 
     fixed_files: list[str] = []
     snapshot: str | None = None
+    seen_fps: set = set()
+    last_error_text, last_fix_text = "", ""
     for iteration in range(max_iter + 1):
         verify_stats["iterations"] = iteration + 1
         errors = _run_verify_commands(
@@ -1765,6 +1794,8 @@ def _run_final_verify(cloud, root: str, task: str, cmds, status,
             if reg_pass:
                 verify_stats["status"] = "PASSED"
                 verify_stats["files"] = list(fixed_files)
+                if rules is not None and last_fix_text:
+                    rules.record_success(last_error_text, last_fix_text)
                 return True, "verification passed"
             verify_stats["status"] = "REGRESSION_FAILED"
             return False, reg_report
@@ -1776,21 +1807,39 @@ def _run_final_verify(cloud, root: str, task: str, cmds, status,
             verify_stats["status"] = "ENV_ERROR"
             return False, "environmental error:\n\n" + _truncate_error(error_text)
 
-        status(f"[hybrid] ⚠ {len(errors)} error(s) — DeepSeek fixing "
+        status(f"[hybrid] ⚠ {len(errors)} error(s) — fixing "
                f"(attempt {iteration + 1}/{max_iter + 1})")
         if snapshot is None:
             snapshot = _git_snapshot(root)
-        try:
-            fix_text = _deepseek_fix(cloud, task, error_text, cache=cache, root=root)
-        except Exception as exc:  # noqa: BLE001
-            status(f"[hybrid] ⚠ DeepSeek fix failed: {exc}")
-            if snapshot:
-                _git_restore(root, snapshot, fixed_files)
-            return False, error_text
+        last_error_text = error_text
+        # Known-solution memory: reuse an exact-failure fix before calling the API.
+        known = rules.lookup(error_text) if rules is not None else None
+        if known is not None:
+            fix_text, confidence = known
+            status(f"[hybrid] 🧠 KNOWN SOLUTION FOUND (confidence {confidence:.0%}) — "
+                   "reusing the recorded fix without an API call")
+        else:
+            try:
+                fix_text = _deepseek_fix(cloud, task, error_text, cache=cache, root=root)
+            except Exception as exc:  # noqa: BLE001
+                status(f"[hybrid] ⚠ DeepSeek fix failed: {exc}")
+                if snapshot:
+                    _git_restore(root, snapshot, fixed_files)
+                return False, error_text
         api_calls += 1
         tokens_used += len(fix_text or "") // 4
 
         applied, skipped, repair_stats = _apply_repair(fix_text, root, bound=bound)
+        last_fix_text = fix_text
+        fp = _fix_fingerprint(fix_text, applied)
+        if fp in seen_fps:
+            status("[hybrid] 🔁 LOOP_DETECTED: same file + same fix as an earlier "
+                   "round — stopping for human review")
+            if snapshot:
+                _git_restore(root, snapshot, fixed_files)
+            verify_stats["status"] = "LOOP_DETECTED"
+            return False, "LOOP_DETECTED: the fix loop is repeating (same file, same fix)"
+        seen_fps.add(fp)
         if repair_stats.get("mode") == "diff" and repair_stats.get("saved_tokens_est"):
             status(f"[hybrid] ✂ surgical diff applied · saved ~{repair_stats['saved_tokens_est']} tokens")
         if any("(bound:" in s for s in skipped):
@@ -1884,6 +1933,7 @@ def _run_program_phases(cloud, root: str, task: str, bound, cfg: dict, status,
             continue
         status(f"[hybrid] 🚦 phase {name}: gate {cmds} (on_fail={on_fail})")
         fixed_files: list[str] = []
+        seen_fps: set = set()
         passed = False
         for round_num in range(max_rounds + 1):
             errors = _run_verify_commands(root, cmds, status, timeout_s)
@@ -1919,6 +1969,11 @@ def _run_program_phases(cloud, root: str, task: str, bound, cfg: dict, status,
             for rel, nbytes in applied:
                 status(f"[hybrid] ✓ phase {name} FIXED {rel} ({nbytes} B)")
                 fixed_files.append(rel)
+            fp = _fix_fingerprint(fix_text, applied)
+            if fp in seen_fps:
+                status(f"[hybrid] 🔁 LOOP_DETECTED: phase {name} fix loop is repeating")
+                return False, f"LOOP_DETECTED: phase {name} fix loop is repeating"
+            seen_fps.add(fp)
             if not applied:
                 status(f"[hybrid] ⚠ phase {name}: no fixable files returned")
                 break
@@ -1943,6 +1998,7 @@ def _run_journey_gate(cloud, root: str, task: str, journey_file: str, bound,
         return False, f"journey config error: {exc}"
     if ok:
         return True, report
+    seen_fps: set = set()
     for round_num in range(max_iter):
         status(f"[hybrid] 🚦 journeys FAILED — DeepSeek fixing "
                f"(round {round_num + 1}/{max_iter})")
@@ -1959,6 +2015,11 @@ def _run_journey_gate(cloud, root: str, task: str, journey_file: str, bound,
             return False, "journey fix output violated the BOUND"
         for rel, nbytes in applied:
             status(f"[hybrid] ✓ journey FIXED {rel} ({nbytes} B)")
+        fp = _fix_fingerprint(fix_text, applied)
+        if fp in seen_fps:
+            status("[hybrid] 🔁 LOOP_DETECTED: journey fix loop is repeating")
+            return False, "LOOP_DETECTED: journey fix loop is repeating"
+        seen_fps.add(fp)
         if not applied:
             status("[hybrid] ⚠ journey fix returned no files")
             break
@@ -1978,6 +2039,7 @@ def _run_differential_gate(cloud, root: str, task: str, bound, status,
     removed assertions, loosened type checks, guard-config edits). On
     violations, DeepSeek is instructed to RESTORE the gate (never weaken it),
     re-apply, and re-check — bounded by max_iter. Returns (ok, report)."""
+    seen_fps: set = set()
     for round_num in range(max_iter + 1):
         violations = analyze_changes(root)
         if not violations:
@@ -2004,6 +2066,11 @@ def _run_differential_gate(cloud, root: str, task: str, bound, status,
             return False, "differential fix output violated the BOUND"
         for rel, nbytes in applied:
             status(f"[hybrid] ✓ gate restored {rel} ({nbytes} B)")
+        fp = _fix_fingerprint(fix_text, applied)
+        if fp in seen_fps:
+            status("[hybrid] 🔁 LOOP_DETECTED: differential fix loop is repeating")
+            return False, "LOOP_DETECTED: differential fix loop is repeating"
+        seen_fps.add(fp)
         if not applied:
             status("[hybrid] ⚠ differential fix returned no files")
             break
@@ -2559,6 +2626,10 @@ def main() -> int:
         # Engineering rules: per-project constitution (.agent/engineering-rules.yml).
         eng = load_engineering_rules(args.root)
         eng_text = eng.prompt_text()
+        constitution_text = load_constitution(args.root)
+        if constitution_text:
+            _status("[hybrid] ⚖ constitution loaded")
+            eng_text = (constitution_text + "\n\n" + eng_text) if eng_text else constitution_text
         if eng_text:
             _status("[hybrid] 📜 engineering rules loaded")
             bound_text = (bound_text + "\n\n" + eng_text) if bound_text else eng_text
@@ -2647,7 +2718,8 @@ def main() -> int:
         # Results that must NEVER leave files behind: output was either never
         # independently reviewed (review_failed_no_verdict) or is INCOMPLETE
         # because even the DeepSeek fallback was truncated (cloud_fallback_truncated).
-        _UNSAFE_REASONS = {"review_failed_no_verdict", "cloud_fallback_truncated"}
+        _UNSAFE_REASONS = {"review_failed_no_verdict", "cloud_fallback_truncated",
+                            "unknown_evidence"}
 
         if args.max_tokens is not None and args.max_tokens < 4096:
             _status(f"[hybrid] ⚠ --max-tokens={args.max_tokens} is low — "
@@ -2679,6 +2751,7 @@ def main() -> int:
                     bound_text=bound_text,
                     contract_text=contract.to_prompt(),
                     source_context=dep_ctx,
+                    evidence_provider=_evidence_provider(cfg, args, tracker),
                 )
         except BudgetExceeded as exc:
             _status("[hybrid] ⛔ supervise aborted: daily DeepSeek token budget exhausted")
@@ -2712,6 +2785,20 @@ def main() -> int:
                 _status("[hybrid] ⚠ --apply: no path-labeled fenced blocks found in output")
             bound_violations = [s for s in skipped if "(bound:" in s]
             tracker.end_phase()
+            # Scope metric: how much did the agent change vs the contract?
+            if contract.complete and applied:
+                required = {pathlib.Path(f).name.lower() for f in contract.files}
+                extra = [rel for rel, _ in applied
+                         if pathlib.Path(rel).name.lower() not in required]
+                required_names = {pathlib.Path(f).name.lower() for f in contract.files}
+                changed = {pathlib.Path(rel).name.lower() for rel, _ in applied}
+                if extra and len(extra) > max(1, len(required_names) // 2):
+                    _status(f"[hybrid] ⚠ SCOPE_VIOLATION: changed {len(changed)} "
+                            f"file(s) vs {len(required_names)} required by the "
+                            f"contract; extra: {', '.join(sorted(set(extra))[:5])}")
+                    verify_report = (verify_report + "\n" if verify_report else "") + \
+                        "SCOPE_VIOLATION: changes outside the contract scope: " + \
+                        ", ".join(sorted(set(extra))[:5])
             # BOUND: the agent attempted something it can never do. Exit code 2
             # — the violation cannot be bypassed (--no-bound is user-level).
             if bound_violations and not args.apply_dry_run:

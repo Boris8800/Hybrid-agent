@@ -368,6 +368,32 @@ the run stops pending approval. Engineering-rule blocklists reject outright;
 `dependency_gate.allow` / `--allow-dep` pre-approve; `--dep-audit` looks up
 license/description from npm/PyPI.
 
+## Evidence & diagnosis
+
+**Evidence-based approval** — `APPROVED` requires cited **machine evidence**
+(`=== EVIDENCE ===`: test names, file:line, command output). An approval
+without evidence is downgraded to **`UNKNOWN`** — a first-class verdict, never
+a guess. `UNKNOWN` triggers an evidence-collection pass (the configured verify
+commands run, their output is attached, and the package is re-reviewed once);
+if still `UNKNOWN`, the run escalates for human review and is never applied.
+
+**Loop detection** — every fix loop (verify, journeys, differential, program
+phases) fingerprints each round's applied files + fix text; the same fix
+appearing twice stops the run: `LOOP_DETECTED`, human review required.
+
+**Failure fingerprinting** — every failure gets a stable `FAILURE_ID`
+(hash of error category + file:line + normalized message). The same failure
+recorded as successfully fixed ≥ 2 times becomes a **known solution** — the
+engine reuses it (`KNOWN SOLUTION FOUND, confidence 96%`) without an API call.
+
+**Agent Constitution** — an optional `.agent/constitution.md` (or root
+`constitution.md`) is injected into every stage alongside the BOUND and
+engineering rules.
+
+**Scope metric** — after apply, changed files are compared against the
+contract's "Files likely involved"; changes well outside scope report
+`SCOPE_VIOLATION` in the verification output.
+
 ## Quick start
 
 ```bash
@@ -710,7 +736,7 @@ report.
 
 ```bash
 cd "Agents /hybrid-agent"
-./.venv/bin/python -m unittest discover -s tests -v    # 242 tests
+./.venv/bin/python -m unittest discover -s tests -v    # 256 tests
 ```
 
 Coverage includes: the fenced-file parser, the apply overwrite/unsafe-path guards,

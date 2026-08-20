@@ -27,7 +27,7 @@ from supervise import (  # noqa: E402
 UNSAFE_REASONS = {"review_failed_no_verdict", "cloud_fallback_truncated"}
 
 
-def _approved(text="=== REVIEW DECISION ===\nAPPROVED\n=== QUALITY SCORE ===\n9.0\n"):
+def _approved(text="=== REVIEW DECISION ===\nAPPROVED\n=== EVIDENCE ===\nverify command passed\n=== EVIDENCE ===\nverify command passed\n=== QUALITY SCORE ===\n9.0\n"):
     return ModelResponse(text=text)
 
 

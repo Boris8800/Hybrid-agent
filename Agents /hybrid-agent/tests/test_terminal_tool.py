@@ -18,7 +18,8 @@ from backends.base import ModelResponse  # noqa: E402
 from supervise import ReviewPackage, _extract_run_blocks, supervise  # noqa: E402
 
 APPROVED_TEXT = (
-    "=== REVIEW DECISION ===\nAPPROVED\n\n=== QUALITY SCORE ===\n8.0\n\n"
+    "=== REVIEW DECISION ===\nAPPROVED\n\n=== EVIDENCE ===\n"
+    "terminal session exit 0; file.py written\n\n=== QUALITY SCORE ===\n8.0\n\n"
     "=== OVERALL ASSESSMENT ===\nSolid change, terminal session confirms it.\n"
 )
 
