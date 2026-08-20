@@ -27,6 +27,26 @@ import threading
 import time
 from pathlib import Path
 
+# --- Self-heal: flask/flask-socketio/cryptography live in the project venv
+# (hybrid-agent/.venv). When invoked with a system python3 that lacks them,
+# re-exec with the venv interpreter instead. Guarded so the re-exec cannot loop
+# and never fires when the module is imported.
+if __name__ == "__main__" and os.environ.get("HYBRID_REHEALED") != "1":
+    try:
+        import flask  # noqa: F401
+        import flask_socketio  # noqa: F401
+    except ImportError:
+        venv_python = Path(__file__).resolve().parent / ".venv" / "bin" / "python"
+        if venv_python.is_file():
+            os.environ["HYBRID_REHEALED"] = "1"
+            os.execv(str(venv_python), [str(venv_python),
+                                        str(Path(__file__).resolve()), *sys.argv[1:]])
+        print("error: flask/flask-socketio missing and no project venv found.\n"
+              "Install them: cd 'Agents /hybrid-agent' && "
+              "./.venv/bin/pip install flask flask-socketio cryptography",
+              file=sys.stderr)
+        raise SystemExit(2)
+
 from flask import Flask, jsonify, request, send_from_directory
 from flask_socketio import SocketIO
 

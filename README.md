@@ -104,6 +104,7 @@ A single-user local control panel for the engine:
 cd "Agents /hybrid-agent"
 ./.venv/bin/pip install flask flask-socketio cryptography   # one-time
 ./.venv/bin/python web_dashboard.py --port 8660              # -> http://127.0.0.1:8660
+# `python3 web_dashboard.py …` also works — it self-heals into the venv.
 ```
 
 - **Providers & API keys** — manage all 2+2 providers: enter/test/delete keys
