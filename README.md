@@ -17,6 +17,7 @@ The bridge is a self-contained CLI (`ask.py`) that talks directly to two OpenAI-
 - [Git & deploy](#git--deploy-pull--push--deploy)
 - [Terminal tool (RUN:)](#terminal-tool-run)
 - [Bounded autonomy (BOUND)](#bounded-autonomy-bound)
+- [Journey verification (Vibe DSL)](#journey-verification-vibe-dsl)
 - [Quick start](#quick-start)
 - [CLI reference](#cli-reference)
 - [The supervise loop](#the-supervise-loop)
@@ -248,6 +249,45 @@ program:
 Phases run when `program.phases` is configured; otherwise the standard
 `--verify` flow runs unchanged.
 
+## Journey verification (Vibe DSL)
+
+User-journey verification in a headless browser — not just build/lint, but
+actual user-facing behavior (BotIntern pattern).
+
+A `journeys.yml` at the project root defines user journeys:
+
+```yaml
+app_url: "http://localhost:3000"
+setup: ["npm run dev"]                     # optional app startup commands
+journeys:
+  - name: "login page renders"
+    steps:
+      - visit: "/"
+      - see_text: "Sign in"
+      - see_element: "button[type=submit]"
+  - name: "login flow works"
+    steps:
+      - visit: "/login"
+      - fill: { selector: "#email", value: "alice@example.com" }
+      - fill: { selector: "#password", value: "password123" }
+      - click: "button[type=submit]"
+      - wait_selector: ".dashboard"
+```
+
+Step types: `visit`, `see_text`, `see_element`, `click`, `fill`,
+`wait_selector`, `wait_text`, `wait_ms`, `screenshot`.
+
+- **Run as a gate** — `--journeys journeys.yml` (or a `journeys:` program phase)
+  runs them headlessly (Playwright/Chromium, in the venv). On failure the
+  report — including a **page snapshot** of the failing state and a screenshot
+  in `hybrid-verify/screenshots/` — goes to DeepSeek, which generates surgical
+  fixes; the journeys re-run until green or `--verify-max` rounds.
+- **Write-One safety** — `journeys.yml` is in the BOUND danger zones: the agent
+  can fix source code but can **never modify the test suite** (no cheating).
+- Standalone: `./.venv/bin/python journeys.py --file journeys.yml`.
+- Without Playwright/PyYAML installed the runner reports a clear message
+  instead of crashing: `./.venv/bin/pip install playwright pyyaml && ./.venv/bin/python -m playwright install chromium`.
+
 ## Quick start
 
 ```bash
@@ -330,6 +370,8 @@ use plain `python3 ask.py …` (the CLI self-heals into the venv interpreter).
 | `--deploy` / `--deploy-cmd CMD` | After verification: run the deploy command. |
 | `--terminal-rounds N` | Max terminal rounds for the `RUN:` tool (0 disables). |
 | `--no-bound` | Disable BOUND runtime enforcement (user-level escape hatch). |
+| `--journeys FILE` | Verify user journeys headlessly (Vibe DSL); DeepSeek fixes and re-runs until green. |
+| `--journeys-timeout S` | Per-step timeout for journey verification (default 30). |
 | `--verify-cmd CMD` | Add a verification command (repeatable; implies `--verify`). |
 | `--verify-max N` | Max verify-fix iterations (default 2). |
 | `--verify-timeout S` | Per-command timeout (default `review.verify_timeout`, 600s). |
@@ -544,7 +586,8 @@ Unknown keys are ignored by the loader, and every section has a safe default.
 | `providers` | `online`, `local` (lists of `{name, base_url, model, api_key_env, api_key, enabled, timeout_s, max_retries}`) |
 | `deploy` | `command`, `cwd`, `timeout` |
 | `bound` | `danger_zones`, `never_do`, `iron_laws` |
-| `program` | `phases` (list of `{name, gate, max_fix_rounds, on_fail}`) |
+| `program` | `phases` (list of `{name, gate | journeys, max_fix_rounds, on_fail}`) |
+| `journey` | `file`, `browser`, `timeout_s`, `screenshots_dir` |
 | `roles` | `implementer`, `supervisor` (architecture — do not change) |
 
 **Environment overrides** (roles stay architecture; only models/endpoints change):
@@ -583,7 +626,7 @@ report.
 
 ```bash
 cd "Agents /hybrid-agent"
-./.venv/bin/python -m unittest discover -s tests -v    # 178 tests
+./.venv/bin/python -m unittest discover -s tests -v    # 190 tests
 ```
 
 Coverage includes: the fenced-file parser, the apply overwrite/unsafe-path guards,
@@ -619,6 +662,7 @@ repo root/
     ├── providers.py             # Provider registry (2 online + 2 local, failover-ready)
     ├── gitops.py                # git pull / push / deploy helpers
     ├── bound.py                 # BOUND: danger zones, never_do, iron laws (Ouro Loop)
+    ├── journeys.py              # Vibe-DSL user-journey verification (headless browser)
     ├── web_dashboard.py         # Web control panel (Flask + SocketIO, port 8660)
     ├── dashboard/               # Dashboard UI + encrypted secrets store
     ├── context.py / scan.py     # Project context scanner

@@ -19,6 +19,7 @@ DEFAULT_DANGER_ZONES = [
     "**/.env", "**/.env.*", "**/*.pem", "**/*.key", "**/*.p12",
     ".git/**", ".kilo/**", "**/.venv/**", "**/node_modules/**",
     "**/memory/**", "**/.cache/**",
+    "**/journeys.yml", "**/journeys.yaml",  # Write-One: the test suite is read-only
 ]
 DEFAULT_NEVER_DO = [
     "rm -rf", "rm -fr", "git push --force", "git push -f", "git push origin --force",

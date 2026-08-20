@@ -46,6 +46,7 @@ from memory import TaskMemory, TaskRecord, memory_root_from_cfg
 from embed import memory_embed_callable
 from gitops import git_pull, git_push, run_deploy
 from bound import load_bound
+from journeys import JourneyError, run_journeys
 from providers import (backend_for, enabled_online, get_local, get_online,
                        load_providers, resolve_api_key)
 
@@ -587,6 +588,7 @@ _KNOWN_CONFIG_KEYS = {
     "deploy": {"command", "cwd", "timeout"},
     "bound": {"danger_zones", "never_do", "iron_laws"},
     "program": {"phases"},
+    "journey": {"file", "browser", "timeout_s", "screenshots_dir"},
     "roles": {"implementer", "supervisor"},
 }
 
@@ -1793,6 +1795,30 @@ def _run_program_phases(cloud, root: str, task: str, bound, cfg: dict, status,
         if on_fail not in ("retry", "revert", "escalate"):
             status(f"[hybrid] ⚠ phase {name}: unknown on_fail={on_fail!r} — treating as retry")
             on_fail = "retry"
+        # Journey-gated phase: headless user journeys from a journeys.yml file.
+        if phase.get("journeys"):
+            jfile = str(phase.get("journeys"))
+            status(f"[hybrid] 🚦 phase {name}: journey gate {jfile} (on_fail={on_fail})")
+            if on_fail in ("revert", "escalate"):
+                ok, rep = _run_journey_gate(cloud, root, task, jfile, bound, status,
+                                            cache=cache, timeout_s=timeout_s, max_iter=0)
+                if not ok:
+                    if on_fail == "revert":
+                        if snapshot:
+                            _git_restore(root, snapshot, fixed_files)
+                        status(f"[hybrid] ↩ phase {name}: changes reverted")
+                        return False, f"phase {name} failed and was reverted"
+                    status(f"[hybrid] ⛔ phase {name}: escalated for human review")
+                    return False, f"phase {name} escalated for human review"
+                status(f"[hybrid] ✅ phase {name} (journeys) passed")
+                continue
+            ok, rep = _run_journey_gate(cloud, root, task, jfile, bound, status,
+                                        cache=cache, timeout_s=timeout_s,
+                                        max_iter=max_rounds)
+            if not ok:
+                return False, f"phase {name}: {rep}"
+            status(f"[hybrid] ✅ phase {name} (journeys) passed")
+            continue
         unsafe = [c for c in cmds if not _is_safe_verify_cmd(c)]
         if unsafe:
             status(f"[hybrid] ⛔ phase {name}: gate not allowlisted: {unsafe[:2]}")
@@ -1842,6 +1868,46 @@ def _run_program_phases(cloud, root: str, task: str, bound, cfg: dict, status,
             status(f"[hybrid] ⛔ phase {name}: gate still failing after remediation")
             return False, f"phase {name} still failing after remediation"
     return True, "all program phases passed"
+
+
+def _run_journey_gate(cloud, root: str, task: str, journey_file: str, bound,
+                      status, cache=None, timeout_s: int = 30,
+                      max_iter: int = 2) -> tuple[bool, str]:
+    """Run the journeys.yml user journeys headlessly; on failure DeepSeek fixes
+    the code (surgical patches, BOUND-enforced) and the journeys re-run until
+    green or max_iter exhausted. The journeys file itself is never modified
+    (Write-One; it is BOUND-protected). Returns (ok, report)."""
+    try:
+        ok, report = run_journeys(
+            journey_file, timeout_s=timeout_s,
+            screenshots_dir=str(pathlib.Path(root) / "hybrid-verify" / "screenshots"))
+    except JourneyError as exc:
+        return False, f"journey config error: {exc}"
+    if ok:
+        return True, report
+    for round_num in range(max_iter):
+        status(f"[hybrid] 🚦 journeys FAILED — DeepSeek fixing "
+               f"(round {round_num + 1}/{max_iter})")
+        try:
+            fix_text = _deepseek_fix(cloud, task, report, cache=cache)
+        except Exception as exc:  # noqa: BLE001
+            status(f"[hybrid] ⚠ journey fix failed ({exc})")
+            break
+        applied, skipped = _apply_fenced_files(fix_text, root, bound=bound)
+        if any("(bound:" in s for s in skipped):
+            status("[hybrid] ⛔ journey fix violated the BOUND")
+            return False, "journey fix output violated the BOUND"
+        for rel, nbytes in applied:
+            status(f"[hybrid] ✓ journey FIXED {rel} ({nbytes} B)")
+        if not applied:
+            status("[hybrid] ⚠ journey fix returned no files")
+            break
+        ok, report = run_journeys(
+            journey_file, timeout_s=timeout_s,
+            screenshots_dir=str(pathlib.Path(root) / "hybrid-verify" / "screenshots"))
+        if ok:
+            return True, report
+    return False, report
 
 
 def _select_backend(agent: HybridAgent, cfg: dict, route: str,
@@ -2072,6 +2138,14 @@ def main() -> int:
                         help="disable the BOUND runtime enforcement (danger zones / "
                              "never_do / exit code 2). User-level escape hatch — the "
                              "agent can never bypass it on its own")
+    parser.add_argument("--journeys", default=None, metavar="FILE",
+                        help="verify user journeys from a journeys.yml DSL file in a "
+                             "headless browser; on failure DeepSeek fixes the code and "
+                             "the journeys re-run until green (Write-One: the file "
+                             "itself is BOUND-protected)")
+    parser.add_argument("--journeys-timeout", type=int, default=0,
+                        help="per-step timeout in seconds for journey verification "
+                             "(default: journey.timeout_s in config, 30)")
     parser.add_argument("--stats", action="store_true",
                         help="print the 80/20 strategy summary (hybrid-agent/stats.json)")
     parser.add_argument("--evaluate", action="store_true",
@@ -2477,6 +2551,17 @@ def main() -> int:
                     parallel=args.verify_parallel, parallel_workers=args.verify_workers,
                     verify_groups=verify_groups, bound=bound)
             tracker.end_phase()
+        # Journey verification (Vibe DSL): headless user journeys run as a gate
+        # after the build/test gates. Fails -> DeepSeek fixes -> re-run.
+        if args.journeys and verified:
+            jtimeout = args.journeys_timeout or int((cfg.get("journey") or {}).get("timeout_s", 30))
+            _status(f"[hybrid] 🚦 journey verification: {args.journeys}")
+            verified, journey_report = _run_journey_gate(
+                cloud, args.root, args.task, args.journeys, bound,
+                lambda line: tracker.tick(line), cache=cache,
+                timeout_s=jtimeout, max_iter=args.verify_max)
+            if journey_report:
+                verify_report = journey_report
         if verify_stats:
             stats.record_verify(verify_stats)
         stats.record_phases(tracker.phases())

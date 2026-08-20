@@ -135,9 +135,21 @@ program:
   #     gate: ["npm run build"]
   #     max_fix_rounds: 2
   #     on_fail: retry        # retry | revert | escalate
+  #   - name: journeys        # user journeys from a journeys.yml DSL (headless browser)
+  #     journeys: "journeys.yml"
+  #     on_fail: retry
   #   - name: test
   #     gate: ["npm test"]
   #     on_fail: escalate
+
+# Journey verification (Vibe DSL): user journeys defined in journeys.yml are
+# run headlessly (Playwright). The journeys file is BOUND-protected (Write-One):
+# the agent can fix source code but can never modify the tests themselves.
+journey:
+  file: "journeys.yml"
+  browser: "chromium"
+  timeout_s: 30
+  screenshots_dir: "hybrid-verify/screenshots"
 
 memory:
   root: "./memory"
