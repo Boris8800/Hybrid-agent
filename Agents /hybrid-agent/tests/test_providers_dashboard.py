@@ -230,6 +230,20 @@ class TestDashboardAPI(unittest.TestCase):
     def test_queue_ok(self):
         self.assertEqual(self.client.get("/api/queue").status_code, 200)
 
+    def test_new_endpoints(self):
+        mem = self.client.get("/api/memory")
+        self.assertEqual(mem.status_code, 200)
+        for k in ("count", "insights", "records"):
+            self.assertIn(k, mem.get_json())
+        sys = self.client.get("/api/system")
+        self.assertEqual(sys.status_code, 200)
+        self.assertIn("engine_dir", sys.get_json())
+        health = self.client.get("/api/health")
+        self.assertEqual(health.status_code, 200)
+        h = health.get_json()
+        for k in ("local", "online"):
+            self.assertIn(k, h)
+
     def test_auth_required_when_token_set(self):
         self.mod.TOKEN = "sekrit"
         try:

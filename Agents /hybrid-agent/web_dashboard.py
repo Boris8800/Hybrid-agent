@@ -397,6 +397,51 @@ def create_app(root: str = str(ENGINE_DIR.parent), config_path: str | None = Non
     def stats():
         return jsonify(_build_stats(_load_stats()))
 
+    @app.route("/api/memory")
+    def memory():
+        """Recent task-memory records + consolidated insights for the UI."""
+        try:
+            from memory import TaskMemory, memory_root_from_cfg
+            mem = TaskMemory(memory_root_from_cfg(_read_config_dict(),
+                                                  cwd=str(ENGINE_DIR)))
+            records = mem._load()[-20:][::-1]  # most recent first
+            return jsonify({
+                "count": mem.count(),
+                "insights": mem.insights_text(),
+                "records": [{
+                    "task": r.get("task", ""), "verdict": r.get("verdict", ""),
+                    "route": r.get("route", ""), "ts": r.get("ts", 0.0),
+                    "quality": r.get("quality", 0.0),
+                } for r in records],
+            })
+        except Exception as exc:  # noqa: BLE001 - memory is best-effort
+            return jsonify({"count": 0, "insights": "", "records": [],
+                            "error": str(exc)})
+
+    @app.route("/api/system")
+    def system():
+        return jsonify({
+            "engine_dir": str(ENGINE_DIR),
+            "root": app.config["AGENT_ROOT"],
+            "python": sys.version.split()[0],
+            "interpreter": sys.executable,
+            "stats_path": str(STATS_PATH),
+            "config_path": str(CONFIG_PATH),
+            "providers_configured": len(_providers_payload()),
+        })
+
+    @app.route("/api/health")
+    def health():
+        """Local endpoints reachability + online key presence (no online calls)."""
+        cfg = _read_config_dict()
+        local_status = []
+        for p in enabled_local(cfg):
+            ok, models = _ping_local(p)
+            local_status.append({"name": p.name, "ok": ok, "models": models[:6]})
+        online_status = [{"name": p.name, "key": bool(resolve_api_key(p)),
+                          "model": p.model} for p in enabled_online(cfg)]
+        return jsonify({"local": local_status, "online": online_status})
+
     @app.route("/api/config")
     def config():
         text = CONFIG_PATH.read_text(encoding="utf-8") if CONFIG_PATH.is_file() else ""
@@ -474,6 +519,20 @@ def create_app(root: str = str(ENGINE_DIR.parent), config_path: str | None = Non
     app.socketio = socketio
     app.runner = runner
     return app, socketio
+
+
+def _ping_local(p) -> tuple[bool, list]:
+    """Quick reachability probe of a local endpoint's /models. Never raises."""
+    import urllib.request
+    try:
+        req = urllib.request.Request(
+            p.base_url.rstrip("/") + "/models",
+            headers={"Authorization": f"Bearer {p.api_key or 'lm-studio'}"})
+        with urllib.request.urlopen(req, timeout=4) as resp:
+            data = json.loads(resp.read().decode())
+        return True, [m.get("id") for m in data.get("data", [])]
+    except Exception:  # noqa: BLE001
+        return False, []
 
 
 def _provider_objects():

@@ -3,364 +3,483 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Hybrid-Agent Dashboard</title>
+<title>Hybrid-Agent Console</title>
 <script src="https://cdn.socket.io/4.7.5/socket.io.min.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
 <style>
-:root{--bg:#0d1117;--panel:#161b22;--border:#30363d;--text:#c9d1d9;--muted:#8b949e;--accent:#58a6ff;--green:#238636;--green2:#2ea043;--red:#da3633;--yellow:#d29922}
+:root{
+  --bg:#0a0e17; --panel:#101724; --panel2:#0d1320; --border:#1e293b; --border2:#273549;
+  --text:#e6edf7; --muted:#8b98ab; --accent:#6366f1; --accent2:#8b5cf6; --accent3:#22d3ee;
+  --green:#10b981; --amber:#f59e0b; --red:#ef4444; --blue:#3b82f6;
+  --radius:14px; --shadow:0 8px 30px rgba(0,0,0,.35);
+  --mono:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
+}
 *{box-sizing:border-box}
-body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;background:var(--bg);color:var(--text);margin:0;padding:20px}
-.wrap{max-width:1280px;margin:0 auto}
-h1{font-size:22px;margin:0 0 16px}h3{margin:0 0 12px;font-size:15px}
-.card{background:var(--panel);border:1px solid var(--border);border-radius:12px;padding:16px;margin-bottom:16px}
-.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(340px,1fr));gap:16px}
-input,select,textarea{width:100%;padding:8px 10px;background:var(--bg);border:1px solid var(--border);border-radius:6px;color:var(--text);margin:4px 0;font-size:13px}
-button{background:var(--green);color:#fff;border:none;padding:8px 14px;border-radius:6px;cursor:pointer;font-weight:600;font-size:13px}
-button:hover{background:var(--green2)}button.ghost{background:transparent;border:1px solid var(--border);color:var(--text)}
-button.danger{background:var(--red)}button.danger:hover{background:#f85149}button.small{padding:4px 10px;font-size:12px}
-.badge{display:inline-block;padding:2px 8px;border-radius:12px;font-size:11px;font-weight:600}
-.badge.online{background:#1f3a5f;color:#79c0ff}.badge.local{background:#3a2f1f;color:#e3b341}.badge.ok{background:var(--green);color:#fff}.badge.no{background:#3a3a3a;color:#aaa}
+body{margin:0;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,'Helvetica Neue',sans-serif;
+  background:
+    radial-gradient(1200px 500px at 80% -10%, rgba(99,102,241,.14), transparent 60%),
+    radial-gradient(900px 400px at -10% 110%, rgba(34,211,238,.08), transparent 55%),
+    var(--bg);
+  color:var(--text);min-height:100vh}
+.wrap{max-width:1320px;margin:0 auto;padding:0 24px 48px}
+
+/* ---------- header ---------- */
+header{position:sticky;top:0;z-index:50;backdrop-filter:blur(12px);
+  background:rgba(10,14,23,.85);border-bottom:1px solid var(--border);margin-bottom:24px}
+.hd{max-width:1320px;margin:0 auto;padding:14px 24px;display:flex;align-items:center;gap:18px}
+.brand{display:flex;align-items:center;gap:10px;font-size:17px;font-weight:700;
+  background:linear-gradient(90deg,#fff,#a5b4fc);-webkit-background-clip:text;background-clip:text;-webkit-text-fill-color:transparent}
+.brand .logo{width:30px;height:30px;border-radius:8px;display:grid;place-items:center;
+  background:linear-gradient(135deg,var(--accent),var(--accent2));font-size:16px;-webkit-text-fill-color:#fff}
+.hd .spacer{flex:1}
+.pill{display:inline-flex;align-items:center;gap:8px;padding:6px 12px;border-radius:999px;
+  border:1px solid var(--border2);background:var(--panel);font-size:12px;color:var(--muted)}
+.pill .dot{width:8px;height:8px;border-radius:50%;background:var(--muted)}
+.pill.live .dot{background:var(--green);box-shadow:0 0 8px var(--green);animation:pulse 2s infinite}
+@keyframes pulse{50%{opacity:.4}}
+
+/* ---------- tabs ---------- */
+nav.tabs{display:flex;gap:6px;padding:4px;background:var(--panel);border:1px solid var(--border);
+  border-radius:12px;margin-bottom:22px;width:max-content}
+nav.tabs button{border:none;background:transparent;color:var(--muted);font-size:13px;font-weight:600;
+  padding:9px 18px;border-radius:9px;cursor:pointer;transition:.15s;display:flex;gap:7px;align-items:center}
+nav.tabs button:hover{color:var(--text)}
+nav.tabs button.active{background:linear-gradient(135deg,var(--accent),var(--accent2));color:#fff}
+
+/* ---------- cards ---------- */
+.grid{display:grid;gap:16px}
+.g4{grid-template-columns:repeat(auto-fit,minmax(230px,1fr))}
+.g2{grid-template-columns:repeat(auto-fit,minmax(420px,1fr))}
+.card{background:var(--panel);border:1px solid var(--border);border-radius:var(--radius);
+  padding:18px;box-shadow:var(--shadow)}
+.card h3{margin:0 0 12px;font-size:13px;text-transform:uppercase;letter-spacing:.06em;color:var(--muted);
+  display:flex;align-items:center;gap:8px}
+.card h3 .n{color:var(--accent3)}
+.stat{background:var(--panel2);border:1px solid var(--border);border-radius:12px;padding:14px;position:relative;overflow:hidden}
+.stat::after{content:"";position:absolute;inset:0 0 auto 0;height:2px;
+  background:linear-gradient(90deg,var(--accent),var(--accent2),transparent)}
+.stat .v{font-size:26px;font-weight:800;letter-spacing:-.02em}
+.stat .l{color:var(--muted);font-size:12px;margin-top:2px}
+.charts{display:grid;grid-template-columns:repeat(auto-fit,minmax(210px,1fr));gap:16px}
+.chart-box{height:190px}
+
+/* ---------- forms ---------- */
+input,select,textarea{width:100%;padding:9px 12px;background:var(--panel2);border:1px solid var(--border2);
+  border-radius:8px;color:var(--text);font-size:13px;margin:4px 0}
+input:focus,select:focus,textarea:focus{outline:none;border-color:var(--accent)}
+label.chk{display:inline-flex;gap:6px;align-items:center;font-size:12.5px;color:var(--muted);
+  border:1px solid var(--border);border-radius:8px;padding:6px 10px;background:var(--panel2);cursor:pointer}
+label.chk input{width:auto;margin:0}
+label.chk:hover{border-color:var(--border2)}
 .row{display:flex;gap:10px;align-items:center;flex-wrap:wrap}
-.stat{text-align:center}.stat .v{font-size:26px;font-weight:700;color:var(--accent)}.stat .l{color:var(--muted);font-size:12px}
-.log{background:var(--bg);border:1px solid var(--border);border-radius:6px;padding:8px;max-height:340px;overflow-y:auto;font:11px/1.45 ui-monospace,SFMono-Regular,Menlo,monospace;white-space:pre-wrap}
-.log .info{color:#c9d1d9}.log .error{color:#ff7b72}.log .success{color:#3fb950}
-.progress{background:var(--border);border-radius:10px;height:18px;overflow:hidden}
-.progress>div{height:100%;background:linear-gradient(90deg,var(--green),var(--green2));width:0%;transition:width .3s}
-.charts{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:12px}
-.chart-box{height:180px}
-.msg{padding:8px 12px;border-radius:6px;margin-top:8px;display:none;font-size:13px}
-.msg.ok{display:block;background:#0d4420;border:1px solid var(--green)}
-.msg.err{display:block;background:#442020;border:1px solid var(--red)}
-.prov{border:1px solid var(--border);border-radius:8px;padding:10px;margin-bottom:10px}
-.prov .head{display:flex;justify-content:space-between;align-items:center;margin-bottom:6px}
-.keyrow{display:flex;gap:6px;align-items:center}
-#token-input{max-width:220px}
+button{background:linear-gradient(135deg,var(--accent),var(--accent2));color:#fff;border:none;
+  padding:9px 16px;border-radius:9px;cursor:pointer;font-weight:600;font-size:13px;transition:.15s}
+button:hover{filter:brightness(1.15)}
+button.ghost{background:transparent;border:1px solid var(--border2);color:var(--text)}
+button.ghost:hover{border-color:var(--accent)}
+button.danger{background:linear-gradient(135deg,#ef4444,#dc2626)}
+button.small{padding:5px 10px;font-size:12px;border-radius:7px}
+button.green{background:linear-gradient(135deg,#059669,#10b981)}
+
+/* ---------- providers ---------- */
+.prov{border:1px solid var(--border);border-radius:12px;padding:14px;margin-bottom:12px;background:var(--panel2)}
+.prov .head{display:flex;justify-content:space-between;align-items:center;margin-bottom:8px}
+.badge{display:inline-block;padding:3px 9px;border-radius:999px;font-size:11px;font-weight:700;letter-spacing:.03em}
+.badge.online{background:rgba(59,130,246,.16);color:#93c5fd}
+.badge.local{background:rgba(245,158,11,.14);color:#fcd34d}
+.badge.ok{background:rgba(16,185,129,.15);color:#6ee7b7}
+.badge.no{background:rgba(148,163,184,.12);color:#94a3b8}
+.badge.err{background:rgba(239,68,68,.15);color:#fca5a5}
+.keyrow input{flex:1;min-width:160px}
+
+/* ---------- logs / queue ---------- */
+.log{background:var(--panel2);border:1px solid var(--border);border-radius:10px;padding:10px;
+  max-height:380px;overflow-y:auto;font:11.5px/1.55 var(--mono);white-space:pre-wrap}
+.log .error{color:#f87171}.log .success{color:#34d399}.log .info{color:#cbd5e1}
+.log::-webkit-scrollbar,.q::-webkit-scrollbar{width:8px}
+.log::-webkit-scrollbar-thumb{background:var(--border2);border-radius:4px}
+.progress{background:var(--border);border-radius:99px;height:16px;overflow:hidden}
+.progress>div{height:100%;width:0%;border-radius:99px;transition:width .35s;
+  background:linear-gradient(90deg,var(--accent),var(--accent2),var(--accent3));background-size:200% 100%;animation:slide 3s linear infinite}
+@keyframes slide{to{background-position:-200% 0}}
+.q{font-size:12px;color:var(--muted);max-height:150px;overflow-y:auto}
+.q .cur{color:var(--accent3)}
+.hist{width:100%;border-collapse:collapse;font-size:12px}
+.hist th{color:var(--muted);text-align:left;padding:6px 8px;border-bottom:1px solid var(--border);font-weight:600}
+.hist td{padding:6px 8px;border-bottom:1px solid var(--border);vertical-align:top}
+.hist .s{font-weight:600}
+.s.passed{color:var(--green)}.s.failed{color:var(--red)}
+.mem-item{font-size:12px;padding:7px 0;border-bottom:1px dashed var(--border);display:flex;gap:8px;align-items:baseline}
+.mem-item .task{color:var(--text)}.mem-item .v{font-size:10px;font-weight:700;padding:1px 7px;border-radius:99px}
+.v.approved{background:rgba(16,185,129,.15);color:#6ee7b7}
+.v.fix_required{background:rgba(245,158,11,.15);color:#fcd34d}
+.v.rejected{background:rgba(239,68,68,.15);color:#fca5a5}
+.msg{display:none;padding:10px 14px;border-radius:10px;font-size:13px;margin-top:10px}
+.msg.ok{display:block;background:rgba(16,185,129,.1);border:1px solid rgba(16,185,129,.4)}
+.msg.err{display:block;background:rgba(239,68,68,.1);border:1px solid rgba(239,68,68,.4)}
+.msg.info{display:block;background:rgba(59,130,246,.1);border:1px solid rgba(59,130,246,.4)}
+.tab-panel{display:none}.tab-panel.active{display:block;animation:fade .25s}
+@keyframes fade{from{opacity:0;transform:translateY(4px)}}
+.health-item{display:flex;gap:10px;align-items:center;padding:8px 0;border-bottom:1px dashed var(--border);font-size:13px}
+h4.sub{font-size:13px;margin:20px 0 10px;color:var(--muted);text-transform:uppercase;letter-spacing:.05em}
+@media (max-width:860px){.g2{grid-template-columns:1fr}.hd{flex-wrap:wrap}}
 </style>
 </head>
 <body>
 <div class="wrap">
-<h1>🤖 Hybrid-Agent Dashboard</h1>
 
-<div class="card">
-  <h3>🔑 Providers &amp; API keys <span style="color:var(--muted);font-weight:400;font-size:12px">(2 online + 2 local · keys stored in Keychain, never exposed)</span></h3>
-  <div class="row" style="margin-bottom:10px">
-    <input id="token-input" placeholder="DASHBOARD_TOKEN (optional)" style="max-width:260px">
-    <button class="ghost small" onclick="saveToken()">Save token</button>
-    <span id="token-hint" style="color:var(--muted);font-size:12px"></span>
+<header>
+  <div class="hd">
+    <div class="brand"><span class="logo">🤖</span> Hybrid-Agent Console</div>
+    <span class="pill" id="sock"><span class="dot"></span><span id="sock-txt">connecting</span></span>
+    <span class="pill" id="phase-pill"><span class="dot"></span><span id="phase-hdr">Idle</span></span>
+    <div class="spacer"></div>
+    <button class="ghost small" onclick="location.reload()">↻</button>
   </div>
-  <div id="providers"></div>
-</div>
+</header>
 
-<div class="grid">
-  <div class="card">
-    <h3>📊 Stats</h3>
-    <div class="grid" style="grid-template-columns:1fr 1fr">
-      <div class="stat"><div class="v" id="s-tasks">0</div><div class="l">Tasks completed</div></div>
-      <div class="stat"><div class="v" id="s-success">0%</div><div class="l">Approval rate</div></div>
-      <div class="stat"><div class="v" id="s-cost">$0</div><div class="l">Verify cost est.</div></div>
-      <div class="stat"><div class="v" id="s-cache">0%</div><div class="l">Cache hit rate</div></div>
-      <div class="stat"><div class="v" id="s-files">0</div><div class="l">Files generated</div></div>
-      <div class="stat"><div class="v" id="s-trunc">0</div><div class="l">Truncations</div></div>
-    </div>
-    <div class="charts" style="margin-top:12px">
-      <div><h3 style="font-size:13px">Phase timing (s)</h3><canvas class="chart-box" id="c-phases"></canvas></div>
-      <div><h3 style="font-size:13px">Cache</h3><canvas class="chart-box" id="c-cache"></canvas></div>
-      <div><h3 style="font-size:13px">API tokens / day</h3><canvas class="chart-box" id="c-tokens"></canvas></div>
-      <div><h3 style="font-size:13px">Reviews</h3><canvas class="chart-box" id="c-reviews"></canvas></div>
+<nav class="tabs">
+  <button data-tab="dash" class="active" onclick="go('dash')">📊 Dashboard</button>
+  <button data-tab="tasks" onclick="go('tasks')">🚀 Tasks &amp; Logs</button>
+  <button data-tab="settings" onclick="go('settings')">⚙️ Settings</button>
+</nav>
+
+<!-- ===================== DASHBOARD ===================== -->
+<section id="tab-dash" class="tab-panel active">
+  <div class="grid g4" style="margin-bottom:16px">
+    <div class="stat"><div class="v" id="s-tasks">0</div><div class="l">Tasks completed</div></div>
+    <div class="stat"><div class="v" id="s-success">0%</div><div class="l">Approval rate</div></div>
+    <div class="stat"><div class="v" id="s-cost">$0</div><div class="l">Verify cost (est.)</div></div>
+    <div class="stat"><div class="v" id="s-cache">0%</div><div class="l">Cache hit rate</div></div>
+    <div class="stat"><div class="v" id="s-files">0</div><div class="l">Files generated</div></div>
+    <div class="stat"><div class="v" id="s-reviews">0</div><div class="l">DeepSeek reviews</div></div>
+    <div class="stat"><div class="v" id="s-fallback">0</div><div class="l">Fallbacks</div></div>
+    <div class="stat"><div class="v" id="s-trunc">0</div><div class="l">Truncations</div></div>
+  </div>
+
+  <div class="card" style="margin-bottom:16px">
+    <h3><span class="n">◆</span> Analytics</h3>
+    <div class="charts">
+      <div><h4 class="sub">Phase timing (s)</h4><canvas class="chart-box" id="c-phases"></canvas></div>
+      <div><h4 class="sub">Cache</h4><canvas class="chart-box" id="c-cache"></canvas></div>
+      <div><h4 class="sub">API tokens / day</h4><canvas class="chart-box" id="c-tokens"></canvas></div>
+      <div><h4 class="sub">Review outcomes</h4><canvas class="chart-box" id="c-reviews"></canvas></div>
     </div>
   </div>
 
-  <div>
+  <div class="grid g2">
     <div class="card">
-      <h3>📝 Submit task</h3>
-      <textarea id="task" rows="3" placeholder="Describe the coding task…"></textarea>
+      <h3><span class="n">◆</span> Task memory &amp; insights</h3>
+      <div id="memory-insights" style="font-size:12px;color:var(--muted);white-space:pre-wrap;margin-bottom:10px">loading…</div>
+      <div id="memory-list" style="max-height:300px;overflow-y:auto"></div>
+    </div>
+    <div class="card">
+      <h3><span class="n">◆</span> Recent runs</h3>
+      <table class="hist"><thead><tr><th>id</th><th>task</th><th>status</th><th>time</th></tr></thead>
+        <tbody id="hist-body"><tr><td colspan="4" style="color:var(--muted)">no runs yet</td></tr></tbody></table>
+      <h4 class="sub">Verification metrics</h4>
+      <div id="verify-metrics" style="font-size:12px;color:var(--muted)">loading…</div>
+    </div>
+  </div>
+</section>
+
+<!-- ===================== TASKS ===================== -->
+<section id="tab-tasks" class="tab-panel">
+  <div class="grid g2">
+    <div class="card">
+      <h3><span class="n">▶</span> Submit task</h3>
+      <textarea id="task" rows="3" placeholder="Describe the coding task…" spellcheck="false"></textarea>
       <div class="row">
-        <select id="mode"><option value="hybrid">Hybrid</option><option value="local">Local</option><option value="code">Code (API)</option></select>
-        <select id="online-prov"><option value="">Online: default</option></select>
-        <select id="local-prov"><option value="">Local: default</option></select>
-      </div>
-      <div class="row">
-        <label><input type="checkbox" id="f-enhance"> enhance</label>
-        <label><input type="checkbox" id="f-verify" checked> verify</label>
-        <label><input type="checkbox" id="f-regression"> regression</label>
-        <label><input type="checkbox" id="f-apply"> apply</label>
-        <label><input type="checkbox" id="f-parallel"> parallel</label>
-        <label><input type="checkbox" id="f-cot"> cot</label>
-        <label><input type="checkbox" id="f-turbo"> <b>turbo</b> (multi-AI)</label>
-        <label><input type="checkbox" id="f-scan"> context-scan</label>
+        <select id="mode" style="max-width:150px"><option value="hybrid">Hybrid</option><option value="local">Local</option><option value="code">Code</option></select>
+        <select id="online-prov" style="max-width:170px"><option value="">Online: default</option></select>
+        <select id="local-prov" style="max-width:170px"><option value="">Local: default</option></select>
+        <input id="max-iter" type="number" value="3" min="1" max="10" style="max-width:70px" title="max iterations">
       </div>
       <div class="row" style="margin-top:8px">
-        <input id="max-iter" type="number" value="3" min="1" max="10" style="max-width:90px" title="max iterations">
-        <button onclick="submitTask()">▶ Run task</button>
+        <label class="chk"><input type="checkbox" id="f-enhance"> enhance</label>
+        <label class="chk"><input type="checkbox" id="f-verify" checked> verify</label>
+        <label class="chk"><input type="checkbox" id="f-regression"> regression</label>
+        <label class="chk"><input type="checkbox" id="f-apply"> apply</label>
+        <label class="chk"><input type="checkbox" id="f-parallel"> parallel</label>
+        <label class="chk"><input type="checkbox" id="f-cot"> cot</label>
+        <label class="chk"><input type="checkbox" id="f-turbo"><b>turbo</b></label>
+        <label class="chk"><input type="checkbox" id="f-scan"> context-scan</label>
+      </div>
+      <div class="row" style="margin-top:12px">
+        <button class="green" onclick="submitTask()">▶ Run task</button>
+        <button class="ghost small" onclick="cancelTask()">■ Cancel current</button>
       </div>
       <div id="task-msg" class="msg"></div>
+      <h4 class="sub">Queue</h4>
+      <div class="q" id="queue">Idle</div>
     </div>
 
     <div class="card">
-      <h3>📈 Progress</h3>
+      <h3><span class="n">◉</span> Progress</h3>
       <div class="progress"><div id="progress-fill"></div></div>
-      <div class="row" style="justify-content:space-between;margin-top:6px">
-        <span id="phase" style="color:var(--muted)">Idle</span><span id="pct">0%</span>
+      <div class="row" style="justify-content:space-between;margin-top:8px">
+        <span id="phase" style="color:var(--muted)">Idle</span><b id="pct">0%</b>
       </div>
-      <h3 style="margin-top:12px">📋 Queue <button class="ghost small danger" onclick="cancelTask()">Cancel current</button></h3>
-      <div id="queue" style="font-size:12px;color:var(--muted)">Idle</div>
+      <h4 class="sub">Diff (hybrid-verify/fixes.diff)</h4>
+      <div class="log" id="diff" style="max-height:170px"></div>
     </div>
-  </div>
-</div>
-
-<div class="grid">
-  <div class="card">
-    <h3>📜 Live logs <button class="ghost small" style="float:right" onclick="downloadLogs()">Download</button></h3>
-    <div class="row" style="margin-bottom:6px">
-      <button class="ghost small" onclick="setFilter('all')">All</button>
-      <button class="ghost small" onclick="setFilter('info')">Info</button>
-      <button class="ghost small" onclick="setFilter('error')">Errors</button>
-      <button class="ghost small" onclick="setFilter('success')">Success</button>
-    </div>
-    <div class="log" id="logs"></div>
   </div>
 
-  <div class="card">
-    <h3>🔧 Config <button class="ghost small" style="float:right" onclick="loadConfig()">Reload</button></h3>
-    <textarea id="config" rows="14" spellcheck="false"></textarea>
-    <div class="row" style="margin-top:6px">
-      <button onclick="saveConfig()">Save config (validated)</button>
-      <span id="config-msg" style="color:var(--muted);font-size:12px"></span>
-    </div>
-    <h3 style="margin-top:12px">📄 Fix diff (hybrid-verify/fixes.diff)</h3>
-    <div class="log" id="diff" style="max-height:180px"></div>
+  <div class="card" style="margin-top:16px">
+    <h3><span class="n">■</span> Live logs
+      <span style="margin-left:auto;display:inline-flex;gap:6px">
+        <button class="ghost small" onclick="setFilter('all')">All</button>
+        <button class="ghost small" onclick="setFilter('info')">Info</button>
+        <button class="ghost small" onclick="setFilter('error')">Errors</button>
+        <button class="ghost small" onclick="setFilter('success')">Success</button>
+        <button class="small" onclick="downloadLogs()">Download</button>
+      </span>
+    </h3>
+    <div class="log" id="logs" style="max-height:420px"></div>
   </div>
-</div>
+</section>
+
+<!-- ===================== SETTINGS ===================== -->
+<section id="tab-settings" class="tab-panel">
+  <h4 class="sub" style="margin-top:0">🔑 API options &amp; providers</h4>
+  <div id="providers"></div>
+
+  <div class="grid g2" style="margin-top:16px">
+    <div class="card">
+      <h3><span class="n">❤</span> System health</h3>
+      <div id="health"></div>
+      <h4 class="sub">System</h4>
+      <div id="sysinfo" style="font-size:12px;color:var(--muted)">loading…</div>
+    </div>
+    <div class="card">
+      <h3><span class="n">§</span> Access &amp; config</h3>
+      <div class="row">
+        <input id="token-input" placeholder="DASHBOARD_TOKEN (optional)" style="max-width:280px">
+        <button class="ghost small" onclick="saveToken()">Save token</button>
+        <span id="token-hint" style="color:var(--muted);font-size:12px"></span>
+      </div>
+      <h4 class="sub">config.yml <button class="ghost small" style="float:right" onclick="loadConfig()">Reload</button></h4>
+      <textarea id="config" rows="12" spellcheck="false"></textarea>
+      <div class="row" style="margin-top:8px">
+        <button onclick="saveConfig()">Save config (validated)</button>
+        <span id="config-msg" style="color:var(--muted);font-size:12px"></span>
+      </div>
+    </div>
+  </div>
+</section>
+
 </div>
 
 <script>
-let charts = {};
 let token = localStorage.getItem('token') || '';
 let filter = 'all';
-
-function headers(extra) {
-  const h = Object.assign({'Content-Type': 'application/json'}, extra || {});
-  if (token) h['Authorization'] = 'Bearer ' + token;
-  return h;
-}
-function saveToken() {
-  token = document.getElementById('token-input').value.trim();
-  localStorage.setItem('token', token);
-  document.getElementById('token-hint').textContent = token ? 'token saved' : '';
-  location.reload();
-}
-
-// ---- Socket ----
+const charts = {};
 const socket = io({query: token ? {token} : {}});
-socket.on('connect', () => document.getElementById('token-hint').textContent = 'live');
-socket.on('log', d => { addLog(d.type, d.message); });
-socket.on('progress', d => {
-  document.getElementById('progress-fill').style.width = d.percent + '%';
-  document.getElementById('phase').textContent = d.phase + ' (' + d.elapsed + 's)';
-  document.getElementById('pct').textContent = d.percent + '%';
-});
-socket.on('queue', renderQueue);
-socket.on('done', () => {
-  document.getElementById('phase').textContent = 'Done';
-  setTimeout(() => { document.getElementById('phase').textContent = 'Idle'; }, 4000);
-});
 
-function addLog(type, msg) {
-  const el = document.createElement('div');
-  el.className = type; el.textContent = msg;
-  const box = document.getElementById('logs');
-  box.appendChild(el); box.scrollTop = box.scrollHeight;
-  if (box.children.length > 800) box.firstChild.remove();
+function headers(extra){return Object.assign({'Content-Type':'application/json'}, extra||{})}
+function $id(id){return document.getElementById(id)}
+function go(tab){
+  document.querySelectorAll('.tabs button').forEach(b=>b.classList.toggle('active', b.dataset.tab===tab));
+  document.querySelectorAll('.tab-panel').forEach(p=>p.classList.toggle('active', p.id==='tab-'+tab));
 }
-function setFilter(f) {
-  filter = f;
-  const box = document.getElementById('logs');
-  [...box.children].forEach(c => {
-    c.style.display = (filter === 'all' || c.className === filter) ? '' : 'none';
-  });
-}
+function showMsg(el,text,kind){const e=$id(el);e.textContent=text;e.className='msg '+(kind||'info');return e}
 
-// ---- Providers ----
-function loadProviders() {
-  fetch('/api/providers', {headers: headers()}).then(r => r.json()).then(renderProviders);
+// ---------- socket ----------
+socket.on('connect',()=>{$id('sock').classList.add('live');$id('sock-txt').textContent='live'});
+socket.on('disconnect',()=>{$id('sock').classList.remove('live');$id('sock-txt').textContent='reconnecting'});
+socket.on('log',d=>addLog(d.type,d.message));
+socket.on('progress',d=>{
+  $id('progress-fill').style.width=d.percent+'%';
+  $id('phase').textContent=d.phase+' ('+d.elapsed+'s)';
+  $id('phase-hdr').textContent=d.phase+' '+d.percent+'%';
+  $id('pct').textContent=d.percent+'%';
+});
+socket.on('queue',renderQueue);
+socket.on('done',()=>{$id('phase').textContent='Done';$id('phase-hdr').textContent='Done';setTimeout(()=>{$id('phase').textContent='Idle';$id('phase-hdr').textContent='Idle'},4000)});
+
+function addLog(type,msg){
+  const el=document.createElement('div');el.className=type;el.textContent=msg;
+  const box=$id('logs');box.appendChild(el);box.scrollTop=box.scrollHeight;
+  if(box.children.length>900)box.firstChild.remove();
 }
-function renderProviders(list) {
-  const wrap = document.getElementById('providers');
-  const online = list.filter(p => p.kind === 'online');
-  const local = list.filter(p => p.kind === 'local');
-  wrap.innerHTML = '';
-  const both = [...online, ...local];
-  both.forEach(p => {
-    const d = document.createElement('div');
-    d.className = 'prov';
-    d.innerHTML = `
+function setFilter(f){filter=f;[...$id('logs').children].forEach(c=>c.style.display=(f==='all'||c.className===f)?'':'none')}
+
+// ---------- providers (Settings) ----------
+function loadProviders(){fetch('/api/providers',{headers:headers()}).then(r=>r.json()).then(renderProviders)}
+function renderProviders(list){
+  const wrap=$id('providers');wrap.innerHTML='';
+  const byKind=k=>list.filter(p=>p.kind===k);
+  [...byKind('online'),...byKind('local')].forEach(p=>{
+    const d=document.createElement('div');d.className='prov';
+    d.innerHTML=`
       <div class="head">
-        <div><span class="badge ${p.kind}">${p.kind}</span> <b>${p.name}</b>
-          <span class="badge ${p.has_key ? 'ok' : 'no'}" id="key-${p.name}">${p.has_key ? 'key ✓ ' + p.key_masked : 'no key'}</span></div>
-        <label style="font-size:12px"><input type="checkbox" id="en-${p.name}" ${p.enabled ? 'checked' : ''} onchange="saveProvider('${p.name}', {enabled: this.checked})"> enabled</label>
+        <div style="display:flex;gap:8px;align-items:center">
+          <span class="badge ${p.kind}">${p.kind}</span><b>${p.name}</b>
+          <span class="badge ${p.has_key?'ok':'no'}" id="key-${p.name}">${p.has_key?'key ✓ '+p.key_masked:'no key'}</span>
+        </div>
+        <label class="chk" style="padding:4px 8px"><input type="checkbox" id="en-${p.name}" ${p.enabled?'checked':''} onchange="saveProvider('${p.name}',{enabled:this.checked})"> enabled</label>
       </div>
       <div class="row">
         <input id="url-${p.name}" value="${p.base_url}" placeholder="base URL" style="flex:2">
         <input id="model-${p.name}" value="${p.model}" placeholder="model" style="flex:2">
       </div>
       <div class="row">
-        <input id="k-${p.name}" type="password" placeholder="API key (leave empty to keep)" style="flex:2">
-        <button class="small" onclick="saveProvider('${p.name}', {key: document.getElementById('k-${p.name}').value})">Save key</button>
-        <button class="small ghost" onclick="saveProvider('${p.name}', {url: document.getElementById('url-${p.name}').value, model: document.getElementById('model-${p.name}').value})">Update endpoint</button>
+        <input id="k-${p.name}" type="password" placeholder="API key (empty = keep current)" style="flex:2">
+        <button class="small" onclick="saveProvider('${p.name}',{key:$id('k-${p.name}').value})">Save key</button>
+        <button class="small ghost" onclick="saveProvider('${p.name}',{url:$id('url-${p.name}').value,model:$id('model-${p.name}').value})">Update endpoint</button>
         <button class="small ghost" onclick="testProvider('${p.name}')">Test</button>
         <button class="small ghost danger" onclick="deleteKey('${p.name}')">Clear key</button>
-        ${p.kind === 'local' ? `<button class="small ghost" onclick="loadModels('${p.name}')">Load models</button>` : ''}
-      </div>
-    `;
+        ${p.kind==='local'?`<button class="small ghost" onclick="loadModels('${p.name}')">Models</button>`:''}
+      </div>`;
     wrap.appendChild(d);
   });
-  // populate task selects
-  const op = document.getElementById('online-prov');
-  const lp = document.getElementById('local-prov');
-  op.innerHTML = '<option value="">Online: default</option>';
-  lp.innerHTML = '<option value="">Local: default</option>';
-  online.forEach(p => { const o = new Option(p.name, p.name); op.appendChild(o); });
-  local.forEach(p => { const o = new Option(p.name, p.name); lp.appendChild(o); });
+  const op=$id('online-prov'),lp=$id('local-prov');
+  op.innerHTML='<option value="">Online: default</option>';lp.innerHTML='<option value="">Local: default</option>';
+  byKind('online').forEach(p=>op.appendChild(new Option(p.name,p.name)));
+  byKind('local').forEach(p=>lp.appendChild(new Option(p.name,p.name)));
 }
-function saveProvider(name, body) {
-  fetch('/api/providers', {method: 'POST', headers: headers(), body: JSON.stringify(Object.assign({name}, body))})
-    .then(r => r.json()).then(() => {
-      if (body.key) {
-        showMsg('api-msg', `key saved for ${name}`, 'ok');
-        loadProviders();
-      }
+function saveProvider(name,body){
+  fetch('/api/providers',{method:'POST',headers:headers(),body:JSON.stringify(Object.assign({name},body))})
+    .then(r=>r.json()).then(()=>{if(body.key)showMsg('task-msg','key saved for '+name,'ok');loadProviders()});
+}
+function testProvider(name){
+  const key=$id('k-'+name).value||undefined;
+  showMsg('task-msg','testing '+name+'…','info');
+  fetch('/api/providers/test',{method:'POST',headers:headers(),body:JSON.stringify({name,api_key:key})})
+    .then(r=>r.json()).then(d=>showMsg('task-msg',d.ok?`✅ ${name}: ${d.message} (${d.latency_ms}ms)`:`❌ ${name}: ${d.error}`,d.ok?'ok':'err'));
+}
+function deleteKey(name){
+  fetch('/api/providers/delete-key',{method:'POST',headers:headers(),body:JSON.stringify({name})}).then(r=>r.json()).then(loadProviders);
+}
+function loadModels(name){
+  const key=$id('k-'+name).value||undefined;
+  fetch('/api/providers/test',{method:'POST',headers:headers(),body:JSON.stringify({name,api_key:key})})
+    .then(r=>r.json()).then(d=>{
+      if(d.ok&&d.models){$id('model-'+name).value=d.models[0];showMsg('task-msg','models: '+d.models.join(', '),'ok')}
+      else showMsg('task-msg','could not list models: '+(d.error||'endpoint down'),'err');
     });
-}
-function testProvider(name) {
-  const key = document.getElementById('k-' + name).value || undefined;
-  const msg = showMsg('api-msg', `testing ${name}…`);
-  fetch('/api/providers/test', {method: 'POST', headers: headers(), body: JSON.stringify({name, api_key: key})})
-    .then(r => r.json()).then(d => {
-      showMsg('api-msg', d.ok ? `✅ ${name}: ${d.message} (${d.latency_ms}ms)` : `❌ ${name}: ${d.error}`, d.ok ? 'ok' : 'err');
-    });
-}
-function deleteKey(name) {
-  fetch('/api/providers/delete-key', {method: 'POST', headers: headers(), body: JSON.stringify({name})})
-    .then(r => r.json()).then(loadProviders);
-}
-function loadModels(name) {
-  const url = document.getElementById('url-' + name).value;
-  fetch('/api/providers/test', {method: 'POST', headers: headers(), body: JSON.stringify({name})})
-    .then(r => r.json()).then(d => {
-      if (d.ok && d.models) {
-        document.getElementById('model-' + name).value = d.models[0];
-        showMsg('api-msg', `models on ${name}: ${d.models.join(', ')}`, 'ok');
-      } else showMsg('api-msg', 'could not list models: ' + (d.error || 'endpoint down'), 'err');
-    });
-}
-function showMsg(id, text, kind) {
-  const el = document.getElementById('task-msg');
-  el.textContent = text; el.className = 'msg ' + kind;
-  return el;
 }
 
-// ---- Task submission ----
-function submitTask() {
-  const task = document.getElementById('task').value.trim();
-  if (!task) return showMsg('task-msg', 'task text required', 'err');
-  const body = {
-    task, mode: document.getElementById('mode').value,
-    online_provider: document.getElementById('online-prov').value,
-    local_provider: document.getElementById('local-prov').value,
-    enhance: document.getElementById('f-enhance').checked,
-    verify: document.getElementById('f-verify').checked,
-    regression: document.getElementById('f-regression').checked,
-    apply: document.getElementById('f-apply').checked,
-    parallel: document.getElementById('f-parallel').checked,
-    cot: document.getElementById('f-cot').checked,
-    turbo: document.getElementById('f-turbo').checked,
-    context_scan: document.getElementById('f-scan').checked,
-    max_iterations: parseInt(document.getElementById('max-iter').value || '3', 10),
-  };
-  fetch('/api/task', {method: 'POST', headers: headers(), body: JSON.stringify(body)})
-    .then(r => r.json()).then(d => {
-      showMsg('task-msg', d.status === 'ok' ? '🚀 task queued: ' + d.id : '❌ ' + d.error, d.status === 'ok' ? 'ok' : 'err');
-      if (d.status === 'ok') document.getElementById('logs').innerHTML = '';
+// ---------- tasks ----------
+function submitTask(){
+  const task=$id('task').value.trim();
+  if(!task)return showMsg('task-msg','task text required','err');
+  const body={
+    task,mode:$id('mode').value,online_provider:$id('online-prov').value,local_provider:$id('local-prov').value,
+    enhance:$id('f-enhance').checked,verify:$id('f-verify').checked,regression:$id('f-regression').checked,
+    apply:$id('f-apply').checked,parallel:$id('f-parallel').checked,cot:$id('f-cot').checked,
+    turbo:$id('f-turbo').checked,context_scan:$id('f-scan').checked,
+    max_iterations:parseInt($id('max-iter').value||'3',10)};
+  fetch('/api/task',{method:'POST',headers:headers(),body:JSON.stringify(body)})
+    .then(r=>r.json()).then(d=>{
+      showMsg('task-msg',d.status==='ok'?'🚀 task queued: '+d.id:'❌ '+d.error,d.status==='ok'?'ok':'err');
+      if(d.status==='ok'){$id('logs').innerHTML='';loadQueue()}
     });
 }
-function cancelTask() {
-  fetch('/api/cancel', {method: 'POST', headers: headers()}).then(r => r.json());
+function cancelTask(){fetch('/api/cancel',{method:'POST',headers:headers()}).then(r=>r.json())}
+function renderQueue(st){
+  const el=$id('queue');const parts=[];
+  if(st.current)parts.push('<div class="cur">▶ '+st.current.id+': '+(st.current.task||'').slice(0,70)+'</div>');
+  st.queued.forEach(q=>parts.push('⏳ '+q.id+': '+q.task));
+  el.innerHTML=parts.length?parts.join('<br>')+'<div style="margin-top:6px">history: '+st.history.map(h=>h.id+' <span class="'+(h.status||'').split('(')[0]+'">'+(h.status||'')+'</span>').join(' · ')+'</div>':'Idle';
 }
-function renderQueue(st) {
-  const el = document.getElementById('queue');
-  const parts = [];
-  if (st.current) parts.push('▶ ' + st.current.id + ': ' + (st.current.task || '').slice(0, 60));
-  st.queued.forEach(q => parts.push('⏳ ' + q.id + ': ' + q.task));
-  if (st.history.length) parts.push('history: ' + st.history.map(h => h.id + ' ' + (h.status || '')).join(' · '));
-  el.textContent = parts.length ? parts.join('\n') : 'Idle';
+function loadQueue(){fetch('/api/queue',{headers:headers()}).then(r=>r.json()).then(renderQueue)}
+function loadHistory(){fetch('/api/queue',{headers:headers()}).then(r=>r.json()).then(st=>{
+  const tb=$id('hist-body');
+  if(!st.history.length){tb.innerHTML='<tr><td colspan="4" style="color:var(--muted)">no runs yet</td></tr>';return}
+  tb.innerHTML=st.history.slice().reverse().map(h=>`<tr><td>${h.id}</td><td>${(h.task||'').slice(0,44)}</td>
+    <td class="s ${(h.status||'').includes('passed')?'passed':(h.status||'').includes('failed')?'failed':''}">${h.status||''}</td>
+    <td>${h.finished||''}</td></tr>`).join('');
+})}
+
+// ---------- stats ----------
+function loadStats(){
+  fetch('/api/stats',{headers:headers()}).then(r=>r.json()).then(s=>{
+    $id('s-tasks').textContent=s.tasks_completed;
+    $id('s-success').textContent=Math.round(s.success_rate*100)+'%';
+    $id('s-cost').textContent='$'+s.verify.estimated_cost_usd.toFixed(4);
+    $id('s-cache').textContent=Math.round(s.cache.rate*100)+'%';
+    $id('s-files').textContent=s.files_generated;
+    $id('s-reviews').textContent=s.deepseek_reviews;
+    $id('s-fallback').textContent=s.deepseek_fallbacks;
+    $id('s-trunc').textContent=s.truncation_events;
+    $id('verify-metrics').textContent=
+      `runs: ${s.verify.runs} · passed: ${s.verify.passed} · failed: ${s.verify.failed} · `+
+      `API calls: ${s.verify.api_calls} · tokens: ${s.verify.tokens_used} · avg quality: ${s.avg_quality}`;
+    chart('c-phases','pie',Object.keys(s.phase_timings),Object.values(s.phase_timings).map(v=>v.total_s),['#6366f1','#8b5cf6','#22d3ee','#f59e0b']);
+    chart('c-cache','doughnut',['hits','misses'],[s.cache.hits,s.cache.misses],['#10b981','#475569']);
+    chart('c-tokens','bar',s.api_tokens.map(d=>d.day),s.api_tokens.map(d=>d.tokens),'#22d3ee');
+    chart('c-reviews','doughnut',['approved','fix required','rejected'],[s.approvals,s.fix_required,s.rejections],['#10b981','#f59e0b','#ef4444']);
+  });
+}
+function chart(id,type,labels,data,color){
+  const ctx=$id(id);if(!ctx)return;
+  if(charts[id])charts[id].destroy();
+  charts[id]=new Chart(ctx,{type,data:{labels,datasets:[{data,backgroundColor:Array.isArray(color)?color:color,
+    borderColor:'#0a0e17',borderWidth:2}]},options:{responsive:true,maintainAspectRatio:false,
+    plugins:{legend:{position:'bottom',labels:{color:'#8b98ab',boxWidth:10,font:{size:10}}}},
+    scales:type==='bar'?{x:{ticks:{color:'#8b98ab',font:{size:9}},grid:{display:false}},
+      y:{ticks:{color:'#8b98ab',font:{size:9}},grid:{color:'#1e293b'}}}:{}}});
 }
 
-// ---- Stats & charts ----
-let chartDefs = {};
-function loadStats() {
-  fetch('/api/stats', {headers: headers()}).then(r => r.json()).then(renderStats);
-}
-function renderStats(s) {
-  document.getElementById('s-tasks').textContent = s.tasks_completed;
-  document.getElementById('s-success').textContent = Math.round(s.success_rate * 100) + '%';
-  document.getElementById('s-cost').textContent = '$' + s.verify.estimated_cost_usd.toFixed(4);
-  document.getElementById('s-cache').textContent = Math.round(s.cache.rate * 100) + '%';
-  document.getElementById('s-files').textContent = s.files_generated;
-  document.getElementById('s-trunc').textContent = s.truncation_events;
-  chart('c-phases', 'pie',
-    Object.keys(s.phase_timings), Object.values(s.phase_timings).map(v => v.total_s),
-    ['#58a6ff', '#2ea043', '#d29922', '#f85149']);
-  chart('c-cache', 'doughnut', ['hits', 'misses'], [s.cache.hits, s.cache.misses], ['#2ea043', '#8b949e']);
-  chart('c-tokens', 'bar', s.api_tokens.map(d => d.day), s.api_tokens.map(d => d.tokens), '#58a6ff');
-  chart('c-reviews', 'doughnut', ['approved', 'fix required', 'rejected'],
-    [s.approvals, s.fix_required, s.rejections], ['#2ea043', '#d29922', '#f85149']);
-}
-function chart(id, type, labels, data, color) {
-  const ctx = document.getElementById(id);
-  if (!ctx) return;
-  if (chartDefs[id]) chartDefs[id].destroy();
-  chartDefs[id] = new Chart(ctx, {
-    type,
-    data: {labels, datasets: [{data, backgroundColor: Array.isArray(color) ? color : color}]},
-    options: {responsive: true, maintainAspectRatio: false,
-      plugins: {legend: {position: 'bottom', labels: {color: '#8b949e', boxWidth: 10, font: {size: 10}}}}},
+// ---------- memory ----------
+function loadMemory(){
+  fetch('/api/memory',{headers:headers()}).then(r=>r.json()).then(d=>{
+    $id('memory-insights').textContent=d.insights||'(not enough history yet — consolidation needs ≥10 tasks)';
+    const list=$id('memory-list');
+    if(!d.records.length){list.innerHTML='<div style="color:var(--muted);font-size:12px">no memory yet</div>';return}
+    list.innerHTML=d.records.map(r=>`<div class="mem-item">
+      <span class="v ${String(r.verdict).toLowerCase()}">${r.verdict}</span>
+      <span class="task">${r.task.slice(0,70)}</span>
+      <span style="margin-left:auto;color:var(--muted)">${r.route} · ${new Date(r.ts*1000).toLocaleString()}</span>
+    </div>`).join('');
   });
 }
 
-// ---- Config ----
-function loadConfig() {
-  fetch('/api/config', {headers: headers()}).then(r => r.json()).then(d => {
-    document.getElementById('config').value = d.text;
+// ---------- health / system ----------
+function loadHealth(){
+  fetch('/api/health',{headers:headers()}).then(r=>r.json()).then(d=>{
+    const h=$id('health');let html='';
+    d.local.forEach(p=>html+=`<div class="health-item">
+      <span class="badge ${p.ok?'ok':'err'}">${p.ok?'● reachable':'○ down'}</span>
+      <b>${p.name}</b><span style="color:var(--muted)">${p.models.length?p.models.join(', '):p.ok?'(no models)':'—'}</span></div>`);
+    d.online.forEach(p=>html+=`<div class="health-item">
+      <span class="badge ${p.key?'ok':'no'}">${p.key?'● key set':'○ no key'}</span>
+      <b>${p.name}</b><span style="color:var(--muted)">${p.model}</span></div>`);
+    h.innerHTML=html||'<div style="color:var(--muted)">no providers enabled</div>';
   });
 }
-function saveConfig() {
-  fetch('/api/config', {method: 'POST', headers: headers(),
-    body: JSON.stringify({text: document.getElementById('config').value})})
-    .then(r => r.json()).then(d => {
-      document.getElementById('config-msg').textContent =
-        d.status === 'ok' ? 'saved (backup written)' : 'ERROR: ' + d.error;
-    });
-}
-function loadDiff() {
-  fetch('/api/diff', {headers: headers()}).then(r => r.json()).then(d => {
-    document.getElementById('diff').textContent = d.exists ? d.text : '(no fixes.diff yet)';
-  });
-}
-function downloadLogs() {
-  fetch('/api/logs/download', {headers: headers()}).then(r => r.blob()).then(b => {
-    const a = document.createElement('a');
-    a.href = URL.createObjectURL(b); a.download = 'hybrid-agent.log'; a.click();
+function loadSystem(){
+  fetch('/api/system',{headers:headers()}).then(r=>r.json()).then(s=>{
+    $id('sysinfo').textContent=
+      `engine: ${s.engine_dir}\nroot: ${s.root}\npython: ${s.python}\ninterpreter: ${s.interpreter}\n`+
+      `stats: ${s.stats_path}\nconfig: ${s.config_path}\nproviders: ${s.providers_configured}`;
   });
 }
 
-// ---- Init ----
-document.getElementById('token-input').value = token;
-loadProviders(); loadStats(); loadConfig(); loadDiff();
-setInterval(loadStats, 10000);
-setInterval(loadDiff, 30000);
-document.getElementById('task').addEventListener('keydown', e => {
-  if (e.key === 'Enter' && (e.metaKey || e.ctrlKey)) submitTask();
-});
+// ---------- config / logs / diff ----------
+function loadConfig(){fetch('/api/config',{headers:headers()}).then(r=>r.json()).then(d=>{$id('config').value=d.text})}
+function saveConfig(){
+  fetch('/api/config',{method:'POST',headers:headers(),body:JSON.stringify({text:$id('config').value})})
+    .then(r=>r.json()).then(d=>{$id('config-msg').textContent=d.status==='ok'?'saved (backup written)':'ERROR: '+d.error});
+}
+function loadDiff(){
+  fetch('/api/diff',{headers:headers()}).then(r=>r.json()).then(d=>{
+    $id('diff').textContent=d.exists?d.text:'(no fixes.diff yet)';
+  });
+}
+function downloadLogs(){fetch('/api/logs/download',{headers:headers()}).then(r=>r.blob()).then(b=>{
+  const a=document.createElement('a');a.href=URL.createObjectURL(b);a.download='hybrid-agent.log';a.click()})}
+function saveToken(){token=$id('token-input').value.trim();localStorage.setItem('token',token);
+  $id('token-hint').textContent=token?'token saved (reconnect)':'';location.reload()}
+
+// ---------- init ----------
+$id('token-input').value=token;
+loadProviders();loadStats();loadMemory();loadQueue();loadHistory();loadHealth();loadSystem();
+loadConfig();loadDiff();
+setInterval(loadStats,10000);setInterval(loadQueue,5000);setInterval(loadMemory,20000);
+setInterval(loadDiff,30000);
+$id('task').addEventListener('keydown',e=>{if(e.key==='Enter'&&(e.metaKey||e.ctrlKey))submitTask()});
 </script>
 </body>
 </html>
