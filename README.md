@@ -15,6 +15,7 @@ The bridge is a self-contained CLI (`ask.py`) that talks directly to two OpenAI-
 - [Web dashboard](#web-dashboard)
 - [Providers & multi-model](#providers--multi-model)
 - [Git & deploy](#git--deploy-pull--push--deploy)
+- [Terminal tool (RUN:)](#terminal-tool-run)
 - [Quick start](#quick-start)
 - [CLI reference](#cli-reference)
 - [The supervise loop](#the-supervise-loop)
@@ -175,6 +176,30 @@ python3 ask.py --supervise --enhance --task "fix the checkout bug" \
   --verify --verify-cmd "npm run build" --apply --pull --push --deploy
 ```
 
+## Terminal tool (RUN:)
+
+The models get a **real terminal tool** in the supervise loop: Gemma can emit
+`RUN: <command>` lines in its output, the engine executes them, and the output
+is fed back for another iteration (up to `--terminal-rounds`, default 3).
+
+```
+RUN: npm run build        ← the model inspects/verifies
+<engine runs it, returns exit code + output>
+<model fixes code, emits RUN again or finishes>
+```
+
+- **Safety**: every command is gated by the dangerous-shell-marker block
+  (`rm`, `sudo`, `|`, `>`, `;`, `&&`, … are always rejected) plus the
+  allowlist — build/test commands (from the verify allowlist) and read-only
+  inspection commands (`ls`, `cat`, `head`, `git status`, `git log`, `pwd`,
+  `find`, `grep`, …).
+- `review.terminal_timeout` (default 120s) caps each command; output is
+  truncated to 4000 chars.
+- The terminal session is appended to the review package's `VERIFICATION`
+  section, so DeepSeek reviews with full knowledge of what ran.
+- `--terminal-rounds 0` disables the tool; it's enabled by default in the
+  supervise loop.
+
 ## Quick start
 
 ```bash
@@ -255,6 +280,7 @@ use plain `python3 ask.py …` (the CLI self-heals into the venv interpreter).
 | `--pull` | `git pull --ff-only` before the task (best-effort). |
 | `--push` | After verification: git add + commit + push the engine's changes. |
 | `--deploy` / `--deploy-cmd CMD` | After verification: run the deploy command. |
+| `--terminal-rounds N` | Max terminal rounds for the `RUN:` tool (0 disables). |
 | `--verify-cmd CMD` | Add a verification command (repeatable; implies `--verify`). |
 | `--verify-max N` | Max verify-fix iterations (default 2). |
 | `--verify-timeout S` | Per-command timeout (default `review.verify_timeout`, 600s). |
@@ -460,7 +486,7 @@ Unknown keys are ignored by the loader, and every section has a safe default.
 | `router` | `local_threshold`, `threshold_min/max`, `target_local_rate`, `alpha`, `supervision` (auto/full/local_first/critical), `weights` |
 | `backends.local` | `base_url`, `api_key`, `model`, `timeout_s`, `max_retries`, `backoff_s`, `cold_start_wait_s` |
 | `backends.deepseek` | `api_key_env`, `base_url`, `model`, `timeout_s`, `max_retries`, `backoff_s` |
-| `review` | `verify`, `verify_timeout`, `verify_groups`, `verify_allowlist`, `regression`, `regression_timeout`, `daily_token_budget`, `max_depth_tokens`, `max_failure_summary_words` |
+| `review` | `verify`, `verify_timeout`, `verify_groups`, `verify_allowlist`, `regression`, `regression_timeout`, `daily_token_budget`, `max_depth_tokens`, `max_failure_summary_words`, `terminal_timeout` |
 | `cache` | `enabled`, `dir`, `ttl_days`, `max_entries` |
 | `circuit_breaker` | `window_size`, `local_error_ceiling`, `deepseek_error_ceiling`, `cooldown_s` |
 | `memory` | `root`, `max_project_summary_words`, `semantic_similarity`, `embedding_model`, `embedding_threshold` |
@@ -504,7 +530,7 @@ report.
 
 ```bash
 cd "Agents /hybrid-agent"
-./.venv/bin/python -m unittest discover -s tests -v    # 151 tests
+./.venv/bin/python -m unittest discover -s tests -v    # 161 tests
 ```
 
 Coverage includes: the fenced-file parser, the apply overwrite/unsafe-path guards,

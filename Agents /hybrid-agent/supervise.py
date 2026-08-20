@@ -265,15 +265,27 @@ def _local_limits_note() -> str:
 
 
 def _gemma_primary_prompt(task: str, prior_fixes: str = "",
+                          terminal_output: str = "",
                           max_tokens: int = GEMMA_MAX_TOKENS) -> ModelRequest:
     system = (
         "You are a careful mid-level engineer implementing a change. "
         "Write correct, minimal, well-structured code for the given task. "
-        "Output the complete updated file(s) in fenced code blocks labeled with paths."
+        "Output the complete updated file(s) in fenced code blocks labeled with paths. "
+        "You have a terminal tool: to inspect or verify, emit a line like "
+        "'RUN: npm run build' and you will receive the command output in the "
+        "next turn. Use it to confirm your changes work."
     )
     user = f"TASK:\n{task}\n"
     if prior_fixes:
         user += f"\nA senior reviewer previously asked you to fix these issues. Apply ALL of them now:\n{prior_fixes}\n"
+    if terminal_output:
+        user += (
+            f"\nTERMINAL SESSION (output of the commands you asked to run):\n"
+            f"{terminal_output}\n"
+            "Use this output to fix your changes. You may emit more "
+            "'RUN: <command>' lines to inspect or verify, then output the "
+            "final code."
+        )
     user += (
         f"\nNOTE: your output is capped at {LOCAL_OUTPUT_TOKENS} tokens. If the "
         "change cannot fit in one response, implement the first coherent chunk "
@@ -281,6 +293,20 @@ def _gemma_primary_prompt(task: str, prior_fixes: str = "",
     )
     user += "\nOutput only the code changes, no preamble."
     return ModelRequest(system=system, user=user, max_tokens=max_tokens, temperature=0.2)
+
+
+# Terminal tool: model-emitted "RUN: <command>" lines, executed by the engine.
+_RUN_RE = re.compile(r"^\s*RUN:\s+(.+?)\s*$", re.M)
+
+
+def _extract_run_blocks(text: str) -> list[str]:
+    """Commands the model asked to run, in order, de-duplicated."""
+    cmds: list[str] = []
+    for m in _RUN_RE.finditer(text or ""):
+        cmd = m.group(1).strip().strip("`").strip()
+        if cmd and cmd not in cmds:
+            cmds.append(cmd)
+    return cmds
 
 
 def _supervisor_request(pkg: ReviewPackage, verbose: bool = True) -> ModelRequest:
@@ -343,6 +369,8 @@ def supervise(
     gemma_max_tokens: int = GEMMA_MAX_TOKENS,
     review: bool = True,
     review_quality_hint: float = 0.0,
+    terminal_tool: callable = None,
+    max_terminal_rounds: int = 3,
 ) -> SuperviseResult:
     """Run Gemma-primary / DeepSeek-supervisor on a task.
 
@@ -352,6 +380,10 @@ def supervise(
     `gemma_generate(request) -> ModelResponse` overrides how Gemma is invoked.
     Pass a streaming wrapper here so the caller can stream Gemma's output live
     (always showing the local model working). Defaults to `local.generate`.
+
+    `terminal_tool(command) -> output` executes 'RUN: <command>' blocks the
+    model emits and feeds the output back, looping up to max_terminal_rounds.
+    None disables the terminal tool.
 
     With `review=False` the DeepSeek review is skipped entirely (local-first
     routing): one Gemma pass, then a synthetic APPROVED verdict so the
@@ -412,6 +444,29 @@ def supervise(
                 return result
         code = resp.text
 
+        # Terminal tool: execute the 'RUN: <command>' blocks the model emitted
+        # and feed the output back so it can iterate against a real shell
+        # (inspect errors, run checks, then emit the final code).
+        terminal_feedback = ""
+        terminal_rounds = 0
+        while terminal_tool is not None and max_terminal_rounds > 0:
+            cmds = _extract_run_blocks(code)
+            if not cmds or terminal_rounds >= max_terminal_rounds:
+                break
+            terminal_rounds += 1
+            status(f"[supervise] iter {iteration}: terminal round {terminal_rounds} — "
+                   f"running: {', '.join(c[:44] for c in cmds)}")
+            outputs = [f"$ {cmd}\n{terminal_tool(cmd)}" for cmd in cmds]
+            terminal_feedback = "\n\n".join(outputs)
+            try:
+                resp = gemma_generate(_gemma_primary_prompt(
+                    current, prior_fixes, terminal_output=terminal_feedback,
+                    max_tokens=gemma_max_tokens))
+            except Exception as exc:  # noqa: BLE001 - keep the last good output
+                status(f"[supervise] terminal re-generate failed ({exc}); continuing")
+                break
+            code = resp.text
+
         # Local-first routing: skip the DeepSeek review entirely. One Gemma
         # pass plus a synthetic APPROVED verdict keeps the apply/stats tail
         # unchanged. review_quality_hint carries the router confidence (0-10).
@@ -429,6 +484,9 @@ def supervise(
 
         # 2. Build the compact review package.
         pkg = package_builder(task, code, iteration) if package_builder else _default_package(task, code)
+        if terminal_feedback:
+            pkg.verification = ((pkg.verification + "\n\n" if pkg.verification else "")
+                                + "TERMINAL SESSION:\n" + terminal_feedback)
 
         # 3. DeepSeek supervises.
         status(f"[supervise] iter {iteration}: DeepSeek supervising...")

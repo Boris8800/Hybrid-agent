@@ -575,7 +575,8 @@ _KNOWN_CONFIG_KEYS = {
     "backends": {"local", "deepseek"},
     "review": {"max_local_retries", "max_depth_tokens", "max_failure_summary_words",
                "daily_token_budget", "verify", "verify_timeout", "verify_groups",
-               "verify_allowlist", "regression", "regression_timeout"},
+               "verify_allowlist", "regression", "regression_timeout",
+               "terminal_timeout"},
     "cache": {"enabled", "dir", "ttl_days", "max_entries"},
     "circuit_breaker": {"window_size", "local_error_ceiling",
                         "deepseek_error_ceiling", "cooldown_s"},
@@ -1053,6 +1054,35 @@ def _supervise_gemma_generate(cfg: dict, model_override: str | None,
     return _gen
 
 
+def _make_terminal_tool(cfg: dict, args: argparse.Namespace):
+    """Build the RUN: terminal tool for the supervise loop: executes allowlisted
+    commands in the task root and returns captured output (never raises)."""
+    timeout = int((cfg.get("review") or {}).get("terminal_timeout", 120))
+
+    def run_terminal(cmd: str) -> str:
+        c = (cmd or "").strip().lower()
+        if not c or any(m in c for m in _DANGEROUS_VERIFY_MARKERS):
+            return "⚠ BLOCKED: dangerous command pattern."
+        if not (_is_safe_verify_cmd(cmd) or c.startswith(_TERMINAL_TOOL_PREFIXES)):
+            return ("⚠ BLOCKED: not an allowlisted terminal command "
+                    "(add it to review.verify_allowlist if you trust it).")
+        try:
+            proc = subprocess.run(cmd, shell=True, cwd=args.root,
+                                  capture_output=True, text=True, timeout=timeout)
+            out = (proc.stdout or "") + (proc.stderr or "")
+            if not out:
+                out = f"(exit {proc.returncode}, no output)"
+            if len(out) > 4000:
+                out = out[:4000] + "\n... [output truncated]"
+            return f"exit {proc.returncode}\n{out}"
+        except subprocess.TimeoutExpired:
+            return f"⏱ timed out after {timeout}s"
+        except Exception as exc:  # noqa: BLE001 - report cleanly
+            return f"error: {exc}"
+
+    return run_terminal
+
+
 def _list_models(base_url: str) -> int:
     """Print one loaded model id per line from the local endpoint. Exit 0 / 1."""
     base_url = base_url.rstrip("/")
@@ -1338,6 +1368,16 @@ _SAFE_VERIFY_PREFIXES = (
 _DANGEROUS_VERIFY_MARKERS = (
     "rm ", "rm -rf", "sudo", ">", ">>", "|", "`", "$(", "&&", "||", ";",
     "chmod", "chown", "mkfs", "dd ", "shutdown", "reboot",
+)
+
+# Read-only inspection commands the RUN: terminal tool may execute (in addition
+# to the build/test verify allowlist). Still marker-gated above.
+_TERMINAL_TOOL_PREFIXES = (
+    "ls", "cat ", "head ", "tail ", "wc", "find ", "grep ", "rg ",
+    "git status", "git log", "git diff", "git show", "git branch", "pwd", "tree",
+    "node --version", "npm --version", "python --version", "python3 --version",
+    "node -v", "npm -v", "echo ", "test -f", "test -d", "file ", "stat ",
+    "which ", "ls -la", "git stash list",
 )
 
 # Extra allowlisted prefixes from config review.verify_allowlist. Populated at
@@ -1905,6 +1945,9 @@ def main() -> int:
                              "deploy.command in config.yml (or --deploy-cmd)")
     parser.add_argument("--deploy-cmd", default=None,
                         help="deploy command override (implies --deploy)")
+    parser.add_argument("--terminal-rounds", type=int, default=3,
+                        help="max terminal rounds for the RUN: tool in the supervise loop "
+                             "(0 disables the terminal tool)")
     parser.add_argument("--stats", action="store_true",
                         help="print the 80/20 strategy summary (hybrid-agent/stats.json)")
     parser.add_argument("--evaluate", action="store_true",
@@ -2175,6 +2218,8 @@ def main() -> int:
                     status=lambda line: tracker.tick(line),
                     gemma_max_tokens=args.max_tokens or GEMMA_MAX_TOKENS,
                     review=(plan != "local_first"),
+                    terminal_tool=_make_terminal_tool(cfg, args),
+                    max_terminal_rounds=args.terminal_rounds,
                 )
         except BudgetExceeded as exc:
             _status("[hybrid] ⛔ supervise aborted: daily DeepSeek token budget exhausted")

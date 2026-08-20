@@ -68,6 +68,9 @@ review:
   # Example: ["npm test", "python -m pytest"]
   regression: []
   regression_timeout: 600
+  # Terminal tool (supervise loop): per-command timeout for 'RUN: <command>'
+  # blocks the model emits. Commands are still allowlist-gated.
+  terminal_timeout: 120
 
 cache:
   enabled: true
