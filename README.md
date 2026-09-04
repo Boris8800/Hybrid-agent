@@ -114,6 +114,7 @@ nano .env          # set DEEPSEEK_API_KEY
 ./start_dashboard.sh          # http://localhost:8660
 ./start_mcp.sh                # MCP server over stdio (attach to an MCP host)
 ./start_mcp.sh --list         # list the built-in tools
+./ask_mcp.sh read_file '{"path":"config.yml"}'   # test a single tool directly
 ```
 
 ---
