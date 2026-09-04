@@ -1016,6 +1016,29 @@ def run_task():
     socketio.emit('task_update', current_task)
     return jsonify({"status": "started", "task": task})
 
+from pathlib import Path
+MEM = os.environ.get("HERMES_MEMORY", str(Path(__file__).resolve().parent / "memory"))
+LOGS = Path(MEM) / "logs"
+
+@app.route('/api/sessions')
+def list_sessions():
+    """List recorded run_agent sessions from the memory log dir."""
+    if not LOGS.exists():
+        return jsonify({"sessions": []})
+    files = sorted({f.stem for f in LOGS.glob("session_*.md")})
+    return jsonify({"sessions": files})
+
+@app.route('/api/session/<name>')
+def get_session(name):
+    """Return one session's markdown + json transcript."""
+    md = LOGS / f"{name}.md"
+    js = LOGS / f"{name}.json"
+    return jsonify({
+        "name": name,
+        "markdown": md.read_text(errors="replace") if md.exists() else "",
+        "json": js.read_text(errors="replace") if js.exists() else "{}",
+    })
+
 @socketio.on('connect')
 def handle_connect():
     emit('connected', {'data': 'Connected'})
@@ -2090,7 +2113,7 @@ cat > "$AGENT_DIR/start_mcp.sh" <<'MCP_LAUNCH'
 #   HERMES_SAFE=1            -> allow destructive tools (delete, kill, exec, db write)
 #   HERMES_ALLOW=delete_file,kill_process  -> allowlist specific tools
 #   HERMES_PROJECT=/path     -> confine filesystem tools to this root (default: app dir)
-#   HERMES_MEMORY=/path      -> long-term memory folder (default: ~/.hermes/memory)
+#   HERMES_MEMORY=/path      -> memory folder (default: <app>/memory)
 #
 # Examples:
 #   ./start_mcp.sh                       # stdio (for an MCP client)
@@ -2099,7 +2122,11 @@ cat > "$AGENT_DIR/start_mcp.sh" <<'MCP_LAUNCH'
 
 cd "$(dirname "$0")" || exit 1
 if [ -f ".env" ]; then set -a; source ".env"; set +a; fi
-exec python3 mcp_server.py "$@"
+# Run with the venv python so auto-installed libs (pypdf, docx, openpyxl, feedparser)
+# are visible to the MCP server. Fall back to python3 if the venv is missing.
+VENV_PY="$(dirname "$0")/.venv/bin/python"
+[ -x "$VENV_PY" ] || VENV_PY="python3"
+exec "$VENV_PY" mcp_server.py "$@"
 MCP_LAUNCH
 chmod +x "$AGENT_DIR/start_mcp.sh"
 cat > "$AGENT_DIR/ask_mcp.sh" <<'ASK_MCP'
@@ -2454,7 +2481,15 @@ cat > "$AGENT_DIR/tools_manifest.json" <<'MANIFEST_JSON'
 }
 MANIFEST_JSON
 ok "MCP tool layer generated in-place (mcp_server.py, start_mcp.sh, ask_mcp.sh, tools_manifest.json)"
-warn "Optional richer tools (PDF/DOCX/XLSX, feeds): pip install pypdf python-docx openpyxl feedparser"
+# Auto-install optional doc/RSS libraries into the venv (pure Python, lightweight).
+# The MCP server (start_mcp.sh) runs on the venv python, so these are then usable.
+if command -v pip >/dev/null 2>&1; then
+    pip install --quiet pypdf python-docx openpyxl feedparser >/dev/null 2>&1 \
+        && ok "Document tools installed (PDF, DOCX, XLSX, RSS)" \
+        || warn "Optional doc tools not installed — run: pip install pypdf python-docx openpyxl feedparser"
+else
+    warn "pip not active — skipped doc tools install"
+fi
 ok "tools_state ready: $AGENT_DIR/tools_state"
 
 cat > "$AGENT_DIR/test_hybrid.py" <<'PY'
