@@ -12,9 +12,12 @@ with ~46 local tools — lives inside that one folder. Nothing is installed into
 `~/Agents`, `~/.zprofile`, or elsewhere on your machine.
 
 > **Repository layout (installer only).** This repository is the *installation kit*.
-> It contains `install.sh` plus the payload files it copies into each new runtime
-> folder. Your actual running agent lives in the `Hermes-<date>` folder that
-> `install.sh` creates — keep this repo clean as your installer source.
+> `install.sh` sits at the top level; all agent source files live inside the single
+> `Hermes/` subfolder (`mcp_server.py`, `start_mcp.sh`, `ask_mcp.sh`,
+> `tools_manifest.json`). `install.sh` is fully self-contained — it embeds every
+> payload — so it works even if only `install.sh` is copied alone. Your actual
+> running agent lives in the `Hermes-<date>` folder that `install.sh` creates;
+> keep this repo clean as your installer source.
 
 ---
 
