@@ -33,6 +33,22 @@ PY="$DIR/hybrid_ai.py"
 WORK="${HYBRID_WORK:-$HOME/.hermes/hybrid_work}"
 mkdir -p "$WORK"
 
+# Allow persistent online-model overrides in ~/.hermes/.env so you can switch the
+# online API/model without editing the script. Shell env always wins.
+if [ -f "$HOME/.hermes/.env" ]; then
+    while IFS='=' read -r _k _v; do
+        case "$_k" in
+            HYBRID_ONLINE_BASE|HYBRID_ONLINE_MODEL|HYBRID_ONLINE_KEY)
+                _v="${_v%\"}"; _v="${_v#\"}"; _v="${_v%\'}"; _v="${_v#\'}"
+                _v="$(printf '%s' "$_v" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
+                if [ -z "$(eval echo "\${$_k:-}")" ]; then
+                    export "$_k=$_v"
+                fi
+                ;;
+        esac
+    done < <(grep -E '^HYBRID_ONLINE_(BASE|MODEL|KEY)=' "$HOME/.hermes/.env")
+fi
+
 # ---------- resolve online (DeepSeek) ----------
 ONLINE_BASE="${HYBRID_ONLINE_BASE:-https://api.deepseek.com/v1}"
 ONLINE_MODEL="${HYBRID_ONLINE_MODEL:-deepseek-chat}"
