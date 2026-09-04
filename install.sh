@@ -1079,12 +1079,13 @@ else
     ok "Git repo already exists"
 fi
 
+mkdir -p "$AGENT_DIR/scripts"
 cat > "$AGENT_DIR/scripts/validate-agents.sh" <<'SH'
 #!/bin/bash
 # Validates required hybrid-agent files exist. Run on pre-commit.
 HERE="$(cd "$(dirname "$0")/.." && pwd)"
 echo "Validating agent files in $HERE ..."
-required_files=("$HERE/config.yml" "$HERE/ask.py" "$HERE/.env" "$HERE/web_dashboard.py")
+required_files=("$HERE/config.yml" "$HERE/ask.py" "$HERE/.env" "$HERE/run_agent.py" "$HERE/web_dashboard.py")
 missing=0
 for f in "${required_files[@]}"; do
     if [ ! -f "$f" ]; then echo "Missing: $f"; missing=1; fi
