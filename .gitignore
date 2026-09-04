@@ -1,0 +1,7 @@
+# installer kit
+__pycache__/
+*.pyc
+.DS_Store
+tools_state/
+Hermes-*/
+*.dmg
