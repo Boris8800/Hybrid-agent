@@ -104,6 +104,14 @@ nano .env          # set DEEPSEEK_API_KEY
 
 ### 4. Try it
 
+Easiest — an interactive menu:
+
+```bash
+./hermes.sh
+```
+
+Or directly:
+
 ```bash
 ./ask.py --task "write a hello world in python"
 
