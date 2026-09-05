@@ -9,7 +9,8 @@
 # What it does:
 #   1. checks macOS / prerequisites
 #   2. ensures `uv` is installed (Homebrew)
-#   3. clones Hermes Agent into ~/.hermes/hermes-agent (if absent)
+#   3. creates ONE dated folder ~/Desktop/Hermes-<date> and clones Hermes Agent
+#      into it (software + all data stay inside that single folder)
 #   4. creates a venv and installs the web + pty extras
 #   5. offers a menu to configure the model, chat, or open the dashboard
 #
@@ -30,16 +31,34 @@ ok(){ echo -e "${GREEN}  ✓ $1${NC}"; }
 warn(){ echo -e "${YELLOW}  ! $1${NC}"; }
 fail(){ echo -e "${RED}  ✗ $1${NC}"; }
 
-HERMES_ROOT="${HERMES_ROOT:-$HOME/.hermes}"
+# --- Location: ONE dated, self-contained folder on the Desktop ---
+# Each run makes a NEW folder ~/Desktop/Hermes-<YYYYMMDD> (-2, -3 … if reused).
+# ALL Hermes data (software, venv, config, sessions, memory, logs) lives inside it.
+# Delete the folder = delete the whole install (memory included).
+BASE="${HERMES_BASE:-$HOME/Desktop}"
+if [ -n "${HERMES_DIR:-}" ]; then
+    AGENT_DIR="${HERMES_DIR}"
+else
+    AGENT_DIR="$BASE/Hermes-$(date +%Y%m%d)"
+    n=1
+    while [ -e "$AGENT_DIR" ]; do
+        n=$((n+1))
+        AGENT_DIR="$BASE/Hermes-$(date +%Y%m%d)-$n"
+    done
+fi
+export HERMES_HOME="$AGENT_DIR"          # Hermes stores ALL its data under here
+HERMES_ROOT="$AGENT_DIR"
 REPO="$HERMES_ROOT/hermes-agent"
 BIN="$REPO/.venv/bin/hermes"
+mkdir -p "$HERMES_ROOT"
 
 log "============================================================"
 log "   HERMES AGENT (NousResearch) — INSTALLER"
 log "============================================================"
-log "  Install root : $HERMES_ROOT"
-log "  Agent dir    : $REPO"
-log "  venv         : $REPO/.venv"
+log "  ONE folder     : $AGENT_DIR  (created this run)"
+log "  Agent software : $REPO"
+log "  venv           : $REPO/.venv"
+log "  Hermes data    : $AGENT_DIR  (config/sessions/memory/logs stay here)"
 log "============================================================"
 
 # --- 1. system ---
@@ -93,14 +112,14 @@ fi
 DESKTOP_LAUNCHER="$HOME/Desktop/Hermes Agent.command"
 cat > "$DESKTOP_LAUNCHER" <<'LAUNCHER'
 #!/bin/bash
-# Hermes Agent — desktop launcher (double-click me).
-REPO="${HERMES_HOME:-$HOME/.hermes/hermes-agent}"
-export PATH="$REPO/.venv/bin:$PATH"
+# Hermes Agent — desktop launcher (double-click me). ONE dated folder.
+export HERMES_HOME="__AGENT_DIR__"
+export PATH="__AGENT_DIR__/hermes-agent/.venv/bin:$PATH"
 cd "$HOME" || exit 1
 while :; do
   clear 2>/dev/null || true
   echo "=============================================="
-  echo "   HERMES AGENT"
+  echo "   HERMES AGENT   (folder: $HERMES_HOME)"
   echo "=============================================="
   echo "  1) Open web dashboard   (http://127.0.0.1:9119)"
   echo "  2) Start chat"
@@ -118,6 +137,8 @@ while :; do
 done
 LAUNCHER
 chmod +x "$DESKTOP_LAUNCHER"
+# bake in the actual dated folder path
+sed -i '' "s|__AGENT_DIR__|$AGENT_DIR|g" "$DESKTOP_LAUNCHER"
 ok "Desktop launcher created: $DESKTOP_LAUNCHER"
 
 # --- 5. launch / menu ---
@@ -135,8 +156,10 @@ esac
 
 echo ""
 log "  Hermes Agent is ready."
-echo "    Activate  :  export PATH=\"$REPO/.venv/bin:\$PATH\"   (or: source $REPO/.venv/bin/activate)"
-echo "    Configure :  hermes model      (pick default model — choose your LOCAL one for hybrid/local-first)"
+echo "    ONE folder : $AGENT_DIR   (everything lives here; delete it to remove Hermes)"
+echo "    Activate   :  export PATH=\"$REPO/.venv/bin:\$PATH\"   (or: source $REPO/.venv/bin/activate)"
+echo "    Configure  :  hermes model      (pick default model — choose your LOCAL one for hybrid/local-first)"
+echo "    API keys   :  add DEEPSEEK_API_KEY=sk-... to  $HERMES_HOME/.env   (for hybrid online plan/gate)"
 echo ""
 echo "  What do you want to do?"
 echo "    1) Configure model/provider   (hermes model)"

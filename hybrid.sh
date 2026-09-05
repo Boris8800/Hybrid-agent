@@ -27,15 +27,27 @@
 set -u
 RED=$'\033[0;31m'; GREEN=$'\033[0;32m'; YELLOW=$'\033[1;33m'; BLUE=$'\033[0;34m'; NC=$'\033[0m'
 
-HERMES_BIN="${HERMES_BIN:-$HOME/.hermes/hermes-agent/.venv/bin/hermes}"
+# Find the newest dated one-folder install on the Desktop (or use HERMES_HOME).
+D="$(ls -d "$HOME"/Desktop/Hermes-* 2>/dev/null | sort -r | head -1)"
+if [ -z "${HERMES_BIN:-}" ]; then
+    if [ -n "$D" ] && [ -x "$D/hermes-agent/.venv/bin/hermes" ]; then
+        HERMES_BIN="$D/hermes-agent/.venv/bin/hermes"
+    else
+        HERMES_BIN="$HOME/.hermes/hermes-agent/.venv/bin/hermes"
+    fi
+fi
 DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PY="$DIR/hybrid_ai.py"
 WORK="${HYBRID_WORK:-$HOME/.hermes/hybrid_work}"
 mkdir -p "$WORK"
 
-# Allow persistent online-model overrides in ~/.hermes/.env so you can switch the
-# online API/model without editing the script. Shell env always wins.
-if [ -f "$HOME/.hermes/.env" ]; then
+# Which .env to read (keys + HYBRID_ONLINE_* overrides): newest dated folder's first.
+ENVF="${HYBRID_ENV:-}"
+if [ -z "$ENVF" ] && [ -n "$D" ] && [ -f "$D/.env" ]; then ENVF="$D/.env"; fi
+if [ -z "$ENVF" ] && [ -f "$HOME/.hermes/.env" ]; then ENVF="$HOME/.hermes/.env"; fi
+
+# Allow persistent online-model overrides in the env file (shell env always wins).
+if [ -n "$ENVF" ] && [ -f "$ENVF" ]; then
     while IFS='=' read -r _k _v; do
         case "$_k" in
             HYBRID_ONLINE_BASE|HYBRID_ONLINE_MODEL|HYBRID_ONLINE_KEY)
@@ -46,23 +58,22 @@ if [ -f "$HOME/.hermes/.env" ]; then
                 fi
                 ;;
         esac
-    done < <(grep -E '^HYBRID_ONLINE_(BASE|MODEL|KEY)=' "$HOME/.hermes/.env")
+    done < <(grep -E '^HYBRID_ONLINE_(BASE|MODEL|KEY)=' "$ENVF")
 fi
 
 # ---------- resolve online (DeepSeek) ----------
 ONLINE_BASE="${HYBRID_ONLINE_BASE:-https://api.deepseek.com/v1}"
 ONLINE_MODEL="${HYBRID_ONLINE_MODEL:-deepseek-chat}"
 ONLINE_KEY="${HYBRID_ONLINE_KEY:-}"
-if [ -z "$ONLINE_KEY" ] && [ -f "$HOME/.hermes/.env" ]; then
-    ONLINE_KEY="$(grep -E '^DEEPSEEK_API_KEY=' "$HOME/.hermes/.env" | head -1 | cut -d= -f2-)"
-    # trim surrounding whitespace and quotes, and a possible CR
+if [ -z "$ONLINE_KEY" ] && [ -n "$ENVF" ] && [ -f "$ENVF" ]; then
+    ONLINE_KEY="$(grep -E '^DEEPSEEK_API_KEY=' "$ENVF" | head -1 | cut -d= -f2-)"
     ONLINE_KEY="${ONLINE_KEY%$'\r'}"
     ONLINE_KEY="${ONLINE_KEY#\"}"; ONLINE_KEY="${ONLINE_KEY%\"}"
     ONLINE_KEY="${ONLINE_KEY#\'}"; ONLINE_KEY="${ONLINE_KEY%\'}"
     ONLINE_KEY="$(printf '%s' "$ONLINE_KEY" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
 fi
 if [ -z "$ONLINE_KEY" ]; then
-    echo -e "${RED}No online key. Set DEEPSEEK_API_KEY in ~/.hermes/.env or HYBRID_ONLINE_KEY.$NC" >&2
+    echo -e "${RED}No online key. Add DEEPSEEK_API_KEY to ${ENVF:-~/.hermes/.env} or set HYBRID_ONLINE_KEY.$NC" >&2
     exit 2
 fi
 if [ ! -x "$HERMES_BIN" ]; then
