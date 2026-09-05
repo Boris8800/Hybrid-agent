@@ -161,6 +161,11 @@ LOCAL="${HYBRID_LOCAL_MODEL:-}"
 if [ -z "$LOCAL" ] && [ -n "$ENVF" ]; then
     LOCAL="$(grep -E '^HYBRID_LOCAL_MODEL=' "$ENVF" | head -1 | cut -d= -f2- | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
 fi
+# online SUPERVISOR model — blank = Hermes' default (what you pick in `hermes model`)
+SUP="${HYBRID_SUPERVISOR_MODEL:-}"
+if [ -z "$SUP" ] && [ -n "$ENVF" ]; then
+    SUP="$(grep -E '^HYBRID_SUPERVISOR_MODEL=' "$ENVF" | head -1 | cut -d= -f2- | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
+fi
 
 WORK="${HYBRID_WORK:-$HOME/.hermes/hybrid_work}"
 mkdir -p "$WORK"
@@ -174,6 +179,9 @@ if [ -z "$LOCAL" ]; then
     echo "  If your default is the ONLINE supervisor, the worker would not be local." >&2
     echo "  Set the local model in $ENVF :  HYBRID_LOCAL_MODEL=<local-model-name>" >&2
 fi
+
+# sup() runs the ONLINE supervisor (explicit model if set, else Hermes default)
+sup(){ if [ -n "$SUP" ]; then "$HERMES_BIN" -m "$SUP" -z "$1"; else "$HERMES_BIN" -z "$1"; fi; }
 
 # task
 TASK=""
@@ -191,7 +199,7 @@ Task: $TASK
 
 Return ONLY the plan: numbered, concrete, actionable steps, plus any risks. No
 preamble, no markdown fences."
-if ! "$HERMES_BIN" -z "$PLAN_PROMPT" > "$WORK/plan.txt" 2>&1; then
+if ! sup "$PLAN_PROMPT" > "$WORK/plan.txt" 2>&1; then
     echo -e "${RED}online plan failed$NC"; exit 1
 fi
 echo -e "${GREEN}Plan:${NC}"; sed 's/^/    /' "$WORK/plan.txt"
@@ -233,7 +241,7 @@ $(cat "$WORK/evidence.txt")
 
 Return EXACTLY one line starting with VERDICT: APPROVED or VERDICT: FIX, then concise
 FEEDBACK lines for what to fix next."
-    "$HERMES_BIN" -z "$INSPECT_PROMPT" > "$WORK/inspect.txt" 2>&1
+    sup "$INSPECT_PROMPT" > "$WORK/inspect.txt" 2>&1
     echo "    $(head -1 "$WORK/inspect.txt")"
     if head -1 "$WORK/inspect.txt" | grep -q "APPROVED"; then
         echo -e "${GREEN}  round $round APPROVED$NC"; break
@@ -257,7 +265,7 @@ FINAL TRANSCRIPT:
 $(tail -n 200 "$WORK/run_out.txt")
 
 Return EXACTLY one line: FINAL: APPROVED or FINAL: REJECTED, then a one-line rationale."
-"$HERMES_BIN" -z "$GATE_PROMPT" > "$WORK/gate.txt" 2>&1
+sup "$GATE_PROMPT" > "$WORK/gate.txt" 2>&1
 FINAL="$(head -1 "$WORK/gate.txt")"
 echo ""
 if echo "$FINAL" | grep -q "APPROVED"; then
@@ -408,6 +416,66 @@ exit 0
 SUPERVISED_SRC
 chmod +x "$HERMES_HOME/supervised_chat.sh"
 ok "Bundled: supervised_chat.sh (embedded)"
+cat > "$HERMES_HOME/hybrid_config.sh" <<'HYBRID_CONFIG'
+#!/bin/bash
+# ============================================================
+# hybrid_config.sh — configure HYBRID mode (like Hermes' MoA configure)
+# ============================================================
+# Choose:
+#   1) the ONLINE SUPERVISOR model (plans / inspects / last gate)
+#   2) the LOCAL WORKER model      (does the real work)
+# Saves them to the Hermes folder's .env, used by hybrid.sh / supervised_chat.sh.
+# Leave a prompt empty to keep the current value; enter "-" to clear to default.
+# ============================================================
+set -u
+BLUE=$'\033[0;34m'; GREEN=$'\033[0;32m'; YELLOW=$'\033[1;33m'; NC=$'\033[0m'
+
+D="$(ls -d "$HOME"/Desktop/Hermes-* 2>/dev/null | sort -r | head -1)"
+if [ -n "${HERMES_HOME:-}" ]; then ENVF="${HERMES_HOME:-}/.env"
+elif [ -n "$D" ]; then ENVF="$D/.env"
+else ENVF="$HOME/.hermes/.env"; fi
+touch "$ENVF" 2>/dev/null || true
+
+readv(){ # $1=key
+    grep -E "^$1=" "$ENVF" 2>/dev/null | head -1 | cut -d= -f2- | sed 's/^[[:space:]]*//;s/[[:space:]]*$//'
+}
+setkey(){ # $1=key $2=value  ("-" => remove)
+    if [ "$2" = "-" ] || [ -z "$2" ]; then
+        grep -v "^$1=" "$ENVF" > "$ENVF.tmp" 2>/dev/null || true
+        [ -f "$ENVF.tmp" ] && mv "$ENVF.tmp" "$ENVF"
+    elif grep -q "^$1=" "$ENVF" 2>/dev/null; then
+        sed -i '' "s|^$1=.*|$1=$2|" "$ENVF"
+    else
+        printf '%s=%s\n' "$1" "$2" >> "$ENVF"
+    fi
+}
+
+echo -e "${BLUE}Configure HYBRID mode${NC}   (folder: ${ENVF})"
+echo "======================================================"
+echo "  ONLINE supervisor = plans / inspects / is the LAST gate."
+echo "  LOCAL worker      = does the real work (your local model)."
+echo "  Leave blank = keep current.  Enter '-' = clear to Hermes default."
+echo ""
+cur_sup="$(readv HYBRID_SUPERVISOR_MODEL)"; cur_loc="$(readv HYBRID_LOCAL_MODEL)"
+echo "  current SUPERVISOR = ${cur_sup:-<Hermes default>}"
+echo "  current WORKER     = ${cur_loc:-<Hermes default>}"
+echo ""
+printf 'Online SUPERVISOR model [%s]: ' "${cur_sup:-<default>}"; read -r sup
+printf 'Local WORKER model     [%s]: ' "${cur_loc:-<default>}"; read -r loc
+[ -n "$sup" ] && setkey HYBRID_SUPERVISOR_MODEL "$sup"
+[ -n "$loc" ] && setkey HYBRID_LOCAL_MODEL "$loc"
+
+echo ""
+echo -e "${GREEN}Saved to ${ENVF}:${NC}"
+grep -E '^(HYBRID_SUPERVISOR_MODEL|HYBRID_LOCAL_MODEL)=' "$ENVF" || echo "  (both on Hermes default)"
+echo ""
+echo "Run:"
+echo "  bash $D/hybrid.sh \"<your task>\"        # one-shot hybrid"
+echo "  bash $D/supervised_chat.sh              # supervised chat"
+exit 0
+HYBRID_CONFIG
+chmod +x "$HERMES_HOME/hybrid_config.sh"
+ok "Bundled: hybrid_config.sh (embedded)"
 
 # --- 4b. Desktop launcher icon ---
 DESKTOP_LAUNCHER="$HOME/Desktop/Hermes Agent.command"
@@ -427,8 +495,9 @@ while :; do
   echo "  3) Set default model    (hybrid: local-first)"
   echo "  4) Run a task in HYBRID mode (online plans -> local works -> online gate)"
   echo "  5) SUPERVISED chat      (every message is online-supervised)"
+  echo "  6) Configure hybrid      (choose supervisor + local worker)"
   echo "  0) Quit"
-  printf 'Choose [0-5]: '
+  printf 'Choose [0-6]: '
   read -r c
   case "$c" in
     1) hermes dashboard ;;
@@ -436,6 +505,7 @@ while :; do
     3) hermes model ;;
     4) printf 'Task: '; read -r t; [ -n "$t" ] && bash "$HERMES_HOME/hybrid.sh" "$t"; printf '[enter] back to menu'; read -r _ ;;
     5) bash "$HERMES_HOME/supervised_chat.sh" ;;
+    6) bash "$HERMES_HOME/hybrid_config.sh" ;;
     0|q|Q) echo "bye"; break ;;
     *) echo "  invalid: $c"; sleep 1 ;;
   esac
