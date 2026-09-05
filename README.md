@@ -57,21 +57,31 @@ hermes dashboard   # web control panel -> http://127.0.0.1:9119
 
 ## Hybrid mode — online plans · local works · online is the last gate
 
-`hybrid.sh` wraps Hermes Agent to give the exact hybrid flow you want:
+`hybrid.sh` uses the REAL Hermes Agent for **both** roles, so:
 
-1. **Online AI (DeepSeek) plans** the task.
-2. **Your local model (driven by Hermes) does ALL the real work** — edits, commands,
-   tool calls — right on your machine.
-3. **Online AI inspects** each round and asks for fixes if needed.
-4. **Online AI is the LAST GATE**: final `APPROVED` / `REJECTED`.
+1. **Online supervisor = whichever model you choose in Hermes** (its default —
+   set via `hermes model`, and it can be a free online model).
+2. **Your local model is the worker** and does ALL the real work — edits, commands,
+   tool calls — via `hermes -m <local>`.
+3. **Online supervisor inspects** each round and asks for fixes if needed.
+4. **Online supervisor is the LAST GATE**: final `APPROVED` / `REJECTED`.
 
-Works with any local model — just set Hermes' default to it first
-(`hermes model`, LM Studio/Ollama/whatever). Online side is any OpenAI-compatible API.
+No separate API keys are needed — Hermes already holds the model credentials, so the
+supervisor can be **any model you can pick in Hermes** (free or paid).
+
+One-time setup — pick your models:
 
 ```bash
-# needs DeepSeek key for the online plan/inspect/gate:
-echo 'DEEPSEEK_API_KEY=sk-...' >> ~/.hermes/.env
+# in Hermes, set your ONLINE (supervisor) model as the default:
+hermes model
 
+# tell hybrid which LOCAL model is the worker (add to the folder's .env):
+echo 'HYBRID_LOCAL_MODEL=your-local-model-name' >> ~/Desktop/Hermes-<date>/.env
+```
+
+Run a task:
+
+```bash
 bash hybrid.sh "build a fibonacci module with tests"
 echo "some task" | bash hybrid.sh
 bash hybrid.sh --file task.txt
@@ -80,19 +90,24 @@ bash hybrid.sh --file task.txt
 Overrides (defaults shown):
 
 ```
-HYBRID_ONLINE_BASE=https://api.deepseek.com/v1
-HYBRID_ONLINE_MODEL=deepseek-chat
-HYBRID_ONLINE_KEY=<key>        # else reads DEEPSEEK_API_KEY from ~/.hermes/.env
-HYBRID_MAX_ROUNDS=3            # plan -> run -> inspect fix rounds
-HYBRID_WORK=~/.hermes/hybrid_work   # artifacts (plan, transcript, verdicts)
+HYBRID_LOCAL_MODEL=<your-local-model>   # worker model for `hermes -m`
+HYBRID_MAX_ROUNDS=3                     # plan -> run -> inspect fix rounds
+HYBRID_WORK=~/.hermes/hybrid_work       # artifacts (plan, transcript, verdicts)
 ```
 
-Local model = whatever `hermes model` is set to. Transcripts and verdicts are saved
-under `~/.hermes/hybrid_work/` for review.
+The online (supervisor) model is exactly what Hermes' default is set to. Transcripts
+and verdicts are saved under `~/.hermes/hybrid_work/` for review.
+
+## Two ways to chat (pick per chat)
+
+Use the Desktop launcher or `install.sh` menu:
+- **Start chat** → a normal Hermes chat. Set its model to your **local** model for a
+  free local conversation.
+- **Run a task in HYBRID mode** → online supervisor plans/inspects/gates while the
+  local model does the work.
 
 ## Uninstall
 
 ```bash
-bash ~/.hermes/hermes-agent/uninstall   # or remove the folder + ~/.hermes config you no longer need
-rm -rf ~/.hermes/hermes-agent
+rm -rf ~/Desktop/Hermes-<date>     # deletes the whole one-folder install
 ```

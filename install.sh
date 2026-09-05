@@ -110,14 +110,15 @@ else
 fi
 
 # --- 4c. Bundle hybrid (part of the install, not a separate thing) ---
-# hybrid.sh drives: ONLINE plans -> LOCAL (Hermes) does the work -> ONLINE inspects/gates.
-# It is installed INTO this one folder so it is always available here.
-if [ -f "$SCRIPT_DIR/hybrid.sh" ] && [ -f "$SCRIPT_DIR/hybrid_ai.py" ]; then
-    cp "$SCRIPT_DIR/hybrid.sh" "$SCRIPT_DIR/hybrid_ai.py" "$HERMES_HOME/"
-    chmod +x "$HERMES_HOME/hybrid.sh" "$HERMES_HOME/hybrid_ai.py"
-    ok "Hybrid mode bundled in this folder (hybrid.sh + hybrid_ai.py)"
+# hybrid.sh uses the REAL Hermes Agent for both roles:
+#   ONLINE supervisor = the model you choose in Hermes (its default),
+#   LOCAL worker      = your local model (hermes -m <local>).
+if [ -f "$SCRIPT_DIR/hybrid.sh" ]; then
+    cp "$SCRIPT_DIR/hybrid.sh" "$HERMES_HOME/"
+    chmod +x "$HERMES_HOME/hybrid.sh"
+    ok "Hybrid mode bundled in this folder (hybrid.sh)"
 else
-    warn "hybrid.sh/hybrid_ai.py not beside install.sh — hybrid not bundled (re-run from the full repo)"
+    warn "hybrid.sh not beside install.sh — hybrid not bundled (re-run from the full repo)"
 fi
 
 # --- 4b. Desktop launcher icon ---
