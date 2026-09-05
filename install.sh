@@ -89,6 +89,37 @@ else
     ok "already installed ($("$BIN" --version 2>&1 | head -1))"
 fi
 
+# --- 4b. Desktop launcher icon ---
+DESKTOP_LAUNCHER="$HOME/Desktop/Hermes Agent.command"
+cat > "$DESKTOP_LAUNCHER" <<'LAUNCHER'
+#!/bin/bash
+# Hermes Agent — desktop launcher (double-click me).
+REPO="${HERMES_HOME:-$HOME/.hermes/hermes-agent}"
+export PATH="$REPO/.venv/bin:$PATH"
+cd "$HOME" || exit 1
+while :; do
+  clear 2>/dev/null || true
+  echo "=============================================="
+  echo "   HERMES AGENT"
+  echo "=============================================="
+  echo "  1) Open web dashboard   (http://127.0.0.1:9119)"
+  echo "  2) Start chat"
+  echo "  3) Set default model    (hybrid: local-first)"
+  echo "  0) Quit"
+  printf 'Choose [0-3]: '
+  read -r c
+  case "$c" in
+    1) hermes dashboard ;;
+    2) hermes chat ;;
+    3) hermes model ;;
+    0|q|Q) echo "bye"; break ;;
+    *) echo "  invalid: $c"; sleep 1 ;;
+  esac
+done
+LAUNCHER
+chmod +x "$DESKTOP_LAUNCHER"
+ok "Desktop launcher created: $DESKTOP_LAUNCHER"
+
 # --- 5. launch / menu ---
 echo -e "${BLUE}--- 5/5 Ready ---${NC}"
 if [ -x "$BIN" ]; then
