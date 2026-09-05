@@ -50,6 +50,7 @@ export HERMES_HOME="$AGENT_DIR"          # Hermes stores ALL its data under here
 HERMES_ROOT="$AGENT_DIR"
 REPO="$HERMES_ROOT/hermes-agent"
 BIN="$REPO/.venv/bin/hermes"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 mkdir -p "$HERMES_ROOT"
 
 log "============================================================"
@@ -108,6 +109,17 @@ else
     ok "already installed ($("$BIN" --version 2>&1 | head -1))"
 fi
 
+# --- 4c. Bundle hybrid (part of the install, not a separate thing) ---
+# hybrid.sh drives: ONLINE plans -> LOCAL (Hermes) does the work -> ONLINE inspects/gates.
+# It is installed INTO this one folder so it is always available here.
+if [ -f "$SCRIPT_DIR/hybrid.sh" ] && [ -f "$SCRIPT_DIR/hybrid_ai.py" ]; then
+    cp "$SCRIPT_DIR/hybrid.sh" "$SCRIPT_DIR/hybrid_ai.py" "$HERMES_HOME/"
+    chmod +x "$HERMES_HOME/hybrid.sh" "$HERMES_HOME/hybrid_ai.py"
+    ok "Hybrid mode bundled in this folder (hybrid.sh + hybrid_ai.py)"
+else
+    warn "hybrid.sh/hybrid_ai.py not beside install.sh — hybrid not bundled (re-run from the full repo)"
+fi
+
 # --- 4b. Desktop launcher icon ---
 DESKTOP_LAUNCHER="$HOME/Desktop/Hermes Agent.command"
 cat > "$DESKTOP_LAUNCHER" <<'LAUNCHER'
@@ -124,13 +136,15 @@ while :; do
   echo "  1) Open web dashboard   (http://127.0.0.1:9119)"
   echo "  2) Start chat"
   echo "  3) Set default model    (hybrid: local-first)"
+  echo "  4) Run a task in HYBRID mode (online plans -> local works -> online gate)"
   echo "  0) Quit"
-  printf 'Choose [0-3]: '
+  printf 'Choose [0-4]: '
   read -r c
   case "$c" in
     1) hermes dashboard ;;
     2) hermes chat ;;
     3) hermes model ;;
+    4) printf 'Task: '; read -r t; [ -n "$t" ] && bash "$HERMES_HOME/hybrid.sh" "$t"; printf '[enter] back to menu'; read -r _ ;;
     0|q|Q) echo "bye"; break ;;
     *) echo "  invalid: $c"; sleep 1 ;;
   esac
