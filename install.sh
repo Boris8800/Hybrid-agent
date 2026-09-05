@@ -109,17 +109,20 @@ else
     ok "already installed ($("$BIN" --version 2>&1 | head -1))"
 fi
 
-# --- 4c. Bundle hybrid (part of the install, not a separate thing) ---
-# hybrid.sh uses the REAL Hermes Agent for both roles:
-#   ONLINE supervisor = the model you choose in Hermes (its default),
-#   LOCAL worker      = your local model (hermes -m <local>).
-if [ -f "$SCRIPT_DIR/hybrid.sh" ]; then
-    cp "$SCRIPT_DIR/hybrid.sh" "$HERMES_HOME/"
-    chmod +x "$HERMES_HOME/hybrid.sh"
-    ok "Hybrid mode bundled in this folder (hybrid.sh)"
-else
-    warn "hybrid.sh not beside install.sh — hybrid not bundled (re-run from the full repo)"
-fi
+# --- 4c. Bundle hybrid + supervised chat (part of the install) ---
+# hybrid.sh:            one-shot task -> online plan / local work / online gate
+# supervised_chat.sh:   a continuous chat where EVERY message is supervised
+# Both use the real Hermes Agent: ONLINE supervisor = Hermes default model;
+# LOCAL worker = your local model (hermes -m). No separate API keys.
+for _h in hybrid.sh supervised_chat.sh; do
+    if [ -f "$SCRIPT_DIR/$_h" ]; then
+        cp "$SCRIPT_DIR/$_h" "$HERMES_HOME/"
+        chmod +x "$HERMES_HOME/$_h"
+        ok "Bundled: $_h"
+    else
+        warn "$_h not beside install.sh — not bundled (re-run from the full repo)"
+    fi
+done
 
 # --- 4b. Desktop launcher icon ---
 DESKTOP_LAUNCHER="$HOME/Desktop/Hermes Agent.command"
@@ -138,14 +141,16 @@ while :; do
   echo "  2) Start chat"
   echo "  3) Set default model    (hybrid: local-first)"
   echo "  4) Run a task in HYBRID mode (online plans -> local works -> online gate)"
+  echo "  5) SUPERVISED chat      (every message is online-supervised)"
   echo "  0) Quit"
-  printf 'Choose [0-4]: '
+  printf 'Choose [0-5]: '
   read -r c
   case "$c" in
     1) hermes dashboard ;;
     2) hermes chat ;;
     3) hermes model ;;
     4) printf 'Task: '; read -r t; [ -n "$t" ] && bash "$HERMES_HOME/hybrid.sh" "$t"; printf '[enter] back to menu'; read -r _ ;;
+    5) bash "$HERMES_HOME/supervised_chat.sh" ;;
     0|q|Q) echo "bye"; break ;;
     *) echo "  invalid: $c"; sleep 1 ;;
   esac
